@@ -16,6 +16,22 @@
 
 上述公共逻辑已由 Isaac 使用，mjlab 已有状态读取、原生控制项和 Task manager 配置适配；不复制两套任务或策略调度。共享 runtime 不导入仿真 SDK。底层驱动维持原生 manager 步进，未增加自写仿真训练循环。
 
+### 后端钩子
+
+上层（run.py、tools、shared/assembly、实验快照）不按后端名分支，只经 `shared.assembly.assets` 的
+`BACKENDS` / `DEFAULT_BACKEND` / `selected_backend` / `backend_module(后端, 模块)` 找到 `shared/backends/<后端>/` 下的同名实现：
+
+| 位置 | 内容 | 调用方 |
+| --- | --- | --- |
+| `__init__.py` | 可选 `SDK`、`INTERPRETER`：当前解释器缺 SDK 时改用的工作区解释器 | run.py、inspect、scene_backend |
+| `assets.py` | `FACTORIES` 资产工厂 | 场景加载、资产目录 |
+| `project.py` | `PROJECT_TERMS`（是否接受项目 terms.py 的原生 term）、`UNKEYED_FACTORIES`（项目 assets.py 无后端键的 `FACTORIES` 是否属于该后端）、`validate_scene`、`validate_project`；可选 `inspect_scene`（显式 `--backend` 的场景单独检查/查看，未提供时明确报错） | prepare_scene、backend_scene、scene_backend |
+| `control.py` | `install_terms`：挂接 planner/executor 原生控制项 | compile_control |
+| `environment.py` | `make_environment`；预览窗口可提供 `window_closed` | Project、preview |
+
+新后端实现这些模块后加入 `BACKENDS`；暂不支持的能力在钩子内明确报错，不在上层补分支。
+仍有少量非分支的 Isaac 依赖留在上层：check 报告的 native_key、历史公式 Task 校验、观察选择解析（`isaac.task_config._selection`）与 Isaac 导出的可视化缓存键。
+
 `env.train.init_params.backend` 是公共后端选择（默认 isaac）。写在 train.yaml 或在命令行覆盖都可以，评估都随训练后端切换；只有显式写 `env.eval.init_params.backend` 时评估才单独选择。选 mjlab 时 run.py 自动改用 `.venv-mjlab` 重新启动（主 `.venv` 没有 mjlab）；显式设置了 `RLINF_PYTHON` 时不替换，缺 mjlab 则直接报错。`run.py check <project> --backend mjlab` 对完整项目检查同一配置及后端能力；也可用标准 Hydra override。没有第二份 mjlab train.yaml。
 
 mjlab 已接入原生 ManagerBasedRlEnv 和未修改的 RLinf PPO，可通过统一入口 check/inspect/smoke/train/evaluate。stock RLinf 中 env_type 仍使用现有 isaaclab 注册槽位，它负责进程和批次传输；项目工厂按 backend 构建真实 mjlab 环境，不启动 Isaac Sim。内部名称不代表仿真后端，项目无需另写 worker 或 runner。

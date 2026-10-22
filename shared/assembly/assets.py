@@ -6,12 +6,24 @@ from pathlib import Path
 from typing import Literal, get_args
 
 BACKENDS = ('isaac', 'mjlab')
+DEFAULT_BACKEND = 'isaac'
 
 
-def factories_for(backend='isaac'):
+def selected_backend(parameters):
+    """Backend named by ``init_params.backend``; recipes without one use the default."""
+    backend = (parameters or {}).get('backend', DEFAULT_BACKEND)
     if backend not in BACKENDS:
         raise ValueError(f'Unknown scene backend {backend!r}; choose one of {BACKENDS}')
-    return dict(import_module(f'shared.backends.{backend}.assets').FACTORIES)
+    return backend
+
+
+def backend_module(backend, name):
+    """A backend's implementation of a shared hook module, e.g. ``project`` or ``control``."""
+    return import_module(f'shared.backends.{selected_backend({"backend": backend})}.{name}')
+
+
+def factories_for(backend=DEFAULT_BACKEND):
+    return dict(backend_module(backend, 'assets').FACTORIES)
 
 
 def asset_backends(name):

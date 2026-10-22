@@ -13,12 +13,14 @@ import subprocess
 import sys
 import tempfile
 
+from shared.assembly.assets import DEFAULT_BACKEND, selected_backend
+
 
 def native_interface(native):
     observations = native.observation_manager
     actions = native.action_manager
     result = {
-        "backend": getattr(native, 'backend_name', 'isaac'),
+        "backend": getattr(native, 'backend_name', DEFAULT_BACKEND),
         "observations": {}, "actions": [], "articulations": {},
         "action_dim": actions.total_action_dim, "step_dt": native.step_dt,
     }
@@ -96,7 +98,7 @@ def inspect_configuration(cfg, module, *, timeout=180):
         from shared.assembly.object_schema import generate
         from shared.assembly.project import project_registry
         factories, terms, _ = project_registry(module.project.package,
-                                               backend=cfg.env[split].init_params.get('backend', 'isaac'))
+                                               backend=selected_backend(cfg.env[split].init_params))
         generate(scene, factories=factories, terms=terms)
     revision = source_revision(scene)
     with tempfile.TemporaryDirectory(prefix="rlinf-interface-") as directory:
@@ -104,7 +106,7 @@ def inspect_configuration(cfg, module, *, timeout=180):
         recipe, output, logfile = (directory / value for value in ("recipe.yaml", "interface.json", "probe.log"))
         OmegaConf.save(cfg, recipe, resolve=True)
         from shared.assembly.project import backend_interpreter
-        interpreter = backend_interpreter(cfg.env[split].init_params.get('backend', 'isaac'))
+        interpreter = backend_interpreter(selected_backend(cfg.env[split].init_params))
         command = [interpreter, str(Path(__file__).resolve()), "--worker", "--module", module.__name__,
                    "--recipe", str(recipe), "--output", str(output)]
         environment = dict(os.environ)
@@ -124,7 +126,7 @@ def inspect_configuration(cfg, module, *, timeout=180):
             raise RuntimeError(f"Scene interface inspection failed ({process.returncode})\n{logfile.read_text()[-7000:]}")
         report = json.loads(output.read_text())
     save_interface(scene, report, expected_revision=revision,
-                   backend=cfg.env[split].init_params.get('backend', 'isaac'))
+                   backend=selected_backend(cfg.env[split].init_params))
     module.interface_metadata = report
     return report
 

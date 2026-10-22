@@ -147,9 +147,10 @@ def execute(cfg, operation):
 
 def use_backend_interpreter(environment):
     """Restart under the interpreter the configured simulator backend declares."""
+    from shared.assembly.assets import selected_backend
     from shared.assembly.project import backend_interpreter
     try:
-        interpreter = backend_interpreter(environment.init_params.get("backend", "isaac"))
+        interpreter = backend_interpreter(selected_backend(environment.init_params))
     except RuntimeError as error:
         raise SystemExit(str(error)) from None
     if interpreter != sys.executable:

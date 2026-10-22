@@ -4,7 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import re
 
-from .assets import factories_for
+from .assets import DEFAULT_BACKEND, factories_for
 from .spec import Abstract, BodyFrame, Device, Entity, FixedJoint, Mount, Pose, Robot, RootReset, Scene, Sensor, WorldSpec
 
 
@@ -190,14 +190,14 @@ def load_scene_config(path):
     return data
 
 
-def load_world_spec(path, cameras=False, *, factories=None, backend='isaac'):
+def load_world_spec(path, cameras=False, *, factories=None, backend=DEFAULT_BACKEND):
     path = Path(path).resolve()
     data = load_scene_config(path)
     return world_spec_from_config(data, directory=path.parent, cameras=cameras,
                                   factories=factories, backend=backend)
 
 
-def world_spec_from_config(data, *, directory, cameras=False, factories=None, backend='isaac'):
+def world_spec_from_config(data, *, directory, cameras=False, factories=None, backend=DEFAULT_BACKEND):
     """Build an editable in-memory scene's description using its source folder."""
     factories = factories_for(backend) if factories is None else factories
     children = tuple(node for entry in data["entities"]

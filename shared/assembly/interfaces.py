@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from .assets import DEFAULT_BACKEND, selected_backend
+
 
 def source_revision(scene):
     from .editing import SceneDocument
@@ -38,14 +40,18 @@ def source_revision(scene):
     return revision
 
 
-def save_interface(scene, report, *, expected_revision=None, backend='isaac'):
+def _cache_path(scene, backend):
+    # The default backend keeps the original cache name, so existing caches stay valid.
+    suffix = '' if selected_backend({'backend': backend}) == DEFAULT_BACKEND else '_' + backend
+    return scene.parent / ".cache" / (scene.stem + suffix + "_interface.json")
+
+
+def save_interface(scene, report, *, expected_revision=None, backend=DEFAULT_BACKEND):
     scene = Path(scene).resolve()
     revision = source_revision(scene)
     if expected_revision is not None and revision != expected_revision:
         raise ValueError("Scene or assets changed during interface inspection; inspect again")
-    if backend not in ('isaac', 'mjlab'):
-        raise ValueError(f'Unknown backend: {backend}')
-    path = scene.parent / ".cache" / (scene.stem + ('' if backend == 'isaac' else '_' + backend) + "_interface.json")
+    path = _cache_path(scene, backend)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"source_revision": revision, "interface": report}, indent=2) + "\n")
@@ -56,11 +62,9 @@ def save_interface(scene, report, *, expected_revision=None, backend='isaac'):
     return path
 
 
-def load_interface(scene, *, backend='isaac'):
+def load_interface(scene, *, backend=DEFAULT_BACKEND):
     scene = Path(scene).resolve()
-    if backend not in ('isaac', 'mjlab'):
-        raise ValueError(f'Unknown backend: {backend}')
-    path = scene.parent / ".cache" / (scene.stem + ('' if backend == 'isaac' else '_' + backend) + "_interface.json")
+    path = _cache_path(scene, backend)
     if not path.is_file():
         return None
     try:

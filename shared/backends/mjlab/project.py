@@ -2,10 +2,17 @@
 from shared.assembly.entity_information import parse_signal
 from shared.assembly.targets import target_catalog
 from .scene import validate
-from .readers import SUPPORTED
+
+# Native Isaac project terms and unkeyed assets.py FACTORIES are not portable here;
+# project assets reach mjlab through BACKEND_FACTORIES['mjlab'].
+PROJECT_TERMS = False
+UNKEYED_FACTORIES = False
+validate_scene = validate
 
 
-def validate_project(description, settings, terms, *, factories=None, require_training=True):
+def validate_project(description, settings, terms, *, tasks=None, factories=None,
+                     require_training=True, evaluation=None):
+    from .readers import SUPPORTED
     # The scene compiler receives scene data only; policy/task remain shared.
     scene_fields = {'schema_version', 'name', 'entities', 'connections', 'simulation', 'world', 'authoring', 'visualization'}
     layout = {k: v for k, v in settings.items() if k in scene_fields}
@@ -41,3 +48,25 @@ def validate_project(description, settings, terms, *, factories=None, require_tr
     for name, binding in settings.get('control', {}).get('output', {}).items():
         if binding['asset_name'] not in keys:
             raise ValueError(f'Control {name} references unknown entity: {binding["asset_name"]}')
+
+
+def inspect_scene(description, settings, factories, report, *, view=False):
+    """Compile the scene alone with CPU MuJoCo; ``view`` opens the native viewer. No policy runs."""
+    from .scene import compile_scene
+    scene, model, data, keys = compile_scene(description, settings, factories)
+    report.update(simulator_started=True, runtime='mjlab scene compiled with CPU MuJoCo',
+                  model={'nq': model.nq, 'nv': model.nv, 'nu': model.nu,
+                         'bodies': model.nbody, 'geometries': model.ngeom})
+    for entry in report['entities']:
+        if keys[entry['path']] in scene.sensors:
+            entry.update(sensor=type(scene.sensors[keys[entry['path']]]).__name__)
+            continue
+        entity = scene.entities[keys[entry['path']]]
+        body = model.body(entity.root_body.name)
+        entry.update(actual_position=data.xpos[body.id].tolist(),
+                     actual_orientation=data.xquat[body.id].tolist(),
+                     joints=list(entity.joint_names))
+    if view:
+        import mujoco.viewer
+        # Native viewer owns interaction. No policy or training is running.
+        mujoco.viewer.launch(model=model, data=data)

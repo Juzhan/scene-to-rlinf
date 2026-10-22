@@ -10,12 +10,11 @@ import os
 from pathlib import Path
 import sys
 
+from .assets import DEFAULT_BACKEND, backend_module, selected_backend
+
 
 def require_online_backend(parameters):
-    backend = parameters.get('backend', 'isaac')
-    if backend not in ('isaac', 'mjlab'):
-        raise ValueError(f'Unknown simulation backend: {backend}')
-
+    selected_backend(parameters)
 
 
 def backend_interpreter(backend):
@@ -25,7 +24,7 @@ def backend_interpreter(backend):
     path of a separate environment). That interpreter is chosen automatically unless the
     user named one with ``RLINF_PYTHON``.
     """
-    package = import_module(f'shared.backends.{backend}')
+    package = import_module(f'shared.backends.{selected_backend({"backend": backend})}')
     sdk = getattr(package, 'SDK', None)
     if sdk is None or util.find_spec(sdk) is not None:
         return sys.executable
@@ -35,6 +34,8 @@ def backend_interpreter(backend):
         raise RuntimeError(f'{sys.executable} has no {sdk}; set RLINF_PYTHON to an interpreter with {sdk}'
                            + (f' (e.g. {interpreter})' if interpreter else ''))
     return str(candidate)
+
+
 def follow_train_backend(cfg, overrides, previous=None):
     """A backend chosen for training on the command line also moves evaluation.
 
@@ -45,7 +46,7 @@ def follow_train_backend(cfg, overrides, previous=None):
     keys = {item.lstrip('+').split('=', 1)[0] for item in overrides}
     if 'env.train.init_params.backend' not in keys or 'env.eval.init_params.backend' in keys:
         return cfg
-    if previous is not None and cfg.env.eval.init_params.get('backend', 'isaac') != previous:
+    if previous is not None and selected_backend(cfg.env.eval.init_params) != previous:
         return cfg
     from omegaconf import open_dict
     with open_dict(cfg):
@@ -62,14 +63,15 @@ class PreparedScene:
     terms: dict
     tasks: dict
     description: object
-    backend: str = 'isaac'
+    backend: str = DEFAULT_BACKEND
 
 
-def project_registry(package=None, *, factories=None, terms=None, tasks=None, backend='isaac'):
+def project_registry(package=None, *, factories=None, terms=None, tasks=None, backend=DEFAULT_BACKEND):
     """Discover optional project assets.py and terms.py; never invoke factories."""
     from .assets import factories_for
 
     assets, registered_terms, registered_tasks = factories_for(backend), {}, {}
+    support = backend_module(backend, 'project')
     if package:
         for suffix in ("assets", "terms"):
             name = package + "." + suffix
@@ -77,12 +79,12 @@ def project_registry(package=None, *, factories=None, terms=None, tasks=None, ba
                 continue
             module = import_module(name)
             if suffix == "assets":
-                if backend == 'isaac':
+                if support.UNKEYED_FACTORIES:
                     assets.update(getattr(module, "FACTORIES", {}))
                 assets.update(getattr(module, 'BACKEND_FACTORIES', {}).get(backend, {}))
             else:
-                if backend != 'isaac':
-                    continue  # Historical native Isaac terms are not portable.
+                if not support.PROJECT_TERMS:
+                    continue  # Native simulator terms are not portable across backends.
                 registered_terms.update(getattr(module, "TERMS", {}))
                 registered_tasks.update(getattr(module, "TASKS", {}))
     assets.update(factories or {})
@@ -145,7 +147,7 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
                   terms=None, tasks=None, headless=None, enable_cameras=None, require_training=True):
     """Same static preparation for check, preview and every RLinf worker."""
     from .layout import load_scene_config, load_world_spec
-    backend = parameters.get('backend', 'isaac')
+    backend = selected_backend(parameters)
     path = Path(parameters.get("scene_config", scene_config)).expanduser().resolve()
     assets, registered_terms, registered_tasks = project_registry(
         project_package, factories=factories, terms=terms, tasks=tasks, backend=backend)
@@ -187,54 +189,10 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
         for entity_path, (node, _) in description.index().items():
             if node.factory:
                 _check_factory(node.factory, node.parameters, assets, entity_path)
-        if backend == 'mjlab':
-            from shared.backends.mjlab.project import validate_project
-            validate_project(description, settings, registered_terms, factories=assets, require_training=require_training)
-            return PreparedScene(path, settings, application, assets, registered_terms, registered_tasks, description, backend)
-        from shared.backends.isaac.scene import scene_metadata
-        from shared.backends.isaac.task_config import validate_task_settings
-        metadata = scene_metadata(description)
-        from shared.backends.isaac.contact_materials import validate_materials
-        validate_materials(settings.get("world", {}).get("contact_materials", {}), metadata.keys.values())
-        from shared.assembly.targets import target_catalog
-        from shared.assembly.entity_information import parse_signal
-        from shared.backends.isaac.task_config import _selection
-        for signal_path, (value, _) in target_catalog(settings).items():
-            if '.target.' not in signal_path:
-                # Abstract entities are validated together with the scene tree.
-                continue
-            entity = signal_path.split('.target.')[0].replace('.', '__')
-            if entity not in metadata.keys.values():
-                raise ValueError(f'Target {signal_path!r} references an unknown scene entity')
-        for group, selection in settings.get('observations', {}).items():
-            for signal_path in _selection(selection, f'observations.{group}')[0]:
-                parsed = parse_signal(signal_path)
-                if signal_path not in target_catalog(settings) and parsed and parsed[0] not in metadata.keys.values():
-                    raise ValueError(f'Observation {signal_path!r} references an unknown scene entity')
-        if 'control' in settings:
-            from .control import component_observations
-            selected = settings['control']['train']
-            for name, component in settings['control']['components'].items():
-                for entry in component_observations(component['observations']):
-                    parsed = parse_signal(entry['source'])
-                    if entry["source"] not in target_catalog(settings) and parsed and parsed[0] not in metadata.keys.values():
-                        raise ValueError(f"Component {name!r} references unknown entity in {entry['source']!r}")
-        from .assets import image_outputs
-        from .entity_information import check_image_sources
-        check_image_sources(_selected_sources(settings), {
-            metadata.keys[path]: image_outputs(assets[node.factory], node.parameters)
-            for path, (node, _) in description.index().items() if node.factory and path in metadata.keys})
-        validate_task_settings(settings, term_registry=registered_terms, task_presets=registered_tasks,
-                               require_training=require_training)
-        if evaluation is not None:
-            from shared.backends.isaac.task_evaluation import validate_sources
-            from shared.assembly.entity_information import parse_signal
-            custom_signals = registered_terms.get("signals", {})
-            for signal in validate_sources(evaluation, custom_signals, settings)["signals"]:
-                parsed = parse_signal(signal)
-                if signal not in custom_signals and signal not in target_catalog(settings) and parsed and parsed[0] not in metadata.keys.values():
-                    raise ValueError(f"Task signal {signal!r} references an unknown scene entity")
-        return PreparedScene(path, settings, application, assets, registered_terms, registered_tasks, description)
+        backend_module(backend, 'project').validate_project(
+            description, settings, registered_terms, tasks=registered_tasks, factories=assets,
+            require_training=require_training, evaluation=evaluation)
+        return PreparedScene(path, settings, application, assets, registered_terms, registered_tasks, description, backend)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"{path}: {error}") from error
 
@@ -270,7 +228,7 @@ def check_project(cfg, *, scene_config, project_package=None, **registries):
             "connections": len(joints), "observations": prepared.settings["observations"],
             "actions": list(prepared.settings["actions"]), "task": "task.py" if "object_api" in prepared.terms else prepared.settings.get("task", {}).get("preset", "custom"),
             "capabilities": {"backend": prepared.backend, "training": "RLinf PPO", "task": "Python" if "object_api" in prepared.terms else "legacy native terms",
-                             "commands": ["check", "inspect", "view", "record", "smoke", "train", "evaluate"] if prepared.backend == 'isaac' else ['check', 'inspect', 'view', 'record', 'smoke', 'train', 'evaluate'],
+                             "commands": ["check", "inspect", "view", "record", "smoke", "train", "evaluate"],
                              "validation": "static; runtime capabilities require smoke/evaluation"},
             "layout": layout, "physical_connections": [asdict(joint) for joint in joints],
             "layout_note": "Poses are authored relative to logical parents; sensor mounts use body-local poses. "
@@ -295,8 +253,7 @@ class Project:
         return check_project(cfg, scene_config=self.scene_config, project_package=self.package)
 
     def make_environment(self, parameters, num_envs, seed, horizon, **options):
-        require_online_backend(parameters)
-        make_environment = import_module(f"shared.backends.{parameters.get('backend', 'isaac')}.environment").make_environment
+        make_environment = backend_module(selected_backend(parameters), 'environment').make_environment
         return make_environment(parameters, num_envs, seed, horizon, scene_config=self.scene_config,
                                 project_package=self.package, **options)
 

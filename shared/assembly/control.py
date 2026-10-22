@@ -3,6 +3,8 @@ from copy import deepcopy
 from importlib import import_module
 import math
 
+from .assets import DEFAULT_BACKEND, backend_module
+
 
 def load_factory(path):
     module, separator, name = path.partition(':')
@@ -225,7 +227,7 @@ def component_config(control, project_package):
     return control
 
 
-def compile_control(settings, registry, *, project_package=None, backend="isaac"):
+def compile_control(settings, registry, *, project_package=None, backend=DEFAULT_BACKEND):
     if 'control' not in settings:
         return settings, registry
     settings, registry = deepcopy(settings), deepcopy(registry)
@@ -265,9 +267,6 @@ def compile_control(settings, registry, *, project_package=None, backend="isaac"
     settings['control'] = control
     settings['observations'] = {'policy': list(components[selected]['observations'])}
     settings['actions'] = {'control_chain': {'type': 'control_chain'}}
-    from shared.assembly.assets import BACKENDS
-    if backend not in BACKENDS:
-        raise ValueError(f'Unknown backend: {backend}')
-    install = import_module(f'shared.backends.{backend}.control').install_terms
+    install = backend_module(backend, 'control').install_terms
     install(control, dt, settings, registry)
     return settings, registry

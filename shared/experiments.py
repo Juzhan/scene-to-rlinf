@@ -63,7 +63,8 @@ def _resolved_interface(value, *, bodies=True):
 
 
 def _same_backend(before, after):
-    return (before or {}).get("backend", "isaac") == (after or {}).get("backend", "isaac")
+    from shared.assembly.assets import selected_backend
+    return selected_backend(before) == selected_backend(after)
 
 
 def _differences(before, after, path=""):
@@ -139,7 +140,8 @@ def project_signature(cfg, module):
             signature = deepcopy(saved["signature"])
             signature["resolved_interface"] = getattr(module, "interface_metadata", signature.get("resolved_interface"))
             # A frozen replay may still choose where it runs.
-            signature["backends"] = {name: cfg.env[name].init_params.get("backend", "isaac")
+            from shared.assembly.assets import selected_backend
+            signature["backends"] = {name: selected_backend(cfg.env[name].init_params)
                                      for name in _backends(signature) or ("train", "eval")}
             return signature
     scenes = _scene_paths(cfg, module)
@@ -150,7 +152,8 @@ def project_signature(cfg, module):
              if key not in {"initial_checkpoint", "model_path", "precision"}}
     # The simulator is where the policy runs, not part of its interface: it is recorded and
     # reported, while the live joint/action order is still checked on the backend in use.
-    backends = {name: cfg.env[name].init_params.get("backend", "isaac") for name in scenes}
+    from shared.assembly.assets import selected_backend
+    backends = {name: selected_backend(cfg.env[name].init_params) for name in scenes}
     interface = {
         "model": model,
         "scenes": {name: {"observations": documents[path].get("observations"),
@@ -483,7 +486,8 @@ def load_snapshot(path, overrides=(), *, register=True, allow_shared_change=Fals
             if before != after:
                 raise ValueError("A frozen replay cannot change its scene or policy interface")
         from shared.assembly.project import follow_train_backend
-        cfg = follow_train_backend(changed, overrides, previous=cfg.env.train.init_params.get("backend", "isaac"))
+        from shared.assembly.assets import selected_backend
+        cfg = follow_train_backend(changed, overrides, previous=selected_backend(cfg.env.train.init_params))
     source = str(snapshot / "source")
     if source not in sys.path:
         sys.path.insert(0, source)

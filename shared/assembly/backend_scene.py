@@ -1,7 +1,7 @@
 """Backend-neutral scene loading and a static report, independent of training."""
 from dataclasses import asdict
 from pathlib import Path
-from .assets import factories_for, asset_backends, check_parameters
+from .assets import asset_backends, backend_module, check_parameters, factories_for
 from .layout import load_scene_config, load_world_spec
 
 
@@ -23,9 +23,7 @@ def prepare(path, backend):
             check_parameters(factories[entity.factory], entity.parameters)
         except (TypeError, ValueError) as error:
             raise ValueError(f'{backend} entity {name}: {error}') from error
-    if backend == 'mjlab':
-        from shared.backends.mjlab.scene import validate
-        validate(description, settings)
+    backend_module(backend, 'project').validate_scene(description, settings)
     report = {'backend': backend, 'scene': str(path), 'scope': 'scene construction',
               'entities': [{'path': name, 'asset': node.factory,
                             'supported_backends': sorted(set(asset_backends(node.factory)) | {backend}),
