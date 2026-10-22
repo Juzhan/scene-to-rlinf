@@ -1,0 +1,524 @@
+diff --git a/rlinf/algorithms/utils.py b/rlinf/algorithms/utils.py
+index 915226a..1c5c5b0 100644
+--- a/rlinf/algorithms/utils.py
++++ b/rlinf/algorithms/utils.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import math
+ from typing import Optional
+ 
+ import torch
+@@ -19,6 +20,25 @@ import torch
+ from rlinf.utils.utils import masked_mean
+ 
+ 
++def adaptive_kl_learning_rate(
++    learning_rate: float,
++    kl_mean: float,
++    target: float,
++    minimum: float = 1e-5,
++    maximum: float = 1e-2,
++) -> float:
++    """Apply the RSL-RL learning-rate rule to one complete minibatch KL."""
++    if not all(math.isfinite(value) for value in (learning_rate, kl_mean, target)):
++        raise ValueError("Adaptive KL requires finite learning rate, KL, and target")
++    if target <= 0 or not 0 < minimum <= learning_rate <= maximum:
++        raise ValueError("Adaptive KL requires a positive target and bounded learning rate")
++    if kl_mean > 2 * target:
++        return max(minimum, learning_rate / 1.5)
++    if 0 < kl_mean < target / 2:
++        return min(maximum, learning_rate * 1.5)
++    return learning_rate
++
++
+ def huber_loss(error: torch.Tensor, delta: float) -> torch.Tensor:
+     return torch.where(
+         error.abs() < delta, 0.5 * error**2, delta * (error.abs() - 0.5 * delta)
+diff --git a/rlinf/data/schema/embodied_types.py b/rlinf/data/schema/embodied_types.py
+index 7dde91e..8be5574 100644
+--- a/rlinf/data/schema/embodied_types.py
++++ b/rlinf/data/schema/embodied_types.py
+@@ -1647,6 +1647,7 @@ class EnvOutput:
+             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
+             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
+             "states": states,
++            **obs,  # Preserve project-defined state and sensor fields.
+             "task_descriptions": task_descriptions,
+         }
+ 
+@@ -1951,8 +1952,7 @@ def merge_episode_data(data: list[dict[str, Any]]) -> dict[str, Any]:
+ 
+ def _observation_batch_size(obs: dict[str, Any]) -> int:
+     """Infer the leading batch size from a policy observation."""
+-    for key in ("states", "main_images", "task_descriptions"):
+-        value = obs.get(key)
++    for value in obs.values():
+         if isinstance(value, (torch.Tensor, np.ndarray)):
+             return value.shape[0]
+         if isinstance(value, list):
+diff --git a/rlinf/envs/__init__.py b/rlinf/envs/__init__.py
+index 2a40c26..fbf6cb0 100644
+--- a/rlinf/envs/__init__.py
++++ b/rlinf/envs/__init__.py
+@@ -21,8 +21,11 @@ from rlinf.utils.robosuite_compat import install_robosuite_egl_device_shim
+ # simulator subprocesses they spawn alike. See ``rlinf.utils.robosuite_compat``.
+ install_robosuite_egl_device_shim()
+ 
++REGISTER_GYMNASIUM_ENVS = {}
++
+ 
+ class SupportedEnvType(Enum):
++    GYMNASIUM = "gymnasium"
+     MANISKILL = "maniskill"
+     MANISKILL_RLT = "maniskill_rlt"
+     LIBERO = "libero"
+@@ -87,7 +90,14 @@ def get_env_cls(env_type: str, env_cfg=None):
+ 
+     env_type = SupportedEnvType(env_type)
+ 
+-    if env_type == SupportedEnvType.MANISKILL:
++    if env_type == SupportedEnvType.GYMNASIUM:
++        if env_cfg is None:
++            raise ValueError("env_cfg.init_params.id is required for gymnasium")
++        task_id = env_cfg.init_params.id
++        if task_id not in REGISTER_GYMNASIUM_ENVS:
++            raise ValueError(f"Gymnasium task {task_id!r} has not been registered")
++        return REGISTER_GYMNASIUM_ENVS[task_id]
++    elif env_type == SupportedEnvType.MANISKILL:
+         if env_cfg.get("enable_offload", False):
+             from rlinf.envs.sim.maniskill.maniskill_offload_env import (
+                 ManiskillOffloadEnv,
+diff --git a/rlinf/envs/sim/frankasim/frankasim_env.py b/rlinf/envs/sim/frankasim/frankasim_env.py
+index e4de3d3..4120db8 100644
+--- a/rlinf/envs/sim/frankasim/frankasim_env.py
++++ b/rlinf/envs/sim/frankasim/frankasim_env.py
+@@ -276,6 +276,15 @@ class FrankaSimEnv(gym.Env):
+         if self.obs_mode == "rgb":
+             kwargs["image_obs"] = True
+             kwargs["render_mode"] = "rgb_array"
++            render_size = _cfg_get(self.cfg, "render_size", None)
++            if render_size is not None:
++                from franka_sim.mujoco_gym_env import GymRenderingSpec
++
++                if len(render_size) != 2 or min(render_size) < 1:
++                    raise ValueError("render_size must contain positive height and width")
++                kwargs["render_spec"] = GymRenderingSpec(
++                    height=int(render_size[0]), width=int(render_size[1])
++                )
+         env = gym.make(self.env_id, disable_env_checker=True, **kwargs)
+         try:
+             env.reset(seed=self.seed + env_idx)
+@@ -297,8 +306,7 @@ class FrankaSimEnv(gym.Env):
+             )
+             return
+ 
+-        imgs = extract_serl_images_dict(raw0, self.image_key)
+-        main = imgs.get(self.main_camera, imgs[sorted(imgs.keys())[0]])
++        main, _ = self._pick_images(raw0)
+         h, w, c = main.shape
+         spaces = {
+             "main_images": gym.spaces.Box(
+@@ -370,6 +378,15 @@ class FrankaSimEnv(gym.Env):
+         keys = sorted(images.keys())
+         main = images.get(self.main_camera, images[keys[0]])
+         extra = images.get(self.extra_camera, main)
++        resize_to = _cfg_get(self.cfg, "resize_to", None)
++        if resize_to is not None:
++            import cv2
++
++            if len(resize_to) != 2 or min(resize_to) < 1:
++                raise ValueError("resize_to must contain positive height and width")
++            size = (int(resize_to[1]), int(resize_to[0]))
++            main = cv2.resize(main, size, interpolation=cv2.INTER_AREA)
++            extra = cv2.resize(extra, size, interpolation=cv2.INTER_AREA)
+         return main, extra
+ 
+     def _collate_obs(self, obs_list: list[dict[str, Any]]) -> dict[str, Any]:
+diff --git a/rlinf/envs/sim/isaaclab/isaaclab_env.py b/rlinf/envs/sim/isaaclab/isaaclab_env.py
+index ff18af3..2bd672a 100644
+--- a/rlinf/envs/sim/isaaclab/isaaclab_env.py
++++ b/rlinf/envs/sim/isaaclab/isaaclab_env.py
+@@ -131,9 +131,7 @@ class IsaaclabBaseEnv(gym.Env):
+ 
+         dones = terminations | truncations
+ 
+-        infos = self._record_metrics(
+-            step_reward, terminations, {}
+-        )  # return infos is useless
++        infos = self._record_metrics(step_reward, terminations, infos)
+         if self.ignore_terminations:
+             infos["episode"]["success_at_end"] = terminations
+             terminations[:] = False
+diff --git a/rlinf/runners/async_embodied_runner.py b/rlinf/runners/async_embodied_runner.py
+index 477f7a4..7cfcb3d 100644
+--- a/rlinf/runners/async_embodied_runner.py
++++ b/rlinf/runners/async_embodied_runner.py
+@@ -57,6 +57,15 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
+ 
+         self.init_weight_sync_state()
+ 
++    def _sample_budget_reached(self, training_metrics):
++        target = self.cfg.runner.get("max_train_samples", -1)
++        if target <= 0:
++            return False
++        samples = training_metrics.get("train/replay_buffer/total_samples")
++        if samples is None:
++            raise ValueError("Sample-budget training requires cumulative replay sample metrics")
++        return samples >= target
++
+     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
+         results: list[dict] = []
+         while True:
+@@ -183,6 +192,7 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
+                             actor_result
+                         ).items()
+                     }
++                    sample_budget_reached = self._sample_budget_reached(training_metrics)
+ 
+                     run_val, save_model, _ = check_progress(
+                         self.global_step,
+@@ -192,6 +202,8 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
+                         1.0,
+                         run_time_exceeded=False,
+                     )
++                    if sample_budget_reached:
++                        run_val, save_model = True, True
+                     if save_model:
+                         self._save_checkpoint()
+                     eval_metrics = {}
+@@ -285,6 +297,10 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
+             if profiled_step is not None:
+                 self._close_profiling_window(profiled_step)
+ 
++            if sample_budget_reached:
++                self.logger.info(f"Reached replay sample budget at step {self.global_step}.")
++                break
++
+         # Let any in-flight non-blocking sync land before the workers go away.
+         self.drain_pending_rollout_weight_sync()
+ 
+diff --git a/rlinf/workers/actor/async_fsdp_sac_policy_worker.py b/rlinf/workers/actor/async_fsdp_sac_policy_worker.py
+index 4932a71..4f23895 100644
+--- a/rlinf/workers/actor/async_fsdp_sac_policy_worker.py
++++ b/rlinf/workers/actor/async_fsdp_sac_policy_worker.py
+@@ -89,6 +89,24 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
+                 return
+             await asyncio.sleep(1)
+ 
++    async def _wait_for_new_samples(self):
++        minimum = self.cfg.actor.get("min_new_samples_per_training_step", 0)
++        if minimum <= 0:
++            return
++        if not hasattr(self, "_sample_update_quota"):
++            self._sample_update_quota = self.replay_buffer.total_samples
++        target = self._sample_update_quota + minimum
++        while True:
++            self._drain_received_trajectories(
++                max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 1024)
++            )
++            if self.replay_buffer.total_samples >= target:
++                self._sample_update_quota = target
++                return
++            if self.should_stop:
++                raise RuntimeError("Stopped while waiting for new replay samples")
++            await asyncio.sleep(0.05)
++
+     @Worker.timer("run_training")
+     async def run_training(self):
+         """SAC training using replay buffer"""
+@@ -99,6 +117,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
+         # Check if replay buffer has enough samples
+         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
+         await self._wait_for_replay_buffer_ready(min_buffer_size)
++        await self._wait_for_new_samples()
+ 
+         torch.distributed.barrier()
+ 
+diff --git a/rlinf/workers/actor/embodied_fsdp_actor_worker.py b/rlinf/workers/actor/embodied_fsdp_actor_worker.py
+index 097f832..7a23141 100644
+--- a/rlinf/workers/actor/embodied_fsdp_actor_worker.py
++++ b/rlinf/workers/actor/embodied_fsdp_actor_worker.py
+@@ -20,7 +20,7 @@ from torch import nn
+ import rlinf.algorithms  # noqa: F401
+ from rlinf.algorithms.expert import build_expert_model_config
+ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
+-from rlinf.algorithms.utils import compute_entropy_loss
++from rlinf.algorithms.utils import adaptive_kl_learning_rate, compute_entropy_loss
+ from rlinf.config import SupportedModel
+ from rlinf.data.schema.embodied_types import Trajectory
+ from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
+@@ -659,6 +659,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
+ 
+                 self.torch_platform.empty_cache()
+ 
++                self.adapt_learning_rate(metrics)
+                 grad_norm, lr_list = self.optimizer_step()
+                 data = {
+                     "actor/grad_norm": grad_norm,
+@@ -668,7 +669,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
+                     data["critic/lr"] = lr_list[1]
+                 append_to_dict(metrics, data)
+         # put LR scheduler step here
+-        self.lr_scheduler.step()
++        if self.cfg.algorithm.get("adaptive_kl_target") is None:
++            self.lr_scheduler.step()
+         self.optimizer.zero_grad()
+         clear_memory()
+         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
+@@ -686,6 +688,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
+ 
+         return mean_metric_dict
+ 
++    def adapt_learning_rate(self, metrics: dict[str, list[float]]) -> None:
++        target = self.cfg.algorithm.get("adaptive_kl_target")
++        if target is None:
++            return
++        kl_values = metrics.get("actor/gaussian_kl", [])
++        if len(kl_values) < self.gradient_accumulation:
++            raise ValueError("Adaptive KL requires Gaussian KL from every microbatch")
++        reduced = all_reduce_dict(
++            {"kl": float(np.mean(kl_values[-self.gradient_accumulation :]))},
++            op=torch.distributed.ReduceOp.AVG,
++        )
++        learning_rate = adaptive_kl_learning_rate(
++            self.optimizer.param_groups[0]["lr"], reduced["kl"], target
++        )
++        for group in self.optimizer.param_groups:
++            group["lr"] = learning_rate
++        append_to_dict(metrics, {"actor/kl_for_lr": reduced["kl"]})
++
+     def train_micro_batch(
+         self,
+         micro_batch: dict[str, torch.Tensor],
+@@ -741,6 +761,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
+                 **kwargs,
+             )
+ 
++        if "gaussian_kl" in output_dict:
++            append_to_dict(
++                metrics,
++                {"actor/gaussian_kl": output_dict["gaussian_kl"].mean().item()},
++            )
++        elif self.cfg.algorithm.get("adaptive_kl_target") is not None:
++            raise ValueError("Adaptive KL requires policy Gaussian statistics")
++
+         if SupportedModel(self.cfg.actor.model.model_type) in [
+             SupportedModel.GR00T,
+             SupportedModel.GR00T_N1D6,
+@@ -847,6 +875,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
+ 
+     def finish_global_batch(self, metrics: dict[str, list[float]]) -> None:
+         self.torch_platform.empty_cache()
++        self.adapt_learning_rate(metrics)
+         grad_norm, lr_list = self.optimizer_step()
+         self.optimizer.zero_grad()
+         metric_data = {
+diff --git a/rlinf/workers/actor/fsdp_sac_policy_worker.py b/rlinf/workers/actor/fsdp_sac_policy_worker.py
+index 0440933..77c9d33 100644
+--- a/rlinf/workers/actor/fsdp_sac_policy_worker.py
++++ b/rlinf/workers/actor/fsdp_sac_policy_worker.py
+@@ -853,3 +853,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
+             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+         )
+         self.replay_buffer.load_checkpoint(buffer_load_path)
++        self.update_step = max(
++            (int(state["step"]) for state in self.qf_optimizer.state.values() if "step" in state),
++            default=0,
++        )
++        self.logger.info(f"Restored SAC critic update counter: {self.update_step}")
+diff --git a/rlinf/workers/rollout/hf/huggingface_worker.py b/rlinf/workers/rollout/hf/huggingface_worker.py
+index 455d225..cdecf08 100644
+--- a/rlinf/workers/rollout/hf/huggingface_worker.py
++++ b/rlinf/workers/rollout/hf/huggingface_worker.py
+@@ -15,6 +15,7 @@
+ import asyncio
+ import copy
+ import gc
++import inspect
+ import time
+ from typing import Any, Callable, Literal, Optional
+ 
+@@ -485,6 +486,11 @@ class MultiStepRolloutWorker(Worker):
+     def predict(
+         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+     ) -> tuple[torch.Tensor, dict[str, Any]]:
++        """Pass train/eval mode to policies that explicitly accept that keyword.
++
++        Custom policies retain their generation sampling parameters. Policies
++        accepting only generation kwargs keep the existing call contract.
++        """
+         kwargs = (
+             self._train_sampling_params
+             if mode == "train"
+@@ -513,6 +519,19 @@ class MultiStepRolloutWorker(Worker):
+                 kwargs["mode"] = mode
+             else:
+                 kwargs = {"mode": mode}
++        else:
++            try:
++                parameter = inspect.signature(
++                    self.hf_model.predict_action_batch
++                ).parameters.get("mode")
++            except (TypeError, ValueError):
++                parameter = None
++            if parameter is not None and parameter.kind in (
++                inspect.Parameter.POSITIONAL_OR_KEYWORD,
++                inspect.Parameter.KEYWORD_ONLY,
++            ):
++                kwargs = dict(kwargs)
++                kwargs["mode"] = "eval" if self.enable_dagger else mode
+ 
+         if model_type in [
+             SupportedModel.CNN_POLICY,
+diff --git a/tests/unit_tests/test_worker.py b/tests/unit_tests/test_worker.py
+index ee82cdf..f65456b 100644
+--- a/tests/unit_tests/test_worker.py
++++ b/tests/unit_tests/test_worker.py
+@@ -868,3 +868,93 @@ def test_clear_stub_import_preserves_real_flash_attn_module():
+     Patcher.clear_stub_import("flash_attn")
+ 
+     assert sys.modules["flash_attn"] is real_flash_attn
++
++
++def _local_policy_rollout(policy, model_type):
++    """Exercise prediction without launching the worker's distributed runtime."""
++    from contextlib import nullcontext
++
++    from rlinf.config import SupportedModel
++    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
++
++    SupportedModel.register(model_type, force=True)
++    worker = object.__new__(MultiStepRolloutWorker)
++    worker.model_cfg = SimpleNamespace(model_type=model_type)
++    worker.algorithm_cfg = {}
++    worker.hf_model = policy
++    worker.expert_model = None
++    worker.enable_dagger = False
++    worker._train_sampling_params = {"temperature": 0.8, "top_k": 7}
++    worker._eval_sampling_params = {"temperature": 0.0, "top_k": 2}
++    worker._accelerator_type = None
++    worker.worker_timer = lambda *args, **kwargs: nullcontext()
++    return worker
++
++
++def test_custom_policy_rollout_passes_mode_and_preserves_generation_options():
++    import torch
++
++    class GaussianPolicy:
++        def __init__(self):
++            self.calls = []
++
++        def predict_action_batch(self, env_obs, *, mode="train", **kwargs):
++            self.calls.append((mode, kwargs))
++            mean = env_obs["states"][:, None, :]
++            distribution = torch.distributions.Normal(mean, torch.ones_like(mean))
++            return (mean if mode == "eval" else distribution.sample()), {}
++
++    policy = GaussianPolicy()
++    worker = _local_policy_rollout(policy, "unit_test_custom_gaussian")
++    observation = {"states": torch.ones(4, 3)}
++    torch.manual_seed(42)
++    train, _ = worker.predict(observation, mode="train")
++    first, _ = worker.predict(observation, mode="eval")
++    second, _ = worker.predict(observation, mode="eval")
++    assert not torch.equal(train, first)
++    torch.testing.assert_close(first, observation["states"][:, None, :])
++    torch.testing.assert_close(second, first)
++    assert policy.calls == [
++        ("train", {"temperature": 0.8, "top_k": 7}),
++        ("eval", {"temperature": 0.0, "top_k": 2}),
++        ("eval", {"temperature": 0.0, "top_k": 2}),
++    ]
++    assert worker._train_sampling_params == {"temperature": 0.8, "top_k": 7}
++    assert worker._eval_sampling_params == {"temperature": 0.0, "top_k": 2}
++
++
++def test_generation_only_policy_rollout_does_not_receive_new_mode_argument():
++    import torch
++
++    class GenerationPolicy:
++        def __init__(self):
++            self.calls = []
++
++        def predict_action_batch(self, env_obs, **kwargs):
++            self.calls.append(kwargs)
++            return torch.zeros(1, 1, 2), {}
++
++    policy = GenerationPolicy()
++    worker = _local_policy_rollout(policy, "unit_test_generation_only")
++    worker.predict({}, mode="train")
++    worker.predict({}, mode="eval")
++    assert policy.calls == [
++        {"temperature": 0.8, "top_k": 7},
++        {"temperature": 0.0, "top_k": 2},
++    ]
++
++
++def test_builtin_policy_rollout_keeps_its_existing_mode_contract():
++    import torch
++
++    from rlinf.config import SupportedModel
++
++    class BuiltinPolicy:
++        def predict_action_batch(self, env_obs, **kwargs):
++            self.received = kwargs
++            return torch.zeros(1, 1, 2), {}
++
++    policy = BuiltinPolicy()
++    worker = _local_policy_rollout(policy, SupportedModel.MLP_POLICY.value)
++    worker.predict({}, mode="eval")
++    assert policy.received == {"mode": "eval", "return_obs": True}
+diff --git a/toolkits/standalone_eval_scripts/openpi/README.md b/toolkits/standalone_eval_scripts/openpi/README.md
+index 01fbfdb..fe3709d 100644
+--- a/toolkits/standalone_eval_scripts/openpi/README.md
++++ b/toolkits/standalone_eval_scripts/openpi/README.md
+@@ -28,6 +28,10 @@ All evaluation scripts share these common parameters:
+ 🌟🌟 **Note:** 🌟🌟 Ensure that `num_steps` and `action_chunk` during evaluation strictly align with the RL training configuration. While Flow Matching policies in SFT allow for flexible num_steps due to continuous-time training, RL uses a fixed denoise step. **Consequently, when evaluating RL-tuned models, `num_steps` must remain consistent with the training config.**
+ 
+ ### LIBERO (`libero_eval.py`)
++Pass `--task_id 2 --num_trials_per_task 1` to evaluate only one task and one initial state. Omitting `--task_id` preserves full-suite evaluation. Invalid task indices are rejected before loading the policy.
++
++The surrounding workspace provides `tools/pi05_libero_probe.py` for the pinned RLinf LIBERO SFT checkpoint downloaded into `~/Downloads`. It ignores unfinished browser downloads, checks the official byte count and SHA-256, then calls this native evaluator for Spatial task 2. `--inspect` checks file presence without inference; results and videos go to `outputs/pi05_libero/browser_probe`. This is inference only, not training or a full benchmark.
++
+ For LIBERO, the `num_steps` and `action_chunk` parameters depend on the model and task suite; they correspond to **Denoise step** and **Action replan horizon** in our paper. Please set them in the command below.
+ 
+ ![](https://github.com/RLinf/misc/blob/main/pic/hyper_parameters_pi_libero.png)
+diff --git a/toolkits/standalone_eval_scripts/openpi/libero_eval.py b/toolkits/standalone_eval_scripts/openpi/libero_eval.py
+index c6566f9..8a6d404 100644
+--- a/toolkits/standalone_eval_scripts/openpi/libero_eval.py
++++ b/toolkits/standalone_eval_scripts/openpi/libero_eval.py
+@@ -83,6 +83,10 @@ def main(args):
+     task_suite = benchmark_dict[args.task_suite_name]()
+     num_tasks_in_suite = task_suite.n_tasks
+     logger.info(f"Task suite: {args.task_suite_name}")
++    task_id = getattr(args, "task_id", None)
++    if task_id is not None and not 0 <= task_id < num_tasks_in_suite:
++        raise ValueError(f"task_id must be in [0, {num_tasks_in_suite})")
++    task_ids = range(num_tasks_in_suite) if task_id is None else [task_id]
+ 
+     # Determine max steps based on task suite
+     if args.task_suite_name == "libero_spatial":
+@@ -107,7 +111,7 @@ def main(args):
+     total_episodes, total_successes = 0, 0
+     results_per_task = {}
+ 
+-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
++    for task_id in tqdm.tqdm(task_ids):
+         # Get task
+         task = task_suite.get_task(task_id)
+ 
+@@ -274,6 +278,12 @@ if __name__ == "__main__":
+         default=50,
+         help="Number of rollouts per task",
+     )
++    parser.add_argument(
++        "--task_id",
++        type=int,
++        default=None,
++        help="Evaluate only this task index; omitted evaluates the full suite",
++    )
+     parser.add_argument(
+         "--action_chunk",
+         type=int,

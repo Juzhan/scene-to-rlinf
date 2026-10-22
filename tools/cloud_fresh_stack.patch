@@ -1,0 +1,23 @@
+--- a/projects/frankasim_stack_v2/train.yaml
++++ b/projects/frankasim_stack_v2/train.yaml
+@@ -102,7 +102,7 @@
+   compile_model: true
+   model:
+     model_path: ${oc.env:WORKSPACE_ROOT}/third_party/RLinf-ResNet10-pretrained
+-    initial_actor_checkpoint: ${oc.env:WORKSPACE_ROOT}/outputs/frankasim_stack/sac_15000_20261008/runs/stack_sac_15000/checkpoints/global_step_15000/actor/model_state_dict/full_weights.pt
++    initial_actor_checkpoint: null
+     state_dim: 7
+     action_dim: 4
+     num_q_heads: 10
+--- a/projects/frankasim_stack_v2/project.py
++++ b/projects/frankasim_stack_v2/project.py
+@@ -21,5 +21,6 @@
+ 
+     check_runtime(config)
+     for component in (config.actor, config.rollout):
+-        if not Path(component.model.initial_actor_checkpoint).is_file():
+-            raise FileNotFoundError(component.model.initial_actor_checkpoint)
+\ No newline at end of file
++        checkpoint = component.model.initial_actor_checkpoint
++        if checkpoint is not None and not Path(checkpoint).is_file():
++            raise FileNotFoundError(checkpoint)

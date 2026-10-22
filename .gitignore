@@ -1,0 +1,61 @@
+# Python / tools
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.pytest_cache/
+.venv*/
+.cache/
+imgui.ini
+/yes
+
+# Runs, scratch and reports (large, regenerated)
+outputs/
+/tmp/
+/report/
+runs/
+*.log
+events.out.tfevents.*
+
+# Third-party sources and nested repos: commits recorded in docs/third_party/LOCK.txt
+/third_party/
+
+# Projects are added selectively later: un-ignore with `!/projects/<name>/` or `git add -f`.
+/projects/*
+
+# Blender editor/add-on are not tracked for now.
+/tools/blender_addon/
+/tools/blender_editor.py
+/tests/test_blender_*.py
+
+# Assets, weights, datasets and media (not synced for now)
+/assets/
+/projects/*/assets/
+/projects/*/data/
+/projects/*/data_*/
+/migration/**/*.tar.zst
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.distcp
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.zip
+*.blend
+*.blend1
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.stl
+*.obj
+*.glb
+*.gltf
+*.dae
+*.ttf
+*.mp4
+*.gif
+*.pptx

@@ -1,0 +1,1 @@
+"""Project setup and explicit validation tools."""

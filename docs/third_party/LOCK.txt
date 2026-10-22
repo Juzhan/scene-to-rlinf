@@ -1,0 +1,13 @@
+# path  remote  commit  dirty_files   (regenerate: bash docs/third_party/update.sh)
+third_party/IsaacLab-Arena-isaac51  https://github.com/isaac-sim/IsaacLab-Arena.git  aad4f25f44cc439c363c2b60f1fd170dfd10d2a5  0
+third_party/IsaacLab-Arena  https://github.com/isaac-sim/IsaacLab-Arena.git  2a7dec3883a58452691f283dac4e6adfdea61786  1
+third_party/RLinf-ResNet10-pretrained  (not a git checkout; copy separately)
+third_party/RLinf-upstream  https://github.com/RLinf/RLinf.git  77ed948d68f07f55b4bc433b7643a409b2cd1adb  0
+third_party/RLinf  https://github.com/RLinf/RLinf.git  77ed948d68f07f55b4bc433b7643a409b2cd1adb  13
+third_party/SO-ARM100  https://github.com/TheRobotStudio/SO-ARM100.git  a758567c3978dfeefe282ede0500085a48fe8f78  0
+third_party/agx_arm_sim  https://github.com/agilexrobotics/agx_arm_sim.git  f8cd8b147c75d59e14f90fb0646770eefa268ed0  0
+third_party/curobo  https://github.com/NVlabs/curobo.git  4ea77366ca48ee453e7df139e39fa6532af49f3b  0
+third_party/isaaclab_reference  (not a git checkout; copy separately)
+third_party/mujoco_menagerie  https://github.com/google-deepmind/mujoco_menagerie.git  0059d4335f8156206f63a35662313385f7ad6d74  0
+third_party/pyroki  https://github.com/chungmin99/pyroki.git  388e43e1fc0d0ee382968d3dd72970fd62a0450c  0
+third_party/serl-frankasim  https://github.com/RLinf/serl.git  d5283dc984de78d223d29dc3b98016be71d50ffc  64

@@ -1,0 +1,48 @@
+# Shared defaults for single-actor RLinf supervised regression.
+defaults:
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+cluster:
+  num_nodes: 1
+  component_placement: {actor: '0'}
+runner:
+  task_type: sft
+  max_epochs: 100
+  max_steps: -1
+  val_check_interval: 10
+  save_interval: 100
+  logger:
+    log_path: ${experiment.output}/logs
+    project_name: supervised
+    experiment_name: sft
+    logger_backends: [tensorboard]
+experiment:
+  output: runs/first_training  # 相对于此项目；训练时必须是新目录
+  initial_weights: null       # 可选旧 residual_best.pt；仅载入权重，不是完整续训
+data:
+  train_data_paths: data/manifest.json
+  val_data_paths: ${data.train_data_paths}
+actor:
+  group_name: SupervisedActor
+  training_backend: fsdp
+  seed: 42
+  micro_batch_size: 128
+  global_batch_size: 128
+  eval_batch_size: 1024
+  model:
+    model_type: ???
+    precision: fp32
+    is_lora: false
+  optim:
+    lr: 0.00003
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 0.0
+    clip_grad: 1.0
+    lr_scheduler: constant
+    lr_warmup_steps: 0
+    total_training_steps: null
+  fsdp_config:
+    sharding_strategy: no_shard
+    use_orig_params: true

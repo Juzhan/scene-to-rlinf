@@ -1,0 +1,1 @@
+"""Simulator adaptations shared by tasks; no trainers or worker replacements."""
