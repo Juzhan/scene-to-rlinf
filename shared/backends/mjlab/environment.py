@@ -2,6 +2,12 @@
 import math
 from shared.backends.environment import Environment
 from shared.integrations.rlinf.terminal import snapshot
+from shared.backends.mjlab.scene import HIDDEN_GEOM_GROUP
+
+# Constraint rows per world. mujoco_warp's guess (64 for a small arm) overflows once two
+# finger pads grip a box (about 115 rows), and it then drops rows silently: fingers pass
+# their joint limits and the object is thrown. mjlab's own lift-cube task allocates 600.
+NJMAX = 600
 
 
 class TerminalObservationMixin:
@@ -56,7 +62,7 @@ def build_config(prepared, *, num_envs, seed, horizon):
     decimation = settings['world']['decimation']
     cfg = ManagerBasedRlEnvCfg(scene=scene, seed=seed, decimation=decimation,
         episode_length_s=math.nextafter(horizon * dt * decimation, 0.),
-        sim=SimulationCfg(mujoco=MujocoCfg(timestep=dt,
+        sim=SimulationCfg(njmax=NJMAX, mujoco=MujocoCfg(timestep=dt,
             gravity=tuple(settings.get('simulation', {}).get('gravity', [0.,0.,-9.81])))),
         actions={'control_chain': prepared.terms['actions']['control_chain']()},
         observations={source: ObservationGroupCfg(terms={'value':prepared.terms['observations'][source]()})
@@ -126,6 +132,7 @@ class Window:
             self.handle = mujoco.viewer.launch_passive(model, self.data)
             with self.handle.lock():
                 aim_camera(self.handle.cam, native, self.viewer)
+                self.handle.opt.geomgroup[HIDDEN_GEOM_GROUP] = 1
         if not self.handle.is_running():
             self.closed = True
             return
@@ -166,6 +173,7 @@ class Video:
             self.viewport = mujoco.MjrRect(0, 0, width, height)
             self.scene = mujoco.MjvScene(model, maxgeom=10000)
             self.option = mujoco.MjvOption()
+            self.option.geomgroup[HIDDEN_GEOM_GROUP] = 1
             self.pixels = np.empty((height, width, 3), dtype=np.uint8)
             self.data = mujoco.MjData(model)
             self.camera = mujoco.MjvCamera()

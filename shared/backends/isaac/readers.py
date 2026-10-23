@@ -4,6 +4,7 @@ from shared.assembly.readers import bind_common
 
 def bind_reader(env, settings, path):
     from .entity_observations import build_signal
+    from .robot import robots
     from .targets import read_target
     def physical(source):
         term = build_signal(source)
@@ -12,4 +13,5 @@ def bind_reader(env, settings, path):
                 parameter.resolve(env.scene)
         return lambda: term.func(env, **term.params)
     return bind_common(env, settings, path, bind_physical=physical,
-                       bind_sampled_target=lambda value: lambda: read_target(env, value))
+                       bind_sampled_target=lambda value: lambda: read_target(env, value),
+                       robots=robots(env, settings))

@@ -5,8 +5,11 @@ from .control import load_factory, component_observations
 
 class ComponentInput:
     """Read named native tensors without flattening, encoding or adding noise."""
-    def __init__(self, config, env, links, settings, *, bind_reader):
+    def __init__(self, config, env, links, settings, *, bind_reader, robots=None):
         from shared.assembly.signals import Signals, Signal, Observation
+        # Generated <Role>Obs of the project, so fixed components and decode get the same typed
+        # view (and robot methods) as written in policy.py; plain views without a project.
+        self.view_type, self.robots = config.get('_view'), robots
         self.signals = Signals()
         self.selection = Observation({entry['source']: entry['source'] for entry in component_observations(config['observations'])})
         for source in self.selection.fields:
@@ -23,8 +26,10 @@ class ComponentInput:
         return self.last[source]
 
     def __call__(self):
-        from shared.assembly.objects import ObjectView
-        return ObjectView({source: self.read(source) for source in self.selection.fields})
+        if not isinstance(self.view_type, type):
+            from shared.assembly.objects import ObjectView
+            self.view_type = load_factory(self.view_type) if self.view_type else ObjectView
+        return self.view_type({source: self.read(source) for source in self.selection.fields}, robots=self.robots)
 
     def reset(self, env_ids):
         for value in self.last.values():

@@ -66,12 +66,16 @@ def box(size: tuple[float, float, float] = (1., 1., 1.), mass: float | None = No
     return EntityCfg(spec_fn=spec_fn)
 
 
-def _mjcf_entity(path, fixed, gains=None, joint_pos=None, mass=None):
+def _mjcf_entity(path, fixed, gains=None, joint_pos=None, mass=None, pads=None, contacts=None):
     """Entity from an MJCF converted by shared.asset_formats.
 
     gains maps exact joint names to (stiffness, damping, effort limit or None); joints
     without gains stay passive. A fixed entity is welded to the world, else it gets
-    a free root joint. A mass rescales the single body's inertial."""
+    a free root joint. MuJoCo's parent filter does not apply to links of a welded root,
+    so their contacts with it are excluded, as PhysX does for jointed links. A mass
+    rescales the single body's inertial. pads maps exact body names to a massless
+    (half size, position) box added to that body; contacts maps exact body names to
+    MjsGeom attributes then set on every geom of that body."""
     from pathlib import Path
     import re
     import mujoco
@@ -89,6 +93,8 @@ def _mjcf_entity(path, fixed, gains=None, joint_pos=None, mass=None):
         if fixed:
             for joint in free:
                 spec.delete(joint)
+            for child in roots[0].bodies:
+                spec.add_exclude(bodyname1=roots[0].name, bodyname2=child.name)
         elif not free:
             roots[0].add_freejoint(name='root')
         for key in list(spec.keys):
@@ -99,6 +105,14 @@ def _mjcf_entity(path, fixed, gains=None, joint_pos=None, mass=None):
                 raise ValueError(f'{path}: mass applies to a single rigid body, found {[b.name for b in bodies]}')
             bodies[0].inertia = [value * mass / bodies[0].mass for value in bodies[0].inertia]
             bodies[0].mass = mass
+        for name, (size, position) in (pads or {}).items():
+            body = spec.body(name)
+            body.add_geom(name=f'{name}_pad', type=mujoco.mjtGeom.mjGEOM_BOX, size=size, pos=position,
+                          mass=0., rgba=list(body.geoms[0].rgba))
+        for name, attributes in (contacts or {}).items():
+            for geom in spec.body(name).geoms:
+                for key, value in attributes.items():
+                    setattr(geom, key, value)
         return spec
     groups = {}
     for joint, values in (gains or {}).items():
@@ -119,7 +133,15 @@ def _joint_names(path):
 
 
 def piper_x(usd_path=None, fix_root_link=True):
-    """Piper X from the MJCF recorded beside its USD; gains match the Isaac PIPER_X_CFG."""
+    """Piper X from the MJCF recorded beside its USD; gains match the Isaac PIPER_X_CFG.
+
+    The fingers touch a held object only through the flat 2.5 x 1 cm tip face of their
+    collision hulls. MuJoCo returns one contact point per mesh pair, which wanders over
+    that face, so the object pivots and slips out where PhysX keeps a contact patch; a
+    box pad flush with the face gives box-box multi-point contacts instead. The 25 g
+    fingers squeeze with 10 N and under the default soft contact sink about 6 mm each
+    into the object (grip opening 0.037 vs 0.048 in Isaac); stiffer finger contacts with
+    priority (not mixed with the object's) keep the opening at 0.045-0.048."""
     from pathlib import Path
     from shared.asset_formats import mjcf_for
     usd = workspace_file(usd_path or Path(__file__).resolve().parents[3] / 'assets/piper_x/piper_x.usda')
@@ -128,7 +150,90 @@ def piper_x(usd_path=None, fix_root_link=True):
                         {**{f'joint{index}': arm for index in range(1, 7)},
                          'gripper_joint1': gripper, 'gripper_joint2': gripper},
                         {'joint1': 0., 'joint2': 1.4, 'joint3': -1.2, 'joint4': 0., 'joint5': 1.2,
-                         'joint6': 0., 'gripper_joint1': .05, 'gripper_joint2': -.05})
+                         'joint6': 0., 'gripper_joint1': .05, 'gripper_joint2': -.05},
+                        pads={finger: ([.0115, .005, .0005], [0., -.005, .0005])
+                              for finger in ('gripper_link1', 'gripper_link2')},
+                        contacts={finger: {'solref': [.01, 1.], 'solimp': [.95, .99, .001, .5, 2.], 'priority': 1,
+                                           'condim': 4, 'friction': [1., .02, .0001]}
+                                  for finger in ('gripper_link1', 'gripper_link2')})
+
+
+def piper(usd_path=None, fix_root_link=True):
+    """Piper from the MJCF recorded beside its USD; gains and ready pose match the Isaac PIPER_CFG."""
+    from pathlib import Path
+    from shared.asset_formats import mjcf_for
+    usd = workspace_file(usd_path or Path(__file__).resolve().parents[3] / 'assets/piper/piper.usd')
+    arm, gripper = (100., 5., 100.), (1000., 50., 10.)
+    return _mjcf_entity(mjcf_for(usd), fix_root_link,
+                        {**{f'joint{index}': arm for index in range(1, 7)}, 'joint7': gripper, 'joint8': gripper},
+                        {'joint1': 0., 'joint2': 1.4, 'joint3': -1.2, 'joint4': 0., 'joint5': 1.2,
+                         'joint6': 0., 'joint7': .035, 'joint8': -.035})
+
+
+def m20(usd_path=None, fix_root_link=False):
+    """DEEP Robotics M20 from the MJCF recorded beside its USD, driven like DEEPROBOTICS_M20_CFG.
+
+    Isaac's DelayedPDActuator is an explicit PD whose lag of 0-1 physics steps is drawn per
+    environment at reset and held; here that is an ideal PD (motor) inside a delay wrapper
+    that draws the lag on the first step after reset and never refreshes it in an episode."""
+    from pathlib import Path
+    from mjlab.actuator import DelayedActuatorCfg, IdealPdActuatorCfg
+    from mjlab.entity import EntityArticulationInfoCfg
+    from shared.asset_formats import mjcf_for
+    usd = workspace_file(usd_path or Path(__file__).resolve().parents[3] / 'assets/m20/M20.usd')
+    cfg = _mjcf_entity(mjcf_for(usd), fix_root_link, joint_pos={
+        '.*hipx_joint': 0., 'f[lr]_hipy_joint': -.3, 'h[lr]_hipy_joint': .3,
+        'f[lr]_knee_joint': .6, 'h[lr]_knee_joint': -.6, '.*_wheel_joint': 0.})
+    delayed = lambda base: DelayedActuatorCfg(base_cfg=base, delay_target=('position', 'velocity', 'effort'),
+                                              delay_min_lag=0, delay_max_lag=1,
+                                              delay_update_period=2 ** 62, delay_per_env_phase=False)
+    cfg.articulation = EntityArticulationInfoCfg(actuators=(
+        delayed(IdealPdActuatorCfg(target_names_expr=('.*hipx_joint', '.*hipy_joint', '.*knee_joint'),
+                                   stiffness=80., damping=2., effort_limit=76.4)),
+        delayed(IdealPdActuatorCfg(target_names_expr=('.*_wheel_joint',), stiffness=0., damping=.6,
+                                   effort_limit=21.6, armature=.00243216))))
+    cfg.init_state.pos = (0., 0., .58)
+    return cfg
+
+
+def anymal_c():
+    """ANYmal-C from the MJCF recorded beside its local Isaac 5.1 USD mirror, driven like ANYMAL_C_CFG
+    by the same ANYdrive LSTM network (assets/anymal_c/ActuatorNets, see manifest.json)."""
+    from pathlib import Path
+    from mjlab.entity import EntityArticulationInfoCfg
+    from shared.asset_formats import mjcf_for
+    from .actuators import LstmActuatorCfg
+    root = Path(__file__).resolve().parents[3] / 'assets/anymal_c'
+    cfg = _mjcf_entity(mjcf_for(root / 'anymal_c.usd'), False, joint_pos={
+        '.*HAA': 0., '.*F_HFE': .4, '.*H_HFE': -.4, '.*F_KFE': -.8, '.*H_KFE': .8})
+    cfg.articulation = EntityArticulationInfoCfg(actuators=(LstmActuatorCfg(
+        target_names_expr=('.*HAA', '.*HFE', '.*KFE'), network_file=str(root / 'ActuatorNets/anydrive_3_lstm_jit.pt'),
+        saturation_effort=120., effort_limit=80., velocity_limit=7.5),))
+    cfg.init_state.pos = (0., 0., .6)
+    return cfg
+
+
+def franka_panda(fix_root_link=True):
+    """Franka Panda from the local mirror of the Isaac 5.1 USD; gains and pose match FRANKA_PANDA_CFG."""
+    from pathlib import Path
+    from shared.asset_formats import mjcf_for
+    usd = Path(__file__).resolve().parents[3] / 'assets/franka_panda/panda_instanceable.usd'
+    shoulder, forearm, hand = (80., 4., 87.), (80., 4., 12.), (2e3, 1e2, 200.)
+    return _mjcf_entity(mjcf_for(usd), fix_root_link,
+                        {**{f'panda_joint{index}': shoulder for index in range(1, 5)},
+                         **{f'panda_joint{index}': forearm for index in range(5, 8)},
+                         'panda_finger_joint1': hand, 'panda_finger_joint2': hand},
+                        {'panda_joint1': 0., 'panda_joint2': -.569, 'panda_joint3': 0., 'panda_joint4': -2.81,
+                         'panda_joint5': 0., 'panda_joint6': 3.037, 'panda_joint7': .741,
+                         'panda_finger_joint1': .04, 'panda_finger_joint2': .04})
+
+
+def seattle_table():
+    """Static Seattle lab table from the local mirror of the Isaac 5.1 USD (collider: its top box)."""
+    from pathlib import Path
+    from shared.asset_formats import mjcf_for
+    return _mjcf_entity(mjcf_for(Path(__file__).resolve().parents[3] / 'assets/seattle_table/table_instanceable.usd'),
+                        True)
 
 
 def urdf_robot(urdf_path, fix_base=True, stiffness=100.0, damping=10.0, merge_fixed_joints=True):
@@ -257,5 +362,5 @@ def frame_transformer(target_body, target_position=(0.0, 0.0, 0.0),
 
 
 FACTORIES = {factory.__name__: factory for factory in
-             (go2, ground_plane, box, piper_x, urdf_robot, usd_robot, usd_object,
-              dex_cube, clear_sky, camera, frame_transformer)}
+             (go2, anymal_c, ground_plane, box, piper, piper_x, m20, franka_panda, seattle_table, urdf_robot, usd_robot,
+              usd_object, dex_cube, clear_sky, camera, frame_transformer)}

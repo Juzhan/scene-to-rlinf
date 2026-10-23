@@ -2,10 +2,18 @@
 import torch
 from .targets import target_catalog
 from .abstract import mounted_pose, tensor_field
+from .robot import FRAME_FIELDS, frame_observations
 
 
-def bind_common(env, settings, path, *, bind_physical, bind_sampled_target):
+def bind_common(env, settings, path, *, bind_physical, bind_sampled_target, robots=None):
     targets = target_catalog(settings)
+    frame = frame_observations(settings.get('_robot_frames') or {}).get(path)
+    if frame is not None:
+        # A named robot frame is read through the backend's robot interface, like frame_pose.
+        robot, name, field = frame
+        kinematics = robots(robot)
+        index = FRAME_FIELDS.index(field)
+        return lambda: kinematics.frame_pose(name)[index]
     if path in targets:
         value = targets[path][0]
         if isinstance(value, dict) and value['sampled']:

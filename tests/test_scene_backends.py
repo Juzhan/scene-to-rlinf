@@ -29,8 +29,13 @@ def test_unsupported_features_fail_before_simulator():
     world.root.children[1].prim_name = 'custom_prim'  # only renames the Isaac prim
     validate(world, settings)
     from shared.assembly.spec import BodyFrame, Pose
-    world.root.children[1].frames = (BodyFrame('tip', 'base', Pose()),)
-    with pytest.raises(NotImplementedError, match='body frames'):
+    robot = next(node for node in world.root.children if node.kind == 'robot')
+    other = next(node for node in world.root.children if node.kind != 'robot' and node.factory)
+    # Robot frames are read through the shared robot interface; nothing else carries frames in mjlab yet.
+    robot.frames = (BodyFrame('tip', 'base', Pose()),)
+    validate(world, settings)
+    other.frames = (BodyFrame('tip', '', Pose()),)
+    with pytest.raises(NotImplementedError, match='robot entities only'):
         validate(world, settings)
 
 

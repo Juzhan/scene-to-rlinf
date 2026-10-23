@@ -46,6 +46,8 @@ bash run.sh train my_project
 
 模型使用 `obs.robot.joint_position`、`obs.robot.wrist_camera.rgb` 等对象属性；保留张量原始形状和 dtype。模型只看到选中的信息，Task 可以按需读取完整场景基础信息。数学计算与编码由 Python/Torch 完成，不再编写 YAML Task 公式。
 
+机器人节点（`kind: robot`）另有方法：`obs.piper.frame_pose('tcp')`、`jacobian(frame)`、`differential_ik(frame, position, orientation=None, max_step=...)`、`joint_names()`。`frame` 为本体 body 名或命名坐标系（资产默认的 `tcp` 等，可在实体 `frames` 覆盖或新增；也可直接选为观察 `piper.tcp.position`，无需传感器），运动链由坐标系决定，不需要写关节列表或在 scene.yaml 配置 IK。固定组件、`decode_action`/`initial_action` 和 task.py 可调用；被训练组件在 policy worker 中只拿到张量，调用会明确报错。接口与各后端实现见 [后端说明](docs/SCENE_BACKENDS.md#后端钩子)。
+
 共享相机 `factory: camera`（Isaac）的参数：`width`/`height`（像素）、`data_types`（任选 `rgb`、`distance_to_image_plane`、`distance_to_camera`、`normals`，同一分辨率）、`focal_length`（mm，水平孔径固定 20.955 mm）、`clipping_range`（近/远裁剪面，m）、`depth_clipping`（超出远裁剪面的深度：`max` 取远平面值、`zero` 置 0、`none` 保留 inf）。每种输出是相机下的一个观察：`rgb` 为 uint8 `[B,H,W,3]`，两种深度为 float `[B,H,W,1]`（m），`normals` 为 float `[B,H,W,3]`（环境坐标轴单位向量）；不做归一化。只能选择相机已开启的输出，选中的输出从 `data_types` 去掉时，check 与编辑器保存会明确报错。`application.enable_cameras: false` 时相机不构建也不渲染。mjlab 支持 rgb 与两种深度，与 Isaac 的差异见 [SCENE_BACKENDS](docs/SCENE_BACKENDS.md)。
 
 点、方向、矩形、长方体等空间量写成 `entities` 中 `kind: abstract` 的抽象体，与物体一样添加、选中、删除和选作观察，只是没有模型和物理：
@@ -76,11 +78,11 @@ bash run.sh train my_project
 | `initial_action(obs)`（可选 `executor.initial`） | `ExecutorOutput`：启动和每次复位时的解码前动作；未设置为 0 |
 | `evaluate(obs: SceneInfo)` | `TaskResult`：reward/success/failure/metrics，按环境输出，缺省 0/False；reward 乘 step_dt 计入回报，success/failure 结束回合，metrics 在回合结束时记入日志 `env/task/<名称>` |
 
-`control.output` 的 `joint_names` 逐个列出关节名，不用正则，列出顺序即该终点的动作维度顺序；`executor.dimension: auto` 只适用于训练动作数等于控制关节总数，类型中直接写出该总数；`executor.output`/`previous_output` 是解码前动作。同一关节被多个终点控制时在环境初始化时报错。Task 跨步统计用 `shared.assembly.task_memory.TaskMemory`（按环境自动复位）。
+`control.output` 的 `joint_names` 逐个列出关节名，不用正则，列出顺序即该终点的动作维度顺序；`executor.dimension: auto` 只适用于训练动作数等于控制关节总数，类型中直接写出该总数；`executor.output`/`previous_output` 是解码前动作。同一关节被多个终点控制时在环境初始化时报错。Task 跨步统计用 `shared.assembly.task_memory.TaskMemory`（按环境自动复位）：`hold` 计持续时间，`mean` 求平均，`rate` 求逐步变化率（复位后第一步为 inf）。
 
 ## 网页、Blender 与终端
 
-`run.sh edit` 默认打开网页编辑器，加 `--blender` 改用 Blender。三者编辑同一份 `scene.yaml`，都经过共享 `SceneDocument` 写回。新建环境默认包含地面、灯光、固定底座的 Franka 机械臂和一个方块（`shared/assembly/starter.py`），可删改。编辑器可以摆放实体、组合安装、调整初始关节状态，添加和编辑抽象体，分别勾选 planner/executor 观察、设置组件决策周期与输出维度、选择训练角色与控制终点。没有 Task 面板，任务编辑 `task.py`。
+`run.sh edit` 默认打开网页编辑器，加 `--blender` 改用 Blender。三者编辑同一份 `scene.yaml`，都经过共享 `SceneDocument` 写回。新建环境默认包含地面、灯光、固定底座的 Franka 机械臂和一个方块（`shared/assembly/starter.py`），可删改。编辑器可以摆放实体、组合安装、调整初始关节状态，添加和编辑抽象体，切换被训练的模块，在各模块页面设置决策周期并勾选观察（模块只能选择前序模块的接口），设置控制终点。planner 输出维度不在网页编辑器中修改，直接写 `scene.yaml`。没有 Task 面板，任务编辑 `task.py`。
 
 网页编辑器（viser，无需 Blender）：
 
@@ -109,7 +111,8 @@ Blender 中，界面保存项目配置时更新 `observation.py`；普通 Ctrl-S
 - `view` / `record`：实际场景预览或策略回放。
 - `smoke`：短程接口、终止与复位检查，不代表策略学会任务。
 - `train` / `evaluate`：调用 RLinf 训练或评估。SFT、MuJoCo/VLA 专用项目以其 README 的能力边界为准。
-- `asset convert <源文件> <资产目录>`：由 USD、URDF 或 MJCF 生成另一后端所需格式（USD↔MJCF，经 URDF 中转，全部使用官方转换器），在资产目录写入 `mjcf/` 或 `usd/` 与 `ASSET.json`（来源哈希、转换步骤、对齐报告）；`asset check <资产目录>` 重新比较 USD 与 MJCF 的连杆位姿、质量、质心、惯量、关节轴与限位。自动使用 `.venv-mjlab`（需 mujoco 与 pxr）。外观只求接近：有碰撞几何的连杆在 MJCF 中用碰撞网格并取主要材质颜色。执行器与增益不在转换文件中，由各后端资产工厂声明。由 URDF/MJCF 生成 USD 会启动 Isaac（Kit）。
+- `asset convert <源文件> <资产目录>`：由 USD、URDF 或 MJCF 生成另一后端所需格式（USD↔MJCF，经 URDF 中转，全部使用官方转换器），在资产目录写入 `mjcf/` 或 `usd/` 与 `ASSET.json`（来源哈希、转换步骤、对齐报告）；`asset check <资产目录>` 重新比较 USD 与 MJCF 的连杆位姿、质量、质心、惯量、关节轴与限位。自动使用 `.venv-mjlab`（需 mujoco 与 pxr）。外观只求接近：碰撞几何与视觉包围盒相差不超过 5 mm 的连杆在 MJCF 中用碰撞网格并取主要材质颜色；相差更大时（如 piper_x 的相机支架与 D435）保留视觉网格，碰撞几何放到不渲染的 geom group 3；超过 MuJoCo 20 万面上限的网格按顶点聚类简化，记录在 ASSET.json。执行器与增益不在转换文件中，由各后端资产工厂声明。由 URDF/MJCF 生成 USD 会启动 Isaac（Kit）。资产架上的 piper、piper_x、m20、franka_panda、seattle_table、anymal_c 均已转换并通过对齐检查，两个后端都可直接使用（ANYmal-C 在 mjlab 使用同一 LSTM 执行器网络），清单与差异见 [docs/SCENE_BACKENDS.md](docs/SCENE_BACKENDS.md)。
+- `asset terrain <地形名|all> <资产目录> [--size --difficulty --seed --param JSON]`：不给 `--param` 时用 `shared/terrain_assets.py` 的 PRESETS；`all` 把 21 种预设写到 `<资产目录>/<地形名>/`，已存在的跳过。`assets/terrains/` 下的地块自动列在 Web 编辑器资产架的“地面 / 地形”类。用 Isaac Lab 地形生成器生成一块以原点为中心的地块，写出 USD（原始三角形静态碰撞体）、MJCF（box、凸包、hfield 重建，MuJoCo 网格碰撞取凸包）与 `ASSET.json`，并把 MJCF 与三角形的高度差校验后记录；之后在两个后端都用 `usd_object` 当普通静态物体引用。非凸封闭块与不规则曲面会被拒绝。详见 [docs/SCENE_BACKENDS.md](docs/SCENE_BACKENDS.md)。
 
 新训练写独立实验目录。快照保存有效配置和项目源码；观察顺序、训练角色、控制周期、解码函数、终点类型与关节顺序变化都属于接口变化。`--allow-scene-change` 不允许绕过模型接口检查。
 

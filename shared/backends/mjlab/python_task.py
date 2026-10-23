@@ -5,8 +5,9 @@ from shared.assembly.python_task import Runtime as TaskRuntime
 class Runtime(TaskRuntime):
     def __init__(self, env, config, settings):
         from .readers import bind_reader
+        from .robot import robots
         super().__init__(env, config, settings,
-                         bind_reader=lambda path: bind_reader(env, settings, path))
+                         bind_reader=lambda path: bind_reader(env, settings, path), robots=robots(env, settings))
 
 
 def evaluate(env, config, settings, field):

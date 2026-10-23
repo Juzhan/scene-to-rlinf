@@ -244,6 +244,7 @@ def compile_control(settings, registry, *, project_package=None, backend=DEFAULT
     targets = target_catalog(settings)
     for name, cfg in components.items():
         periods[name] = period_steps(name, cfg.get('period'), dt)
+        cfg['_view'] = f'{project_package}.observation:{name.capitalize()}Obs' if project_package else None
         cfg['_targets'] = {}
         for entry in component_observations(cfg['observations']):
             source = entry['source']

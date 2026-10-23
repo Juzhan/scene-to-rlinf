@@ -298,6 +298,9 @@ class SceneDocument:
         abstract = {self.entities[path]['name'] for path in removed if self.entities[path].get('kind') == 'abstract'}
         def dropped(term):
             return bool(parse_signal(term) and parse_signal(term)[0] in keys) or term.split('.', 1)[0] in abstract
+        for role, component in self.data.get('control', {}).get('components', {}).items():
+            if component['observations'] and all(dropped(term) for term in component['observations']):
+                raise ValueError(f"删除后 {role} 没有任何观察输入；请先在观察页为 {role} 选择其他输入，再删除")
         def container(path):
             parent = dirname(path)
             return self.data['entities'] if parent == self.data.get('name', 'world') else self.targets[parent][0]['children']

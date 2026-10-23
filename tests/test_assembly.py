@@ -1143,3 +1143,12 @@ def test_new_framework_does_not_export_legacy_aliases(tmp_path):
     OmegaConf.save(OmegaConf.create(config), path)
     with pytest.raises(ValueError, match="Unknown entity kind"):
         load_world_spec(path, cameras=True)
+
+
+def test_terrain_variants_reject_unknown_names_and_name_isaac_config_classes():
+    from shared.backends.isaac.assets import TERRAIN_VARIANTS, terrain_variant
+
+    with pytest.raises(ValueError, match="Unknown terrain variant 'ramp'.*stairs"):
+        terrain_variant("ramp", {})
+    assert {"stairs", "inverted_stairs", "gap", "slope", "rough", "stepping_stones"} <= set(TERRAIN_VARIANTS)
+    assert all(name.startswith(("Mesh", "Hf")) and name.endswith("TerrainCfg") for name in TERRAIN_VARIANTS.values())

@@ -70,3 +70,37 @@ def test_native_camera_depth_matches_geometry():
     plane = depth(camera.data.depth, camera.cfg, 'distance_to_image_plane', cosine)
     torch.testing.assert_close(plane, torch.ones_like(plane), atol=1e-3, rtol=0)
     torch.testing.assert_close(ray, 1 / cosine.expand_as(ray), atol=1e-3, rtol=0)
+
+
+@pytest.mark.skipif(os.environ.get('RUN_MJLAB_GPU') != '1', reason='requires mjlab CUDA environment')
+def test_anymal_lstm_actuator_follows_isaac_network_and_resets_per_env():
+    from mjlab.scene import Scene, SceneCfg
+    from mjlab.sim import Simulation, SimulationCfg
+    from shared.backends.mjlab.assets import FACTORIES
+    scene = Scene(SceneCfg(num_envs=2, entities={'ground': FACTORIES['ground_plane'](),
+                                                 'robot': FACTORIES['anymal_c']()}), device='cuda:0')
+    sim = Simulation(num_envs=2, cfg=SimulationCfg(), model=scene.compile(), device='cuda:0')
+    scene.initialize(mj_model=sim.mj_model, model=sim.model, data=sim.data)
+    robot = scene['robot']
+    actuator, = robot.actuators
+    target = robot.data.default_joint_pos.clone()
+    robot.write_joint_state_to_sim(target, torch.zeros_like(target))
+    robot.write_root_state_to_sim(robot.data.default_root_state.clone())
+    scene.reset()
+    sim.forward()
+    # Isaac ActuatorNetLSTM: one sequence step per env x joint over (target - position, velocity).
+    hidden = torch.zeros(2, 24, 8, device='cuda:0')
+    cell = torch.zeros_like(hidden)
+    for _ in range(20):
+        robot.set_joint_position_target(target)
+        error, velocity = target - robot.data.joint_pos, robot.data.joint_vel
+        with torch.no_grad():
+            expected, (hidden, cell) = actuator.network(
+                torch.stack((error, velocity), -1).reshape(24, 1, 2), (hidden, cell))
+        scene.write_data_to_sim()
+        torch.testing.assert_close(sim.data.ctrl[:], expected.reshape(2, 12).clamp(-80, 80))
+        sim.step()
+        scene.update(sim.cfg.mujoco.timestep)
+    scene.reset(torch.tensor([1], device='cuda:0'))
+    assert actuator._hidden[:, 1].abs().sum() == 0 and actuator._cell[:, 1].abs().sum() == 0
+    assert actuator._hidden[:, 0].abs().sum() > 0

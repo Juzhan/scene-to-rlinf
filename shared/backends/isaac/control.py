@@ -7,8 +7,9 @@ from shared.assembly.policy_runtime import ComponentInput as BaseInput, Feedback
 class ComponentInput(BaseInput):
     def __init__(self, config, env, links, settings):
         from .readers import bind_reader
+        from .robot import robots
         super().__init__(config, env, links, settings,
-                         bind_reader=lambda path: bind_reader(env, settings, path))
+                         bind_reader=lambda path: bind_reader(env, settings, path), robots=robots(env, settings))
 
 
 class FeedbackChain(BaseChain):

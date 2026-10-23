@@ -3,11 +3,12 @@ from functools import lru_cache
 import torch
 from shared.assembly.policy_runtime import ComponentInput, FeedbackChain, validate_targets
 from .readers import bind_reader
+from .robot import robots
 
 
 def component_input(config, env, links, settings):
     return ComponentInput(config, env, links, settings,
-                          bind_reader=lambda path: bind_reader(env, settings, path))
+                          bind_reader=lambda path: bind_reader(env, settings, path), robots=robots(env, settings))
 
 
 class Endpoint:
@@ -32,8 +33,16 @@ class Endpoint:
         self.ids = torch.tensor(indices, dtype=torch.long, device=env.device)
         self.action_dim = len(indices)
         self.write = getattr(self.entity, 'set_' + mode + '_target')
+        self.clamp = mode == 'joint_position'
 
     def apply(self, value):
+        if self.clamp:
+            # MuJoCo joint limits are soft: a position target beyond the range keeps the actuator
+            # pushing through the limit (a 25 g finger sinks 1-2 cm at 10 N). PhysX limits are hard,
+            # so clamp the target to the range; unlimited joints report an empty [0, 0] range.
+            lower, upper = self.entity.data.joint_pos_limits[:, self.ids].unbind(-1)
+            limited = lower < upper
+            value = torch.where(limited, torch.minimum(torch.maximum(value, lower), upper), value)
         self.write(value, joint_ids=self.ids)
 
 

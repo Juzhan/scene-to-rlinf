@@ -80,4 +80,6 @@ def bind_reader(env, settings, path):
         return lambda: getattr(data, attribute)
     def sampled(value):
         raise NotImplementedError('mjlab randomized abstract entities are not connected yet')
-    return bind_common(env, settings, path, bind_physical=physical, bind_sampled_target=sampled)
+    from .robot import robots
+    return bind_common(env, settings, path, bind_physical=physical, bind_sampled_target=sampled,
+                       robots=robots(env, settings))

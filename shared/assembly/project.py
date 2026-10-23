@@ -143,6 +143,16 @@ def prepare_geometry(scene_config, *, project_package=None):
     return PreparedScene(path, settings, application, assets, {}, {}, description)
 
 
+def refresh_observation_types(scene, package, **options):
+    """Regenerate a live project's observation.py; a frozen run snapshot keeps the file it recorded.
+
+    The generator's comments follow the shared code, so rewriting a snapshot would break its hash."""
+    if package and package.startswith('_experiment_'):
+        return
+    from .object_schema import generate
+    generate(scene, **options)
+
+
 def prepare_scene(parameters, *, scene_config, project_package=None, factories=None,
                   terms=None, tasks=None, headless=None, enable_cameras=None, require_training=True):
     """Same static preparation for check, preview and every RLinf worker."""
@@ -156,10 +166,9 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
         if (Path(scene_config).parent / 'task.py').is_file() and project_package:
             if settings.get('variables') or settings.get('task'):
                 raise ValueError('Python Task projects define evaluation in task.py; remove task/variables from scene.yaml')
-            from .object_schema import generate
             # Project-local assets must be discoverable while the typed schema
             # is regenerated, exactly as they are for the environment itself.
-            generate(path, factories=assets, terms=registered_terms)
+            refresh_observation_types(path, project_package, factories=assets, terms=registered_terms)
             registered_terms['object_api'] = {'module': project_package}
             task_module = import_module(project_package + '.task')
             if not callable(getattr(getattr(task_module, 'Task', task_module), 'evaluate', None)):
@@ -179,6 +188,8 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
             from .legacy.task import evaluation_config
             evaluation = evaluation_config(settings)
         from .control import compile_control
+        from .robot import robot_frames
+        settings['_robot_frames'] = robot_frames(load_world_spec(path, cameras=False, factories=assets))
         settings, registered_terms = compile_control(settings, registered_terms, project_package=project_package, backend=backend)
         application = {"headless": True, "enable_cameras": False, **settings.get("application", {})}
         if headless is not None:
@@ -262,9 +273,8 @@ class Project:
         from shared.integrations.rlinf.isaac import register_isaac_assembly_env
         object_api = (self.scene_config.parent / 'task.py').is_file()
         if object_api:
-            from .object_schema import generate
             factories, terms, _ = project_registry(self.package)
-            generate(self.scene_config, factories=factories, terms=terms)
+            refresh_observation_types(self.scene_config, self.package, factories=factories, terms=terms)
         policy = import_module(self.package + ".policy")
         from .layout import load_scene_config
         settings = load_scene_config(self.scene_config)

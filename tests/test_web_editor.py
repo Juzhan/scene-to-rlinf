@@ -116,6 +116,16 @@ added = SceneDocument(scene).entities['world/' + name]
 assert added['kind'] == 'abstract' and added['shape'] == 'box' and added['size'] == [0.2, 0.3, 0.4], added
 editor._choose_asset('abstract:point')
 assert not editor.asset_size.visible
+import json
+W.TERRAINS = W.Path({str(tmp_path)!r}) / 'terrains'
+(W.TERRAINS / 'stairs').mkdir(parents=True)
+(W.TERRAINS / 'stairs' / 'ASSET.json').write_text(json.dumps({{
+    'formats': {{'usd': 'assets/terrains/stairs/usd/stairs.usda'}},
+    'terrain': {{'label': '台阶', 'size': 8.0, 'spawn_origin': [0.0, 0.0, 1.5]}}}}))
+editor._refresh_assets()
+tile = editor.gallery_entries['library:terrain_stairs']
+assert tile['category'] == 'terrain' and tile['factory'] == 'usd_object' and tile['label'] == '台阶', tile
+assert tile['parameters'] == {{'usd_path': 'assets/terrains/stairs/usd/stairs.usda'}}, tile
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -268,7 +278,7 @@ editor.server.stop()
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-def test_component_period_and_dimension_fields(tmp_path):
+def test_training_switch_and_module_pages(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('__pycache__'))
     script = f'''
@@ -277,22 +287,49 @@ sys.path.insert(0, {str(ROOT)!r})
 import tools.web_editor as W
 from shared.assembly.editing import SceneDocument
 editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
-editor.role_pick.value = 'planner'
-assert editor.component_fields['period'].value == '0.02' and editor.component_fields['dimension'].value == '3'
-editor.component_fields['period'].value = '0.015'  # Not a multiple of dt 0.01: rejected on save.
+tabs = editor.observation_tabs
+assert list(tabs) == ['planner', 'executor'] and editor.train_role == 'executor'
+assert tabs['executor'].icon == 'flame' and tabs['planner'].icon == 'lock'
+assert '"输出控制动作 · 训练中"' in editor.train_style.content and '"生成目标 · 固定"' in editor.train_style.content
+assert 'button:nth-child(2){{--button-bg:var(--mantine-color-orange' in editor.train_style.content
+# Planner sees no module interfaces, executor only the planner's; both pages list rows alike.
+shown = {{role: [key for profile, key in editor.observation_boxes if profile == role] for role in tabs}}
+assert not any(key.startswith(('planner.', 'executor.')) for key in shown['planner']), shown['planner']
+assert 'planner.output' in shown['executor'] and not any(key.startswith('executor.') for key in shown['executor'])
+common = [key for key in shown['executor'] if key in shown['planner']]
+assert common == [key for key in shown['planner'] if key in shown['executor']]
+editor._set_train('planner')
+editor._set_train('planner')  # Already trained: no second undo step.
+assert tabs['planner'].icon == 'flame' and '"生成目标 · 训练中"' in editor.train_style.content
+assert editor.collect()['control_train'] == 'planner'
+editor.undo_edit()
+assert editor.train_role == 'executor' and 'control_train' not in editor.collect()
+assert editor.observation_tabs['executor'].icon == 'flame'
+editor.redo_edit()
+# Each module page edits only that module's inputs.
+saved = SceneDocument(editor.scene).snapshot()['control']['components']
+key = next(key for key in editor.observation_order['planner'] if key not in saved['planner']['observations']
+           and not editor.observation_boxes[('planner', key)].disabled)
+editor.observation_boxes[('planner', key)].value = True
+# Group folders holding a ticked box are highlighted client-side via :checked.
+uuid = editor.observation_boxes[('planner', key)]._impl.uuid
+assert any(f'input[id="{{uuid}}"]:checked' in getattr(item, 'content', '') for item in editor.observation_items)
+assert editor.collect()['observations'] == {{'planner': saved['planner']['observations'] + [key]}}
+editor.period_fields['planner'].value = '0.015'  # Not a multiple of dt 0.01: rejected on save.
 editor.save()
 assert 'error' in editor.status.content
-assert SceneDocument(editor.scene).snapshot()['control']['components']['planner']['period'] == 0.02
-editor.component_fields['period'].value = '0.1'
-editor.component_fields['dimension'].value = '4'
-assert editor.collect()['components'] == {{'planner': {{'period': 0.1, 'dimension': 4}}}}
-editor.undo_edit()  # Typing in one field is one step: only the dimension reverts.
+editor.period_fields['planner'].value = '0.1'
 assert editor.collect()['components'] == {{'planner': {{'period': 0.1}}}}
-assert editor.component_fields['dimension'].value == '3'
-editor.redo_edit()
+editor.dimension_fields['planner'].value = 'auto'  # Only executor may resolve its dimension.
 editor.save()
-planner = SceneDocument(editor.scene).snapshot()['control']['components']['planner']
-assert planner['period'] == 0.1 and planner['dimension'] == 4, planner
+assert 'error' in editor.status.content
+editor.dimension_fields['planner'].value = '6'
+assert editor.collect()['components'] == {{'planner': {{'period': 0.1, 'dimension': 6}}}}
+editor.save()
+saved = SceneDocument(editor.scene).snapshot()['control']
+assert saved['train'] == 'planner' and key in saved['components']['planner']['observations']
+assert saved['components']['planner']['period'] == 0.1 and saved['components']['planner']['dimension'] == 6
+assert key not in saved['components']['executor']['observations']
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)

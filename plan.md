@@ -80,4 +80,6 @@
 
 - 第二、三、四步的网页闭环已打通：`tools/web_editor.py`（viser），入口 `run.py edit <project> --web`。覆盖加载、添加/删除资产、移动旋转、布局组合、布局父子与物理安装（偏移、对齐）、初始关节状态（FK 实时预览、取消恢复）、复位绑定、区域与目标、planner/executor 观察、训练角色和命名控制终点，保存走 `SceneDocument`/`apply_edits` 并更新 `observation.py`。
 - 已验证：assembly_lift / planner_executor / assembly_go2 副本上各操作保存、重开后无残留修改，编辑后的副本通过 `run.py check`；网页触发的 Isaac 原生网格导出可回填显示；`tests/test_web_editor.py`。
-- 未完成：坐标计算已收于 `shared/assembly/frames.py`，但 Blender 插件尚未改用它；资产仍用分类下拉选择，缩略图陈列栏留到界面优化；第五步（MuJoCo 后端核对）未开始；浏览器内框选、撤销尚未实现。
+- 浏览器实测（2026-10-22，assembly_lift 副本）：改位置后保存按钮变为“保存到 scene.yaml”、实体带未保存标记；保存后 scene.yaml 只改动对应数值；Ctrl+Z 按快照还原文件，刷新后保持；添加资产、删除（有确认框）和逐步撤回均正常。保存会按统一格式重写 yaml（缩进风格可能与手写不同，语义不变）。
+- 资产架只列两个后端都有工厂的资产：piper、piper_x、m20、franka_panda、seattle_table、anymal_c 已用 `run.py asset convert` 备好 USD+MJCF 并通过对齐检查（后三者为 Isaac 5.1 资产的本地镜像，带 manifest），Go2 在 mjlab 用 Menagerie 原生 MJCF；网格与缩略图已预生成到 `.cache/`，打开网页即可加载。
+- 未完成：坐标计算已收于 `shared/assembly/frames.py`，但 Blender 插件尚未改用它；第五步（MuJoCo 后端核对）未开始；浏览器内框选尚未实现。

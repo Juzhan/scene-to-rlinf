@@ -390,3 +390,14 @@ def test_frozen_replay_reports_the_backend_it_runs_on(project, tmp_path):
     report = checkpoint_compatibility(replay, frozen, checkpoint)
     assert report["backends"]["current"] == {"train": "mjlab", "eval": "mjlab"}
     assert report["backend_changed"] and report["policy_interface_matches"]
+
+
+def test_frozen_snapshot_packages_keep_their_recorded_observation_types(monkeypatch):
+    from shared.assembly import object_schema
+    from shared.assembly.project import refresh_observation_types
+    calls = []
+    monkeypatch.setattr(object_schema, "generate", lambda scene, **options: calls.append(scene))
+    refresh_observation_types("frozen/scene.yaml", "_experiment_20261022_abc")
+    assert not calls
+    refresh_observation_types("live/scene.yaml", "projects.piper_pick")
+    assert calls == ["live/scene.yaml"]

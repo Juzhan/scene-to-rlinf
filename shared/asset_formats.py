@@ -9,9 +9,12 @@ URDF, stages meshes, and records provenance plus an alignment report in ASSET.js
     MJCF -> USD  : Isaac Lab MjcfConverter (Isaac Sim MJCF importer; starts Kit)
 
 The body must align (joints, limits, axes, masses, inertia, frames); appearance only
-needs to be close. Links with collision geometry are drawn in MJCF from that geometry,
-coloured with the dominant visual material colour. Actuators and gains are not part of
-the converted files: each backend's asset factory declares them.
+needs to be close. Links whose collision geometry covers their visuals (bounding boxes
+within APPEARANCE_TOLERANCE) are drawn in MJCF from that geometry, coloured with the
+dominant visual material colour. Elsewhere the visual meshes are kept and the collision
+geoms move to the hidden group COLLISION_GROUP; meshes over MuJoCo's face limit are
+reduced by vertex clustering. Actuators and gains are not part of the converted files:
+each backend's asset factory declares them.
 
     run.py asset convert assets/piper_x/piper_x.usda assets/piper_x
     run.py asset check assets/piper_x
@@ -36,6 +39,9 @@ ROOT = Path(__file__).resolve().parents[1]
 USD_SUFFIXES = {'.usd', '.usda', '.usdc'}
 MESH_SUFFIXES = {'.stl'}
 TOLERANCE = {'position': 1e-4, 'mass': 1e-3, 'inertia': 1e-3, 'angle': 1e-4, 'axis': 1e-4}
+APPEARANCE_TOLERANCE = 0.005  # m, visual vs collision bounding box corners of one link
+COLLISION_GROUP = 3           # MuJoCo viewers and mjlab cameras draw groups 0-2 by default
+MESH_FACE_LIMIT = 200000      # MuJoCo mesh loader
 
 
 def digest(path):
@@ -76,11 +82,64 @@ def _usd_to_urdf_library():
     return UsdToUrdf, (bundle.parents[0] / 'config/extension.toml')
 
 
+FIXED_JOINT_RECONCILE = {'angle': 0.01, 'position': 0.001}  # rad, m
+
+
+def physx_stage(path):
+    """Open a USD with fixed-joint children at the pose PhysX simulates, plus the bodies moved.
+
+    A PhysX articulation places each link from its parent through the joint frames, so the
+    authored pose of a fixed joint's child is ignored. Small disagreements between the two
+    (ANYmal-C RH_FOOT: 1.2 mrad) make UsdToUrdf reject the asset; the child is moved to the
+    parent-implied pose in the in-memory session layer only. Larger gaps are left for the
+    exporter to report, and other joint types are never touched (their gap is a joint angle)."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    stage = Usd.Stage.Open(str(path))
+    stage.SetEditTarget(stage.GetSessionLayer())
+    moved = {}
+
+    def local(joint, side):
+        position = getattr(joint, f'GetLocalPos{side}Attr')().Get() or Gf.Vec3f()
+        rotation = getattr(joint, f'GetLocalRot{side}Attr')().Get() or Gf.Quatf(1)
+        return Gf.Matrix4d().SetTransform(Gf.Rotation(Gf.Quatd(rotation)), Gf.Vec3d(position))
+
+    for _ in range(64):  # A moved body can shift joints further down the chain.
+        cache, changed = UsdGeom.XformCache(), False
+        for prim in stage.Traverse():
+            if not prim.IsA(UsdPhysics.FixedJoint):
+                continue
+            joint = UsdPhysics.FixedJoint(prim)
+            ends = [joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets()]
+            if not all(ends):
+                continue
+            parent, child = (stage.GetPrimAtPath(targets[0]) for targets in ends)
+            via_parent = local(joint, 0) * cache.GetLocalToWorldTransform(parent).RemoveScaleShear()
+            child_world = cache.GetLocalToWorldTransform(child)
+            via_child = local(joint, 1) * child_world.RemoveScaleShear()
+            turn = via_parent.ExtractRotationQuat() * via_child.ExtractRotationQuat().GetInverse()
+            angle = 2 * math.acos(min(1., abs(turn.GetReal())))
+            offset = (via_parent.ExtractTranslation() - via_child.ExtractTranslation()).GetLength()
+            if (angle <= 1e-5 and offset <= 1e-6) or angle > FIXED_JOINT_RECONCILE['angle'] \
+                    or offset > FIXED_JOINT_RECONCILE['position']:
+                continue
+            if not Gf.IsClose(child_world.RemoveScaleShear(), child_world, 1e-9):
+                raise ValueError(f'{child.GetPath()}: scaled fixed-joint child cannot be re-posed')
+            target = local(joint, 1).GetInverse() * via_parent
+            parent_world = cache.GetParentToWorldTransform(child)
+            UsdGeom.Xformable(child).MakeMatrixXform().Set(target * parent_world.GetInverse())
+            entry = moved.setdefault(child.GetName(), {'joint': prim.GetName(), 'angle': 0., 'position': 0.})
+            entry['angle'], entry['position'] = max(entry['angle'], angle), max(entry['position'], offset)
+            changed = True
+            break
+        if not changed:
+            return stage, moved
+    raise ValueError(f'{path}: fixed-joint poses did not settle')
+
+
 def usd_to_urdf(source, directory, name, root=None):
     """Export the USD kinematic tree; link names lose the exporter's '<defaultPrim>_' prefix."""
-    from pxr import Usd
     UsdToUrdf, extension = _usd_to_urdf_library()
-    stage = Usd.Stage.Open(str(source))
+    stage, moved = physx_stage(source)
     prefix = stage.GetDefaultPrim().GetName() + '_' if stage.GetDefaultPrim() else None
     exporter = UsdToUrdf(stage, root=root, log_level='WARNING')
     path = Path(directory) / (name + '.urdf')
@@ -95,6 +154,16 @@ def usd_to_urdf(source, directory, name, root=None):
             short = value.removeprefix(prefix)
             if short != value and short not in names and short not in rename.values():
                 rename[value] = short
+    # A body that is the articulation root without a joint above it is merged into the
+    # default-prim node and named after it (M20 base_link -> 'M20'); give it its body name.
+    from pxr import UsdPhysics
+    bodies = {prim.GetName() for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.RigidBodyAPI)}
+    children = {joint.find('child').get('link') for joint in robot.iter('joint')}
+    roots = [value for value in names if value not in children]
+    unnamed = bodies - {rename.get(value, value) for value in names}
+    if len(roots) == 1 and roots[0] not in bodies and len(unnamed) == 1 and (
+            stage.GetDefaultPrim() and roots[0] == stage.GetDefaultPrim().GetName()):
+        rename[roots[0]] = next(iter(unnamed))
     for link in robot.iter('link'):
         link.set('name', rename.get(link.get('name'), link.get('name')))
     for joint in robot.iter('joint'):
@@ -107,7 +176,7 @@ def usd_to_urdf(source, directory, name, root=None):
     version = next((line.split('=')[1].strip().strip('"') for line in extension.read_text().splitlines()
                     if line.startswith('version')), 'unknown')
     return path, {'tool': 'isaacsim.asset.exporter.urdf (nvidia.srl UsdToUrdf)', 'version': version,
-                  'renamed_links': rename}
+                  'renamed_links': rename, 'fixed_joint_children_posed_by_parent': moved}
 
 
 # URDF -> MJCF --------------------------------------------------------------
@@ -169,6 +238,102 @@ def urdf_colour(visual, source, packages):
     return material_colour(resolve_mesh(mesh.get('filename'), source, packages)) if mesh is not None else None
 
 
+def _rotation(rpy):
+    roll, pitch, yaw = rpy
+    cr, sr, cp, sp, cy, sy = (math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch),
+                              math.cos(yaw), math.sin(yaw))
+    return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr]]
+
+
+def element_bounds(element, source, packages, meshes):
+    """Link-frame bounding box (min, max) of a URDF visual/collision element, None if unknown."""
+    import numpy as np
+    geometry = element.find('geometry')
+    shape = geometry[0] if geometry is not None and len(geometry) else None
+    if shape is None:
+        return None
+    if shape.tag == 'mesh':
+        path = resolve_mesh(shape.get('filename'), source, packages)
+        if str(path) not in meshes:
+            import trimesh
+            meshes[str(path)] = trimesh.load(path, force='mesh').vertices
+        scale = [float(value) for value in shape.get('scale', '1 1 1').split()]
+        points = np.asarray(meshes[str(path)]) * scale
+    else:
+        if shape.tag == 'box':
+            half = np.array([float(value) for value in shape.get('size').split()]) / 2
+        elif shape.tag == 'cylinder':
+            radius = float(shape.get('radius'))
+            half = np.array([radius, radius, float(shape.get('length')) / 2])
+        elif shape.tag == 'sphere':
+            half = np.full(3, float(shape.get('radius')))
+        else:
+            return None
+        points = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * half
+    origin = element.find('origin')
+    xyz = [float(value) for value in (origin.get('xyz', '0 0 0') if origin is not None else '0 0 0').split()]
+    rpy = [float(value) for value in (origin.get('rpy', '0 0 0') if origin is not None else '0 0 0').split()]
+    points = points @ np.array(_rotation(rpy)).T + xyz
+    return points.min(0), points.max(0)
+
+
+def same_shape(left, right):
+    """Same geometry and origin in two URDF visual/collision elements."""
+    def shape(element):
+        origin, geometry = element.find('origin'), element.find('geometry')
+        return ({} if origin is None else dict(origin.attrib),
+                [(child.tag, dict(child.attrib)) for child in (geometry if geometry is not None else ())])
+    return shape(left) == shape(right)
+
+
+def bounds_difference(visuals, collisions, source, packages, meshes):
+    """Largest corner distance between the visual and collision bounding boxes of a link."""
+    import numpy as np
+
+    def union(elements):
+        boxes = [element_bounds(element, source, packages, meshes) for element in elements]
+        if not boxes or any(box is None for box in boxes):
+            return None
+        return np.min([box[0] for box in boxes], 0), np.max([box[1] for box in boxes], 0)
+
+    visual, collision = union(visuals), union(collisions)
+    if visual is None or collision is None:
+        return None
+    return float(max(np.abs(visual[0] - collision[0]).max(), np.abs(visual[1] - collision[1]).max()))
+
+
+def cluster_vertices(mesh, cell):
+    """Merge vertices within one grid cell; drops collapsed and repeated faces."""
+    import numpy as np
+    import trimesh
+    _, first, inverse = np.unique(np.floor(mesh.vertices / cell).astype(np.int64), axis=0,
+                                  return_index=True, return_inverse=True)
+    faces = inverse.reshape(-1)[mesh.faces]
+    faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])]
+    _, unique = np.unique(np.sort(faces, 1), axis=0, return_index=True)
+    return trimesh.Trimesh(mesh.vertices[first], faces[np.sort(unique)], process=False)
+
+
+def write_mesh(path, target):
+    """STL copy of a mesh; returns (faces before, faces after, cell m) when it had to be reduced."""
+    import trimesh
+    mesh = trimesh.load(path, force='mesh')  # geometry only: MuJoCo meshes carry no material or texture
+    if len(mesh.faces) <= MESH_FACE_LIMIT:
+        if path.suffix.lower() in MESH_SUFFIXES:
+            shutil.copyfile(path, target)
+        else:
+            mesh.export(target)
+        return None
+    cell, reduced = 1e-4, mesh
+    while len(reduced.faces) > MESH_FACE_LIMIT:
+        reduced = cluster_vertices(mesh, cell)
+        cell *= 2
+    reduced.export(target)
+    return [len(mesh.faces), len(reduced.faces), cell / 2]
+
+
 def urdf_to_mjcf(source, directory, name, packages=None, keep_visuals=False):
     """Compile URDF with MuJoCo into directory/<name>.xml with STL meshes in directory/assets."""
     import mujoco
@@ -180,18 +345,32 @@ def urdf_to_mjcf(source, directory, name, packages=None, keep_visuals=False):
         raise ValueError(f'{source}: not a URDF robot')
     meshes = directory / 'assets'
     meshes.mkdir(parents=True)
-    colours, dropped, written, by_content = {}, [], {}, {}
+    colours, dropped, kept, simplified, written, by_content, vertices = {}, [], {}, {}, {}, {}, {}
     for link in robot.iter('link'):
         visuals = link.findall('visual')
-        if visuals and link.find('collision/geometry') is not None and not keep_visuals:
+        collisions = [element for element in link.findall('collision') if element.find('geometry') is not None]
+        if not visuals or not collisions:
+            continue
+        # UsdToUrdf also writes every collision element as a visual; such copies show nothing new.
+        copies = [visual for visual in visuals if any(same_shape(visual, element) for element in collisions)]
+        visuals = [visual for visual in visuals if visual not in copies] or copies
+        colour = next(filter(None, (urdf_colour(visual, source, packages) for visual in visuals)), None)
+        if colour is not None:
+            colours[link.get('name')] = colour
+        for visual in copies:
+            if visual not in visuals:
+                link.remove(visual)
+        difference = None if keep_visuals else bounds_difference(visuals, collisions, source, packages, vertices)
+        if difference is not None and difference <= APPEARANCE_TOLERANCE:
             # MJCF is not the rendering format: draw the link with its collision
             # geometry in the dominant visual colour.
-            colour = next(filter(None, (urdf_colour(visual, source, packages) for visual in visuals)), None)
-            if colour is not None:
-                colours[link.get('name')] = colour
             for visual in visuals:
                 link.remove(visual)
-                dropped.append(link.get('name'))
+            dropped.append(link.get('name'))
+        else:
+            # Collision geometry that does not cover the visual would draw the part
+            # misplaced: keep the visual and hide the collision geoms instead.
+            kept[link.get('name')] = None if difference is None else round(difference, 4)
     for mesh in robot.iter('mesh'):
         path = resolve_mesh(mesh.get('filename'), source, packages)
         if not path.is_file():
@@ -205,13 +384,10 @@ def urdf_to_mjcf(source, directory, name, packages=None, keep_visuals=False):
                 target = meshes / (path.stem + '.stl')
                 if target.exists():
                     target = meshes / f'{path.stem}_{content[:8]}.stl'
-                if path.suffix.lower() in MESH_SUFFIXES:
-                    shutil.copyfile(path, target)
-                else:
-                    import trimesh
-                    # Geometry only: MuJoCo meshes carry no DAE/OBJ material or texture.
-                    trimesh.load(path, force='mesh').export(target)
+                reduced = write_mesh(path, target)
                 written[key] = by_content[content] = target.relative_to(directory).as_posix()
+                if reduced:
+                    simplified[written[key]] = reduced
         mesh.set('filename', written[key])
     # MuJoCo URDF extension: keep fixed-joint links (camera/tcp mounts) as bodies.
     extension = robot.find('mujoco')
@@ -234,16 +410,21 @@ def urdf_to_mjcf(source, directory, name, packages=None, keep_visuals=False):
         # compiles to an empty body beside the real root; it carries nothing.
         if not (body.bodies or body.geoms or body.joints or body.sites or body.cameras or body.mass):
             spec.delete(body)
-    for body, colour in colours.items():
+    for body in {*colours, *kept}:
         for geom in spec.body(body).geoms:
-            if geom.contype or geom.conaffinity:
-                geom.rgba = colour
+            collides = bool(geom.contype or geom.conaffinity)
+            if body in kept and collides:
+                geom.group = COLLISION_GROUP
+            elif body in colours and (body in kept) != collides:
+                geom.rgba = colours[body]
     spec.compile()
     (directory / (name + '.xml')).write_text(spec.to_xml())
     return directory / (name + '.xml'), {
         'tool': 'MuJoCo URDF compiler', 'version': mujoco.__version__,
         'packages': {key: workspace_path(value) for key, value in packages.items()},
-        'visuals_replaced_by_collision_geometry': sorted(set(dropped)),
+        'visuals_replaced_by_collision_geometry': sorted(dropped),
+        'visuals_kept': kept,
+        'meshes_simplified': simplified,
     }
 
 
@@ -263,8 +444,8 @@ def usd_frames_into_mjcf(mjcf, usd):
     """
     import mujoco
     import numpy as np
-    from pxr import Usd, UsdGeom, UsdPhysics
-    stage = Usd.Stage.Open(str(usd))
+    from pxr import UsdGeom, UsdPhysics
+    stage = physx_stage(usd)[0]
     cache = UsdGeom.XformCache()
     spec = mujoco.MjSpec.from_file(str(mjcf))
     model = spec.compile()
@@ -313,6 +494,78 @@ def usd_frames_into_mjcf(mjcf, usd):
     return turned
 
 
+COLLIDER_TYPES = {'Cube': 'box', 'Sphere': 'sphere', 'Cylinder': 'cylinder', 'Capsule': 'capsule', 'Mesh': 'mesh'}
+CAPSULE_AXES = {'X': (math.sqrt(.5), 0., math.sqrt(.5), 0.), 'Y': (math.sqrt(.5), -math.sqrt(.5), 0., 0.),
+                'Z': (1., 0., 0., 0.)}  # MuJoCo capsules lie along their local z
+
+
+def usd_colliders(stage):
+    """(collider gprim, owning rigid body or None); CollisionAPI may sit on an ancestor Xform."""
+    from pxr import Usd, UsdGeom, UsdPhysics
+    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+        if not prim.IsA(UsdGeom.Gprim):
+            continue
+        body, collider, node = None, None, prim
+        while node and not node.IsPseudoRoot():
+            if collider is None and node.HasAPI(UsdPhysics.CollisionAPI):
+                collider = UsdPhysics.CollisionAPI(node).GetCollisionEnabledAttr().Get() is not False
+            if node.HasAPI(UsdPhysics.RigidBodyAPI):
+                body = node
+                break
+            node = node.GetParent()
+        if collider:
+            yield prim, body
+
+
+def usd_capsules_into_mjcf(mjcf, usd):
+    """Add the USD capsule colliders that URDF cannot express (UsdToUrdf skips them).
+
+    Each capsule keeps its USD world pose, written in the matching MJCF body frame. Bodies
+    that draw visual meshes get it in the hidden COLLISION_GROUP like their other colliders.
+    """
+    import mujoco
+    import numpy as np
+    from pxr import Gf, UsdGeom
+    stage = physx_stage(usd)[0]
+    cache = UsdGeom.XformCache()
+    spec = mujoco.MjSpec.from_file(str(mjcf))
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    added = Counter()
+    for prim, owner in usd_colliders(stage):
+        if not prim.IsA(UsdGeom.Capsule):
+            continue
+        body = spec.body(owner.GetName()) if owner else None
+        if body is None:
+            raise ValueError(f'{prim.GetPath()}: capsule collider without a matching MJCF body')
+        capsule = UsdGeom.Capsule(prim)
+        axis = capsule.GetAxisAttr().Get()
+        transform = cache.GetLocalToWorldTransform(prim)
+        scale = Gf.Transform(transform).GetScale()
+        along = 'XYZ'.index(axis)
+        radial = [scale[index] for index in range(3) if index != along]
+        if abs(radial[0] - radial[1]) > 1e-6 * max(radial):
+            raise ValueError(f'{prim.GetPath()}: capsule radius scaled unevenly {tuple(scale)}')
+        rotation = transform.RemoveScaleShear().ExtractRotationQuat()
+        world = np.zeros(4)
+        mujoco.mju_mulQuat(world, np.array([rotation.GetReal(), *rotation.GetImaginary()]),
+                           np.array(CAPSULE_AXES[axis]))
+        index = model.body(owner.GetName()).id
+        inverse, local = np.zeros(4), np.zeros(4)
+        mujoco.mju_negQuat(inverse, data.xquat[index])
+        mujoco.mju_mulQuat(local, inverse, world)
+        hidden = any(not (geom.contype or geom.conaffinity) for geom in body.geoms)
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+                      size=[capsule.GetRadiusAttr().Get() * radial[0], capsule.GetHeightAttr().Get() / 2 * scale[along], 0],
+                      pos=data.xmat[index].reshape(3, 3).T @ (np.array(transform.ExtractTranslation()) - data.xpos[index]),
+                      quat=local, group=COLLISION_GROUP if hidden else 0)
+        added[owner.GetName()] += 1
+    spec.compile()
+    Path(mjcf).write_text(spec.to_xml())
+    return dict(sorted(added.items()))
+
+
 def usd_inertia_into_mjcf(mjcf, usd):
     """Set each matching body's inertial from the USD MassAPI, expressed in the MJCF body frame.
 
@@ -324,8 +577,8 @@ def usd_inertia_into_mjcf(mjcf, usd):
     """
     import mujoco
     import numpy as np
-    from pxr import Gf, Usd, UsdGeom, UsdPhysics
-    stage = Usd.Stage.Open(str(usd))
+    from pxr import Gf, UsdGeom, UsdPhysics
+    stage = physx_stage(usd)[0]
     cache = UsdGeom.XformCache()
     spec = mujoco.MjSpec.from_file(str(mjcf))
     model = spec.compile()
@@ -415,9 +668,9 @@ def _isaac_import(source, directory, name, fix_base):
 # Alignment -----------------------------------------------------------------
 
 def usd_bodies(path):
-    """Rest-pose rigid bodies and joints read directly with pxr."""
-    from pxr import Gf, Usd, UsdGeom, UsdPhysics
-    stage = Usd.Stage.Open(str(path))
+    """Rest-pose rigid bodies and joints read directly with pxr (fixed-joint children as PhysX poses them)."""
+    from pxr import Gf, UsdGeom, UsdPhysics
+    stage = physx_stage(path)[0]
     cache = UsdGeom.XformCache()
     bodies, joints = {}, {}
     for prim in stage.Traverse():
@@ -441,9 +694,16 @@ def usd_bodies(path):
                             * Gf.Quatd(joint.GetLocalRot0Attr().Get()))
                 axis = {'X': (1, 0, 0), 'Y': (0, 1, 0), 'Z': (0, 0, 1)}[joint.GetAxisAttr().Get()]
                 scale = math.pi / 180 if kind == 'hinge' else 1.0
+                limits = [joint.GetLowerLimitAttr().Get(), joint.GetUpperLimitAttr().Get()]
+                continuous = all(value is None or math.isinf(value) or abs(value) >= 3e38 for value in limits)
                 joints[prim.GetName()] = {
                     'type': kind, 'axis': list(Gf.Rotation(rotation).TransformDir(Gf.Vec3d(*axis))),
-                    'range': [joint.GetLowerLimitAttr().Get() * scale, joint.GetUpperLimitAttr().Get() * scale]}
+                    'range': None if continuous else [value * scale for value in limits]}
+    for prim, body in usd_colliders(stage):
+        if body is not None and body.GetName() in bodies:
+            colliders = bodies[body.GetName()].setdefault('colliders', {})
+            kind = COLLIDER_TYPES.get(prim.GetTypeName(), prim.GetTypeName())
+            colliders[kind] = colliders.get(kind, 0) + 1
     return bodies, joints
 
 
@@ -458,6 +718,13 @@ def mjcf_bodies(path):
         'mass': float(model.body_mass[index]),
         'com': data.xipos[index].tolist(), 'inertia': sorted(model.body_inertia[index].tolist())}
         for index in range(1, model.nbody)}
+    shapes = {int(getattr(mujoco.mjtGeom, 'mjGEOM_' + kind.upper())): kind
+              for kind in ('box', 'sphere', 'cylinder', 'capsule', 'mesh')}
+    for index in range(model.ngeom):
+        if (model.geom_contype[index] or model.geom_conaffinity[index]) and model.geom_bodyid[index]:
+            colliders = bodies[model.body(model.geom_bodyid[index]).name].setdefault('colliders', {})
+            kind = shapes.get(int(model.geom_type[index]), str(model.geom_type[index]))
+            colliders[kind] = colliders.get(kind, 0) + 1
     kinds = {mujoco.mjtJoint.mjJNT_HINGE: 'hinge', mujoco.mjtJoint.mjJNT_SLIDE: 'slide'}
     joints = {model.joint(index).name: {
         'type': kinds.get(model.jnt_type[index], 'other'), 'axis': data.xaxis[index].tolist(),
@@ -489,17 +756,21 @@ def compare(usd, mjcf):
             if a['mass'] > 0 and 'com' in a:
                 check('position', f'body {name} centre of mass', a['com'], b['com'])
                 check('inertia', f'body {name}', a['inertia'], b['inertia'], max(*a['inertia'], 1e-9))
+        if a.get('colliders', {}) != b.get('colliders', {}):  # converters can drop shapes (URDF has no capsule)
+            mismatches.append({'item': f'body {name} colliders', 'kind': 'colliders',
+                               'usd': a.get('colliders', {}), 'mjcf': b.get('colliders', {})})
     for name in sorted(usd_joint.keys() | mj_joint.keys()):
         if name not in usd_joint or name not in mj_joint:
             mismatches.append({'item': f'joint {name}', 'kind': 'missing',
                                'usd': name in usd_joint, 'mjcf': name in mj_joint})
             continue
         a, b = usd_joint[name], mj_joint[name]
-        if a['type'] != b['type'] or b['range'] is None:
+        if a['type'] != b['type'] or (a['range'] is None) != (b['range'] is None):
             mismatches.append({'item': f'joint {name}', 'kind': 'type/limit', 'usd': a, 'mjcf': b})
             continue
         check('axis', f'joint {name}', a['axis'], b['axis'])
-        check('angle', f'joint {name} range', a['range'], b['range'])
+        if a['range'] is not None:  # both continuous otherwise
+            check('angle', f'joint {name} range', a['range'], b['range'])
     massive = lambda bodies, name: bodies[name].get('mass', 1.0) > 0
     return {
         'aligned': not mismatches,
@@ -510,8 +781,8 @@ def compare(usd, mjcf):
         'usd_only_bodies': sorted(name for name in usd_body.keys() - mj_body.keys() if massive(usd_body, name)),
         'mjcf_only_bodies': sorted(name for name in mj_body.keys() - usd_body.keys() if massive(mj_body, name)),
         'mismatches': mismatches,
-        'not_compared': ['collision shapes (MuJoCo uses mesh convex hulls; PhysX follows the USD collider '
-                         'approximation)', 'contact/friction parameters', 'actuators (declared by backend factories)'],
+        'not_compared': ['collision shape sizes (MuJoCo uses mesh convex hulls; PhysX follows the USD collider '
+                         'approximation); collider counts per body and type are compared', 'contact/friction parameters', 'actuators (declared by backend factories)'],
     }
 
 
@@ -547,6 +818,7 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
                                       keep_visuals)
             if kind == 'usd':
                 step['body_frames_from_usd'] = usd_frames_into_mjcf(path, source)
+                step['capsule_colliders_from_usd'] = usd_capsules_into_mjcf(path, source)
                 step['inertial_from_usd_mass_api'] = usd_inertia_into_mjcf(path, source)
             steps.append({'from': 'urdf', 'to': 'mjcf', **step})
             formats['mjcf'] = workspace_path(path)
@@ -705,11 +977,38 @@ def main(argv=None):
     create.add_argument('--root', help='USD source: prim path of the kinematic root')
     create.add_argument('--fix-base', action='store_true', help='URDF/MJCF source: fixed-base articulation in USD')
     create.add_argument('--keep-visuals', action='store_true',
-                        help='Keep visual meshes in MJCF even where collision geometry exists')
+                        help='Keep visual meshes in MJCF for every link; collision geoms then go to the hidden group')
     verify = commands.add_parser('check', help='Compare the USD and MJCF forms of an asset')
     verify.add_argument('asset', type=Path, help='Asset directory with ASSET.json, or a USD file')
     verify.add_argument('mjcf', type=Path, nargs='?', help='MJCF file when the first argument is a USD file')
+    tile = commands.add_parser('terrain', help='Generate a terrain tile as an ordinary USD + MJCF asset')
+    tile.add_argument('variant', help='Terrain variant name (shared/backends/isaac/assets.py TERRAIN_VARIANTS), '
+                                      'or "all" for every preset into OUTPUT/<variant>')
+    tile.add_argument('output', type=Path, help='Asset directory; writes usd/, mjcf/ and ASSET.json')
+    tile.add_argument('--name', help='File name of the generated model (default: variant)')
+    tile.add_argument('--size', type=float, default=8.0, help='Square tile edge in metres (default 8)')
+    tile.add_argument('--difficulty', type=float, default=0.5, help='Isaac Lab difficulty in [0, 1] (default 0.5)')
+    tile.add_argument('--seed', type=int, default=0)
+    tile.add_argument('--param', metavar='JSON',
+                      help='Sub-terrain parameters as a JSON object (default: shared/terrain_assets.py PRESETS)')
     options = parser.parse_args(argv)
+    if options.command == 'terrain':
+        from shared.terrain_assets import PRESETS, generate
+        parameters = None if options.param is None else json.loads(options.param)
+        if options.variant == 'all':
+            if options.name or parameters is not None:
+                parser.error('"all" uses each preset; --name and --param apply to a single variant')
+            jobs = [(variant, options.output / variant) for variant in PRESETS
+                    if not (options.output / variant / 'ASSET.json').exists()]
+        else:
+            jobs = [(options.variant, options.output)]
+        for variant, output in jobs:
+            record = generate(variant, output, name=options.name, size=options.size, difficulty=options.difficulty,
+                              seed=options.seed, parameters=parameters)
+            print(json.dumps({**record['formats'], **record['terrain']}, indent=2))
+            print(json.dumps(record['steps'][0]['mjcf_collision']),
+                  'max height difference', f"{record['steps'][0]['max_height_difference']:.2e} m", flush=True)
+        return 0
     if options.command == 'convert':
         packages = {}
         for item in options.package:

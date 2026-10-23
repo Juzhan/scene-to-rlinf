@@ -5,6 +5,8 @@ from typing import Literal
 
 from shared.assembly.assets import CameraData, box_parameters, camera_parameters, checked, workspace_file
 
+ASSETS = Path(__file__).resolve().parents[3] / "assets"
+
 
 def _local_robot(config, usd_path, fix_root_link):
     config = config.copy()
@@ -38,18 +40,19 @@ def go2():
 
 
 def anymal_c():
-    """ANYbotics ANYmal-C with the native ANYdrive actuator configuration."""
+    """Native ANYMAL_C_CFG on the local mirror of its Isaac 5.1 USD and ANYdrive LSTM (assets/anymal_c/manifest.json)."""
     from isaaclab_assets.robots.anymal import ANYMAL_C_CFG
 
-    return ANYMAL_C_CFG.copy()
+    config = _local_robot(ANYMAL_C_CFG, ASSETS / "anymal_c/anymal_c.usd", False)
+    config.actuators["legs"].network_file = str(ASSETS / "anymal_c/ActuatorNets/anydrive_3_lstm_jit.pt")
+    return config
 
 
 def franka_panda(fix_root_link=True):
+    """Native FRANKA_PANDA_CFG on the local mirror of its Isaac 5.1 USD (assets/franka_panda/manifest.json)."""
     from isaaclab_assets.robots.franka import FRANKA_PANDA_CFG
 
-    config = FRANKA_PANDA_CFG.copy()
-    config.spawn.articulation_props.fix_root_link = fix_root_link
-    return config
+    return _local_robot(FRANKA_PANDA_CFG, ASSETS / "franka_panda/panda_instanceable.usd", fix_root_link)
 
 
 def ground_plane():
@@ -68,13 +71,12 @@ def dome_light(color=(0.75, 0.75, 0.75), intensity=3000.0):
 
 
 def seattle_table():
+    """Local mirror of the Isaac 5.1 SeattleLabTable USD (assets/seattle_table/manifest.json)."""
     import isaaclab.sim as sim
     from isaaclab.assets import AssetBaseCfg
-    from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     return AssetBaseCfg(prim_path="",
-                        spawn=sim.UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/"
-                                                    "table_instanceable.usd"))
+                        spawn=sim.UsdFileCfg(usd_path=str(ASSETS / "seattle_table/table_instanceable.usd")))
 
 
 def dex_cube(scale=(0.8, 0.8, 0.8)):
@@ -122,6 +124,55 @@ def clear_sky(intensity=750.0):
 MATERIALS = {"white_marble": white_marble}
 
 
+# Sub-terrain names used in scene.yaml -> Isaac Lab sub-terrain config classes.
+# Mesh terrains build exact geometry; height-field terrains (rough, slope, waves,
+# obstacles, stepping stones) are sampled on a grid and suit rough-ground training.
+TERRAIN_VARIANTS = {
+    "flat": "MeshPlaneTerrainCfg",
+    "stairs": "MeshPyramidStairsTerrainCfg",
+    "inverted_stairs": "MeshInvertedPyramidStairsTerrainCfg",
+    "random_grid": "MeshRandomGridTerrainCfg",
+    "rails": "MeshRailsTerrainCfg",
+    "pit": "MeshPitTerrainCfg",
+    "box": "MeshBoxTerrainCfg",
+    "gap": "MeshGapTerrainCfg",
+    "floating_ring": "MeshFloatingRingTerrainCfg",
+    "star": "MeshStarTerrainCfg",
+    "repeated_pyramids": "MeshRepeatedPyramidsTerrainCfg",
+    "repeated_boxes": "MeshRepeatedBoxesTerrainCfg",
+    "repeated_cylinders": "MeshRepeatedCylindersTerrainCfg",
+    "rough": "HfRandomUniformTerrainCfg",
+    "slope": "HfPyramidSlopedTerrainCfg",
+    "inverted_slope": "HfInvertedPyramidSlopedTerrainCfg",
+    "hf_stairs": "HfPyramidStairsTerrainCfg",
+    "hf_inverted_stairs": "HfInvertedPyramidStairsTerrainCfg",
+    "obstacles": "HfDiscreteObstaclesTerrainCfg",
+    "waves": "HfWaveTerrainCfg",
+    "stepping_stones": "HfSteppingStonesTerrainCfg",
+}
+
+
+def _as_tuples(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(_as_tuples(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _as_tuples(item) for key, item in value.items()}
+    return value
+
+
+def terrain_variant(factory, parameters):
+    if factory not in TERRAIN_VARIANTS:
+        raise ValueError(f"Unknown terrain variant '{factory}'. Available: {', '.join(TERRAIN_VARIANTS)}")
+    import isaaclab.terrains as terrains
+
+    config_class = getattr(terrains, TERRAIN_VARIANTS[factory])
+    values = _as_tuples(parameters)
+    for key in ("object_params_start", "object_params_end"):
+        if key in values:
+            values[key] = config_class.ObjectCfg(**values[key])
+    return config_class(**values)
+
+
 def terrain(terrain_generator, physics_material, material, **parameters):
     import isaaclab.sim as sim
     import isaaclab.terrains as terrains
@@ -129,12 +180,8 @@ def terrain(terrain_generator, physics_material, material, **parameters):
     generator = dict(terrain_generator)
     generator["size"] = tuple(generator["size"])
     generator["difficulty_range"] = tuple(generator["difficulty_range"])
-    variants = {
-        "stairs": terrains.MeshPyramidStairsTerrainCfg,
-        "inverted_stairs": terrains.MeshInvertedPyramidStairsTerrainCfg,
-    }
     generator["sub_terrains"] = {
-        name: variants[variant["factory"]](**variant["parameters"])
+        name: terrain_variant(variant["factory"], variant.get("parameters", {}))
         for name, variant in generator["sub_terrains"].items()
     }
     return terrains.TerrainImporterCfg(

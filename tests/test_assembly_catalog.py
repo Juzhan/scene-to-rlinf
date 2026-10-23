@@ -95,6 +95,23 @@ def test_entity_categories_and_observation_bindings_follow_actual_targets(tmp_pa
     assert missing["source_groups"]["states"]["missing"] == ["missing_arm"]
 
 
+def test_box_capabilities_follow_its_mass_parameter(tmp_path):
+    """A box with a mass is a rigid root body both backends can read; a static one stays geometry only."""
+    scene = {"schema_version": 1, "name": "world", "entities": [
+        {"name": "pad", "factory": "box", "parameters": {"size": [.2, .2, .01], "mass": .5},
+         "reset": {"region": "world/area"}},
+        {"name": "area", "kind": "abstract", "shape": "rectangle", "size": [.3, .3]},
+        {"name": "wall", "factory": "box", "parameters": {"size": [1., 1., 1.]}}]}
+    report = describe_scene(scene, directory=tmp_path)
+    entities = {entry["path"]: entry for entry in report["entities"]}
+    assert "root_state" in entities["world/pad"]["capabilities"]
+    assert "root_state" not in entities["world/wall"]["capabilities"]
+    ids = {entry["id"] for entry in report["observations"]}
+    assert {"pad.position", "pad.linear_velocity"} <= ids
+    assert "wall.position" not in ids
+
+
+
 def test_relative_observations_keep_both_entity_sources():
     report = describe_scene(ROOT / "projects/assembly_lift/scene.yaml")
     relation = next(entry for entry in report["observations"] if entry["id"] == "object.position")

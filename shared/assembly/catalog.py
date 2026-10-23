@@ -35,9 +35,9 @@ _ASSETS = {
     "box": ("长方体", "完整边长（米）；质量为空时是静态设施。", ["geometry"]),
     "urdf_robot": ("导入的 URDF 机器人", "工作区内的 URDF，首次使用时转换为 USD（缓存于 .cache/urdf_usd）；所有关节共用一组隐式 PD 增益，请按机器人调整。", ["articulation", "root_state", "joint_state"]),
     "usd_robot": ("导入的 USD 机器人", "工作区内带关节的 USD；未填增益时沿用 USD 中的关节驱动。", ["articulation", "root_state", "joint_state"]),
-    "usd_object": ("导入的 USD 物体", "质量为空时是静态设施；填写质量时 USD 内需已有刚体与碰撞属性。", ["geometry"]),
+    "usd_object": ("导入的 USD 物体", "质量为空时是静态设施；填写质量时 USD 内需已有刚体与碰撞属性。`run.py asset terrain` 生成的双格式地形地块也用它。", ["geometry"]),
     "seattle_table": ("工作台", "SeattleLab 工作台资产。", ["geometry"]),
-    "terrain": ("程序化地形", "复用 Isaac Lab 地形生成器，含台阶及难度范围。", ["terrain", "geometry"]),
+    "terrain": ("程序化地形", "仅 Isaac，只为已有项目保留，不在资产架提供：复用 Isaac Lab 地形生成器按难度课程排布子地形。新场景用 `run.py asset terrain` 生成双后端地块，再以 usd_object 引用。", ["terrain", "geometry"]),
     "height_scanner": ("地形高度扫描器", "从机器人附近向地形投射射线。", ["height_scan"]),
     "contact_sensor": ("接触力传感器", "测量所选刚体接触力，可记录足端离地时间。", ["contact_forces"]),
     "camera": ("相机", "针孔相机，可输出 RGB、深度与法向，各输出同一分辨率；可安装在机器人或场景中，观察图像时自动启用相机。", ["image"]),
@@ -45,6 +45,8 @@ _ASSETS = {
     "dome_light": ("环境灯", "统一环境照明。", ["lighting"]),
     "clear_sky": ("天空照明", "使用原生晴空环境贴图。", ["lighting"]),
 }
+# Still loadable for existing scenes, but not offered when adding entities.
+_NOT_ON_SHELF = {"terrain"}
 _OBSERVATIONS = {
     "base_lin_vel": ("机身线速度", "机器人自身坐标系中的三轴线速度。", "base_lin_vel", "m/s", "robot_root", ["robot"], 3),
     "base_ang_vel": ("机身角速度", "机器人自身坐标系中的三轴角速度。", "base_ang_vel", "rad/s", "robot_root", ["robot"], 3),
@@ -106,6 +108,19 @@ def entity_category(capabilities, kind="entity", factory=None):
     if "lighting" in capabilities:
         return "light"
     return "object" if factory else "group"
+
+
+def asset_capabilities(factory, capabilities, parameters=None):
+    """Parameter-dependent capabilities a factory declares only by its arguments.
+
+    ``box`` is a static facility without a mass and a rigid root body with one, which the
+    backends already read as ``position``/``linear_velocity``; the metadata must follow or
+    such a body cannot be selected as an observation.
+    """
+    parameters = parameters or {}
+    if factory == "box" and parameters.get("mass") is not None and "rigid_body" not in capabilities:
+        return [*capabilities, "rigid_body", "root_state"]
+    return capabilities
 
 
 # Display names for annotated factory parameters; the YAML keys stay the factory argument names.
@@ -244,7 +259,7 @@ project registries and metadata are discovered for ordinary Python packages.
             continue
         builtin = _ASSETS.get(node.factory, (node.factory, "项目自定义资产。", []))
         docs = asset_docs.get(node.factory, {})
-        capabilities = list(docs.get("capabilities", builtin[2]))
+        capabilities = asset_capabilities(node.factory, list(docs.get("capabilities", builtin[2])), node.parameters)
         category = entity_category(capabilities, node.kind, node.factory)
         entities.append({"path": path, "native_key": metadata.keys[path], "factory": node.factory,
                          "supported_backends": asset_backends(node.factory),
@@ -353,10 +368,12 @@ project registries and metadata are discovered for ordinary Python packages.
     asset_entries = []
     for name, factory in assets.items():
         label, description, capabilities = _ASSETS.get(name, (name, inspect.getdoc(factory) or "项目自定义资产。", []))
+        capabilities = asset_capabilities(name, capabilities)
         asset_entries.append({"id": name, "label": label, "description": description, "capabilities": capabilities,
                               "supported_backends": asset_backends(name),
                               "implementation": f"{getattr(factory, '__module__', 'project')}.{getattr(factory, '__qualname__', name)}",
                               "parameters": _factory_parameters(factory, name), "available": True,
+                              "on_shelf": name not in _NOT_ON_SHELF,
                               **deepcopy(asset_docs.get(name, {}))})
         entry = asset_entries[-1]
         entry["category"] = entity_category(entry["capabilities"], factory=name)
@@ -407,6 +424,21 @@ project registries and metadata are discovered for ordinary Python packages.
                                  "information": _image_size(signal_information(name), entity, assets).describe(),
                                  "profile": signal_profile(name),
                                  "selected_in": selected.get(name, []), **availability([entity["native_key"]])})
+    if not preset:
+        # Named robot frames (asset defaults such as tcp, plus entity frames), computed from body poses.
+        from .information import Information
+        from .robot import frame_observations, robot_frames
+        frames = robot_frames(world)
+        for name, (robot, frame, field) in frame_observations(frames).items():
+            body, (offset, _) = frames[robot][frame]
+            info = (Information("position", (3,), "float", "m", "environment") if field == "position" else
+                    Information("rotation", (4,), "float", "1", "environment", robot + "/" + frame, "wxyz"))
+            label = {"position": "坐标系位置", "orientation": "坐标系朝向"}[field] + f"（{frame}）"
+            observations.append({"id": name, "label": label,
+                                 "description": f"{label}：{body or '根部'} 偏移 {list(offset)} m，环境坐标；由本体位姿计算，无需传感器。",
+                                 "requires": [robot], "units": "m · 环境坐标" if field == "position" else "wxyz 四元数 · 环境坐标",
+                                 "dimension": info.shape[0], "information": info.describe(), "profile": "states",
+                                 "selected_in": selected.get(name, []), **availability([robot])})
     gravity_info = signal_information('simulation.gravity')
     observations.append({'id': 'simulation.gravity', 'label': '环境重力加速度', 'description': '仿真配置中的重力向量',
                          'requires': [], 'information': gravity_info.describe(), 'units': gravity_info.unit,

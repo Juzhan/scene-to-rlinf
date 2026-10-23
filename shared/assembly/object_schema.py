@@ -85,7 +85,13 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
         if missing:
             raise ValueError(f'{role}: unavailable observation fields {sorted(missing)}')
         groups[role.capitalize() + 'Obs' if role != 'policy' else 'Obs'] = paths
-    lines = [HEADER, 'from typing import TypedDict\n\nfrom torch import Tensor\nfrom shared.assembly.objects import ObjectView\n\n']
+    from .layout import world_spec_from_config
+    from .robot import RobotView, robot_frames
+    robots = robot_frames(world_spec_from_config(settings, directory=catalog_directory or scene.parent,
+                                                 factories=factories))
+    methods = {name for name in vars(RobotView) if not name.startswith('_')}
+    lines = [HEADER, 'from typing import TypedDict\n\nfrom torch import Tensor\nfrom shared.assembly.objects import ObjectView\n'
+             'from shared.assembly.robot import RobotView\n\n']
     for root, paths in groups.items():
         tree = {}
         for path in sorted(paths):
@@ -99,14 +105,23 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
             if node:
                 raise ValueError(f'Information path collision: {path}')
             node['_leaf'] = path
-        def emit(node, name):
+        def emit(node, name, robot=None):
             children = {}
             for attr, child in node.items():
                 if '_leaf' not in child:
                     child_name = name + '_' + attr
-                    emit(child, child_name)
+                    # Only a robot's own top-level node queries it; component.input.<robot> is a cached past reading.
+                    emit(child, child_name, attr if name == root and attr in robots else None)
                     children[attr] = child_name
-            lines.append(f'class {name}(ObjectView):\n')
+            if robot is not None:
+                if node.keys() & methods:
+                    raise ValueError(f'{robot}: information names {sorted(node.keys() & methods)} clash with robot methods')
+                frames = ', '.join(robots[robot]) or '无'
+                lines.append(f'class {name}(RobotView):\n'
+                             f'    # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；\n'
+                             f'    # frame 取本体 body 名或已命名坐标系：{frames}\n')
+            else:
+                lines.append(f'class {name}(ObjectView):\n')
             if not node:
                 lines.append('    pass\n')
             for attr, child in node.items():

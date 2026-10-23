@@ -116,6 +116,8 @@ GALLERY_SCENE = ROOT / '.cache' / 'asset_gallery' / 'scene.yaml'
 # User-imported assets: named shared-factory presets, listed in the gallery.
 LIBRARY = ROOT / 'assets' / 'library.json'
 IMPORT_FACTORIES = ('urdf_robot', 'usd_robot', 'usd_object')
+# Tiles written by `run.py asset terrain`: listed on the shelf as usd_object presets.
+TERRAINS = ROOT / 'assets' / 'terrains'
 IMPORT_KINDS = {'机器人（带关节）': 'robot', '物体': 'object'}
 # Global polish on top of viser 1.1.1's Mantine panels. Folder classes are viser's
 # compiled names; if they change the panels simply fall back to viser's look.
@@ -148,12 +150,44 @@ h3{font-size:16px!important;margin-top:2px!important}
 """
 OBSERVATION_CSS = ('{labels}{{white-space:pre-line;font-size:11.5px!important;line-height:1.35!important;color:#868e96!important}}'
                    '{first}{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#212529}}')
-# The ✕ button sits before its folder; lift it onto that folder's header line, right side.
-# The 1px height keeps the folder's top margin from collapsing through the wrapper.
+# Group folders holding a ticked input; `:checked` keeps it live without a server round trip.
+OBSERVATION_GROUP_CSS = ('._3o7djo0:has({checked}){{border-color:#a5d8ff!important}}'
+                         '._3o7djo0:has({checked}) > ._3o7djo1{{background:#e7f5ff!important;color:#1864ab!important;'
+                         'box-shadow:inset 3px 0 0 #339af0}}'
+                         '._3o7djo0:has({checked}) > ._3o7djo1:hover{{background:#d0ebff!important}}')
+ROLE_PURPOSE = {'planner': '生成目标', 'executor': '输出控制动作'}
+# A button group used as a two-way switch: one button per module, its role and state written
+# under the name, the trained one filled. Viser gives the group no id; its (hidden) row label
+# points at the uuid.
+TRAIN_ROW = '.mantine-Flex-root:has(> div > p > label[for="{id}"])'
+TRAIN_SWITCH_CSS = ('{row}{{padding:10px 0 14px}}{row} > div:first-child{{display:none}}'
+                    '{row} > div:last-child{{flex:1 1 auto!important;width:100%}}'
+                    '{row} > div:last-child > .mantine-Flex-root{{flex-wrap:nowrap;gap:8px}}'
+                    '{row} button{{height:auto!important;min-width:0!important;padding:7px 6px!important;'
+                    '--button-bg:var(--mantine-color-default)!important;--button-hover:#f3f5f8!important;'
+                    '--button-color:var(--mantine-color-text)!important;--button-bd:1px solid #dee2e6!important}}'
+                    '{row} .mantine-Button-label{{flex-direction:column;height:auto;line-height:1.4;white-space:normal;'
+                    'font-size:13px;font-weight:600}}'
+                    '{row} .mantine-Button-label::after{{font-size:11px;font-weight:400;opacity:.8}}')
+TRAIN_BUTTON_CSS = '{row} button:nth-child({n}) .mantine-Button-label::after{{content:{caption}}}'
+TRAIN_ON_CSS = ('{row} button:nth-child({n}){{--button-bg:var(--mantine-color-orange-filled)!important;'
+                '--button-hover:var(--mantine-color-orange-filled-hover)!important;'
+                '--button-color:var(--mantine-color-white)!important;--button-bd:1px solid transparent!important}}')
+# The ✕ button sits before its folder; lift it onto the middle of that folder's 30px header,
+# left of the chevron. The 1px height keeps the folder's top margin (pinned to 6px) from
+# collapsing through the wrapper, so the header centre is 1 + 6 + 1 + 15 px below its top.
 CONTROL_REMOVE_CSS = ('div:has(> [id="{id}"]){{height:1px;padding:0!important;position:relative;z-index:3}}'
-                      '[id="{id}"]{{position:absolute;right:.9em;top:calc(var(--mantine-spacing-xs) + 1px - .7em);'
-                      'width:1.4em!important;height:1.4em!important;min-width:0;padding:0!important}}'
-                      '[id="{id}"] .mantine-Button-section{{margin:0!important}}')
+                      'div:has(> [id="{id}"]) + div{{margin-top:6px!important}}'
+                      'button[id="{id}"][style]{{position:absolute;right:30px;top:23px;transform:translateY(-50%);'
+                      'width:22px!important;height:22px!important;min-width:0;padding:0!important;'
+                      '--button-bd:none!important;border-radius:4px}}'
+                      '[id="{id}"] .mantine-Button-inner{{justify-content:center}}'
+                      '[id="{id}"] .mantine-Button-label{{display:none}}'
+                      # Viser places the icon absolutely with a half-size offset; let it flow and centre.
+                      '[id="{id}"] .mantine-Button-section,[id="{id}"] .mantine-Button-section > div'
+                      '{{margin:0!important;width:auto!important;height:auto!important}}'
+                      '[id="{id}"] .mantine-Button-section svg{{position:static!important;transform:none!important;'
+                      'display:block;width:15px;height:15px}}')
 GALLERY_CARD = ('[id="{id}"]{{height:auto!important;min-height:104px;padding:{padding}!important;'
                 'background:{bg} {image} center 6px/auto 66px no-repeat!important;border:{border}!important;'
                 'color:var(--mantine-color-text)!important;font-weight:400!important;'
@@ -163,12 +197,33 @@ GALLERY_CARD = ('[id="{id}"]{{height:auto!important;min-height:104px;padding:{pa
                 '[id="{id}"] .mantine-Button-inner{{flex-direction:column;align-items:center;justify-content:center;'
                 'gap:8px;height:auto!important;width:100%}}'
                 # Mantine's left-section margin offsets the icon sideways once the row becomes a column.
-                '[id="{id}"] .mantine-Button-section{{margin:0!important;justify-content:center}}'
-                '[id="{id}"] .mantine-Button-section svg{{width:30px;height:30px;opacity:.55}}')
+                # Its icon box keeps the small icon size with the svg absolutely placed, so the enlarged
+                # icon would overflow it; let the svg size the box instead.
+                '[id="{id}"] .mantine-Button-section,[id="{id}"] .mantine-Button-section > div'
+                '{{margin:0!important;justify-content:center;width:auto!important;height:auto!important}}'
+                '[id="{id}"] .mantine-Button-section svg{{position:static!important;transform:none!important;'
+                'width:30px;height:30px;opacity:.55}}')
 
 
 def _resolve(owner, reference):
     return posixpath.normpath(posixpath.join(owner, reference)) if reference.startswith('.') else reference
+
+
+def _body_pattern_matches(pattern, name):
+    try:
+        return re.fullmatch(pattern, name) is not None
+    except re.error:
+        return False
+
+
+def _body_groups(bodies):
+    """Link groups sharing a name suffix, e.g. '所有 *_foot（4 个）' -> '.*_foot', for multi-link sensors."""
+    suffixes = {}
+    for body in bodies:
+        if '_' in body:
+            suffixes.setdefault(body.rsplit('_', 1)[1], []).append(body)
+    return {f'所有 *_{suffix}（{len(names)} 个）': f'.*_{re.escape(suffix)}'
+            for suffix, names in suffixes.items() if len(names) > 1}
 
 
 def _wxyz(matrix):
@@ -248,13 +303,23 @@ def ray_shape(shape, origin, direction):
     return _ray_sphere(origin, direction, np.zeros(3), max(shape['length'] * .5, .03))
 
 
-def component_value(key, text):
-    """Typed period/dimension from the editor text fields."""
-    text = str(text).strip()
+def component_period(text):
+    """Decision period in seconds from the editor text field."""
     try:
-        return float(text) if key == 'period' else text if text == 'auto' else int(text)
+        return float(str(text).strip())
     except ValueError:
-        raise ValueError(f'组件{"决策周期须为秒数" if key == "period" else "输出维度须为正整数或 auto"}：{text!r}') from None
+        raise ValueError(f'决策周期须为秒数：{text!r}') from None
+
+
+def component_dimension(text):
+    """Output dimension from the editor text field: a positive integer or auto."""
+    text = str(text).strip()
+    if text == 'auto':
+        return text
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(f'输出维度须为正整数或 auto：{text!r}') from None
 
 
 def observation_group(key, source, components=()):
@@ -364,6 +429,22 @@ def load_library():
         return []
 
 
+def terrain_tiles():
+    """Library-style presets for the dual-backend terrain tiles under assets/terrains."""
+    tiles = []
+    for path in sorted(TERRAINS.glob('*/ASSET.json')):
+        try:
+            record = json.loads(path.read_text())
+            usd, terrain = record['formats']['usd'], record['terrain']
+        except (OSError, ValueError, KeyError):
+            continue
+        tiles.append({'id': 'terrain_' + path.parent.name, 'label': terrain.get('label') or path.parent.name,
+                      'factory': 'usd_object', 'parameters': {'usd_path': usd}, 'category': 'terrain',
+                      'note': f'地形地块 · {terrain["size"]:g} m 见方，以实体原点为中心；'
+                              f'参考出生点（相对中心）{[round(v, 3) for v in terrain["spawn_origin"]]}'})
+    return tiles
+
+
 def save_library(entries):
     LIBRARY.parent.mkdir(parents=True, exist_ok=True)
     temporary = LIBRARY.with_suffix('.tmp')
@@ -441,12 +522,6 @@ class Editor:
             if state:
                 self.observation_enabled = dict.fromkeys(state['observations'], True)
                 self.train_role = state['train']
-                self.syncing += 1
-                try:
-                    if self.train_role is not None:
-                        self.train_pick.value = self.train_role
-                finally:
-                    self.syncing -= 1
                 self._rebuild_observations()
             self._refresh_lists()
             keep = state['selected'] if state else self.selected
@@ -626,9 +701,13 @@ class Editor:
         info = self.info[path]
         if not body:
             return info['node']
-        if body not in info['bodies']:
+        if body in info['bodies']:
+            return info['bodies'][body]
+        # A contact sensor may cover a link group such as .*_foot; preview it on the first match.
+        matches = [name for name in info['bodies'] if _body_pattern_matches(body, name)]
+        if not matches:
             raise ValueError(f'{path}: 连杆 {body} 无预览坐标，请先刷新原生模型')
-        return info['bodies'][body]
+        return info['bodies'][matches[0]]
 
     def _connect_physical(self):
         snapshot = self.snapshot
@@ -640,8 +719,10 @@ class Editor:
             body = mount.get('body', '')
             bodies = self.info.get(target, {}).get('bodies', {})
             if target in self.info:
-                node.parent = bodies.get(body, self.info[target]['node'])
-            if body and body not in bodies:
+                node.parent = self.info[target]['node']
+                with contextlib.suppress(ValueError):
+                    node.parent = self.body_node(target, body)
+            if body and not any(_body_pattern_matches(body, name) for name in bodies):
                 self.info[item['path']]['note'] = '机身坐标预览不可用（暂用资产原点）；仿真按连杆安装'
         joints = list(snapshot.get('connections', []))
         for item in snapshot['entities']:
@@ -1100,9 +1181,11 @@ class Editor:
         if control and self.train_role != control['train']:
             payload['control_train'] = self.train_role
         for role, fields in self.pending['components'].items():
-            saved = control['components'][role]
-            changed = {key: component_value(key, value) for key, value in fields.items()
-                       if component_value(key, value) != saved.get(key, 'auto' if key == 'dimension' else None)}
+            saved, changed = control['components'][role], {}
+            if 'period' in fields and (period := component_period(fields['period'])) != saved.get('period'):
+                changed['period'] = period
+            if 'dimension' in fields and (dimension := component_dimension(fields['dimension'])) != saved.get('dimension', 'auto'):
+                changed['dimension'] = dimension
             if changed:
                 payload.setdefault('components', {})[role] = changed
         for profile, order in self.observation_order.items():
@@ -1338,13 +1421,10 @@ class Editor:
                 gui.add_button('组成布局组合', icon='stack-2').on_click(lambda _: self._create_group())
             self.asset_category.on_update(lambda _: self._refresh_assets())
         with panel.add_tab('观察', icon='eye'):
-            self.train_pick = gui.add_dropdown('训练角色', ['executor'])
-            self.train_pick.on_update(lambda _: None if self.syncing else self._set_train(self.train_pick.value))
-            self.role_pick = gui.add_dropdown('编辑组件输入', ['executor'])
-            self.role_pick.on_update(lambda _: None if self.syncing else self._rebuild_observations())
-            self.component_folder = gui.add_folder(None)
-            self.observation_folder = gui.add_folder('观察项')
-            self.observation_items = []
+            # Rebuilt per scene: training switch, then one page of input checkboxes per module.
+            self.observation_folder = gui.add_folder(None)
+            self.observation_items, self.observation_tabs, self.observation_boxes = [], {}, {}
+            self.period_fields, self.dimension_fields = {}, {}
         with panel.add_tab('控制', icon='steering-wheel'):
             # Like the observation tab: one folder per target, its joints as checkboxes.
             self.control_folder = gui.add_folder(None)
@@ -1402,7 +1482,8 @@ class Editor:
     def _refresh_lists(self):
         self.syncing += 1
         try:
-            categories = sorted({entry.get('category', 'object') for entry in self.snapshot['catalog'].get('assets', [])}) + ['abstract']
+            categories = sorted({entry.get('category', 'object') for entry in self.snapshot['catalog'].get('assets', [])
+                                 if entry.get('on_shelf', True)}) + ['abstract']
             self.category_names = {'全部': None, **{CATEGORY_LABELS.get(c, c): c for c in categories}}
             self.asset_category.options = list(self.category_names)
         finally:
@@ -1869,17 +1950,19 @@ class Editor:
         catalog = {entry['id']: entry for entry in self.snapshot['catalog'].get('assets', []) if entry.get('available', True)}
         entries = {}
         for factory, entry in catalog.items():
-            if factory in IMPORT_FACTORIES:  # Reached through the import form as library presets.
+            if factory in IMPORT_FACTORIES or not entry.get('on_shelf', True):  # Imports appear as library presets.
                 continue
             entries[factory] = {'label': entry.get('label', factory), 'factory': factory, 'parameters': None,
                                 'category': entry.get('category', 'object'), 'entry': entry,
                                 'key': thumbnail_key(factory, {})}
-        for item in load_library():
+        for item in load_library() + terrain_tiles():
             entry = catalog.get(item.get('factory'))
             if entry:
+                if item.get('note'):
+                    entry = {**entry, 'description': item['note']}
                 entries['library:' + item['id']] = {
                     'label': item.get('label') or item['id'], 'factory': item['factory'], 'library': item,
-                    'parameters': item.get('parameters', {}), 'category': entry.get('category', 'object'),
+                    'parameters': item.get('parameters', {}), 'category': item.get('category') or entry.get('category', 'object'),
                     'entry': entry, 'key': thumbnail_key(item['factory'], item.get('parameters', {}))}
         for shape, label in ABSTRACT_SHAPES.items():
             # Abstract entities: no model or physics, listed alongside assets.
@@ -2229,6 +2312,7 @@ class Editor:
             detach = gui.add_button('解除父物体（保留当前位置）', icon='unlink')
             detach.on_click(lambda _: self._detach(path))
         state = {'syncing': False, 'start': node.world(), 'mode_touched': bool(current)}
+        groups = {}
 
         def mode():
             return modes[mode_pick.value]
@@ -2240,7 +2324,7 @@ class Editor:
             if abstract and mode() == 'physical':
                 return target, ''  # Abstract entities follow the parent's root pose.
             if mode() == 'physical' and body_pick.value != ROOT_BODY:
-                return target, body_pick.value
+                return target, groups.get(body_pick.value, body_pick.value)
             return target, (self.initial_display(target).get('root_body', '') if mode() == 'physical' else '')
 
         def offset_matrix(parent):
@@ -2282,11 +2366,18 @@ class Editor:
         def update_bodies():
             target = targets.get(target_pick.value)
             bodies = (self.initial_display(target).get('body_names', []) or list(self.info[target]['bodies'])) if target else []
+            # Contact sensors may cover every link sharing a name suffix (the four feet).
+            groups.clear()
+            if 'contact_forces' in capabilities.get(path, []):
+                groups.update(_body_groups(bodies))
             state['syncing'] = True
             try:
-                body_pick.options = [ROOT_BODY, *bodies]
-                if relation and relation['entity'] == target and relation.get('body') in bodies:
-                    body_pick.value = relation['body']
+                body_pick.options = [ROOT_BODY, *bodies, *groups]
+                current_body = (relation or {}).get('body')
+                if relation and relation['entity'] == target and current_body in bodies:
+                    body_pick.value = current_body
+                elif relation and relation['entity'] == target and current_body in groups.values():
+                    body_pick.value = {value: key for key, value in groups.items()}[current_body]
                 if target and not state['mode_touched']:
                     mode_pick.value = mode_label[default_mode(target)]
             finally:
@@ -2569,81 +2660,111 @@ class Editor:
             for key in saved:
                 self.observation_enabled[(role, key)] = True
         self.train_role = control.get('train')
-        self.syncing += 1
-        try:
-            roles = list(self.observation_order)
-            self.role_pick.visible = self.train_pick.visible = bool(roles)
-            if roles:
-                self.role_pick.options = roles
-                if self.role_pick.value not in roles:
-                    self.role_pick.value = self.train_role
-                self.train_pick.options = roles
-                self.train_pick.value = self.train_role
-        finally:
-            self.syncing -= 1
         self._rebuild_observations()
 
     @action
     def _set_train(self, role):
+        if role == self.train_role:
+            return
         self.checkpoint()
         self.train_role = role
-        self.report(f'训练角色改为 {role}；保存后生效')
+        self._show_train()
+        self.report(f'训练模块改为 {role}；保存后生效')
+
+    def _show_train(self):
+        """Mark the trained module on the switch and on its tab icon."""
+        roles = list(self.observation_order)
+        row = TRAIN_ROW.format(id=self.train_switch._impl.uuid)
+        rules = [TRAIN_SWITCH_CSS.format(row=row)]
+        for index, role in enumerate(roles, 1):
+            trained = role == self.train_role
+            self.observation_tabs[role].icon = 'flame' if trained else 'lock'
+            caption = ' · '.join(filter(None, (ROLE_PURPOSE.get(role), '训练中' if trained else '固定')))
+            rules.append(TRAIN_BUTTON_CSS.format(row=row, n=index, caption=json.dumps(caption, ensure_ascii=False)))
+            if trained:
+                rules.append(TRAIN_ON_CSS.format(row=row, n=index))
+        self.train_style.content = '<style>' + ''.join(rules) + '</style>'
 
     def _rebuild_observations(self):
         for handle in self.observation_items:
             handle.remove()
-        self.observation_items = []
-        gui, profile = self.server.gui, self.role_pick.value if self.observation_order else None
-        groups = {}
-        for key in self.observation_order.get(profile, []):
-            meta = self.observation_meta.get(key, {})
-            sources = meta.get('source_groups', {})
-            source = sources.get('default', {})
-            group, name = observation_group(key, source, (self.snapshot.get('control') or {}).get('components', {}))
-            groups.setdefault(group, []).append((key, name, meta, source))
+        self.observation_items, self.observation_tabs, self.observation_boxes = [], {}, {}
+        self.period_fields, self.dimension_fields = {}, {}
+        gui, roles = self.server.gui, list(self.observation_order)
+        components = (self.snapshot.get('control') or {}).get('components', {})
         boxes = []
-        with self.component_folder:
-            if profile:
-                # Decision period and output size of the component whose inputs are listed below.
-                saved = self.snapshot['control']['components'][profile]
-                fields = self.pending['components'].get(profile, {})
-                period = gui.add_text('决策周期 (s)', str(fields.get('period', saved.get('period', ''))),
-                                      hint='须为物理步 simulation.dt 的整数倍；executor 周期须整除 planner 周期')
-                dimension = gui.add_text('输出维度', str(fields.get('dimension', saved.get('dimension', 'auto'))),
-                                         hint='planner 填整数；executor 填 auto 时等于控制关节总数')
-                for key, handle in (('period', period), ('dimension', dimension)):
-                    handle.on_update(lambda _, key=key, handle=handle: (
-                        self.checkpoint(('component', profile, key)),
-                        self.pending['components'].setdefault(profile, {}).__setitem__(key, handle.value)))
-                self.component_fields = {'period': period, 'dimension': dimension}
-                self.observation_items += [period, dimension]
         with self.observation_folder:
-            if not self.observation_order:
+            if not roles:
                 self.observation_items.append(gui.add_html(
                     '<div class="rl-status error" style="margin:0 8px 6px">此场景没有 control.components，'
                     '不是当前模板格式；编辑器只编辑新模板项目的组件观察。</div>'))
-            for label, rows in groups.items():
-                folder = gui.add_folder(label, expand_by_default=any(self.observation_enabled.get((profile, key)) for key, *_ in rows))
-                self.observation_items.append(folder)
-                with folder:
-                    for key, name, meta, source in rows:
-                        enabled = bool(self.observation_enabled.get((profile, key)))
-                        available = source.get('available', meta.get('available', enabled)) and meta.get('observation_selectable', True)
-                        hint = f'obs.{key}：' + meta.get('description', '')
-                        if source.get('missing'):
-                            hint += '　缺少：' + ', '.join(source['missing'])
-                        # The folder is the obs object (obs.robot); rows show the attribute
-                        # inside it in English, then the description, shape and unit.
-                        box = gui.add_checkbox(f'{name}\n{observation_caption(meta)}'.strip(), enabled,
-                                               disabled=not available and not enabled, hint=hint)
-                        boxes.append(box)
-                        box.on_update(lambda _, key=key, box=box: (
-                            self.checkpoint(), self.observation_enabled.__setitem__((profile, key), box.value)))
+                return
+            self.train_switch = gui.add_button_group('训练', roles, hint=(
+                '橙色为被训练的模块：PPO 更新其参数。其余模块固定，只运行 policy.py 中的模型。'))
+            self.train_switch.on_click(lambda event: self._set_train(event.target.value))
+            self.train_style = gui.add_html('')
+            tabs = gui.add_tab_group()
+            self.observation_items += [self.train_switch, self.train_style, tabs]
+            for index, role in enumerate(roles):
+                with tabs.add_tab(f'{role} 的输入') as tab:
+                    self.observation_tabs[role] = tab
+                    self._period_field(role, components[role])
+                    # A module reads earlier modules' interfaces, not its own or later ones.
+                    boxes += self._observation_boxes(role, components, hidden=roles[index:])
+            self._show_train()
             # Attribute path on the first line in monospace, the description below it.
             if boxes:
                 selectors = [f'p:has(> label[for="{box._impl.uuid}"])' for box in boxes]
                 self.observation_items.append(gui.add_html('<style>' + OBSERVATION_CSS.format(
-                    labels=','.join(selectors), first=','.join(item + '::first-line' for item in selectors)) + '</style>'))
+                    labels=','.join(selectors), first=','.join(item + '::first-line' for item in selectors))
+                    + OBSERVATION_GROUP_CSS.format(checked=','.join(f'input[id="{box._impl.uuid}"]:checked' for box in boxes))
+                    + '</style>'))
+
+    def _period_field(self, role, saved):
+        period = self.pending['components'].get(role, {}).get('period', saved.get('period', ''))
+        field = self.server.gui.add_text('决策周期 (s)', str(period),
+                                         hint='须为物理步 simulation.dt 的整数倍；executor 周期须整除 planner 周期')
+        field.on_update(lambda _: (self.checkpoint(('component', role, 'period')),
+                                   self.pending['components'].setdefault(role, {}).__setitem__('period', field.value)))
+        self.period_fields[role] = field
+        dimension = self.pending['components'].get(role, {}).get('dimension', saved.get('dimension', 'auto'))
+        size = self.server.gui.add_text('输出维度', str(dimension), hint=(
+            '模型 forward 返回的末维；planner 须为正整数，executor 可写 auto（等于控制目标关节总数）'))
+        size.on_update(lambda _: (self.checkpoint(('component', role, 'dimension')),
+                                  self.pending['components'].setdefault(role, {}).__setitem__('dimension', size.value)))
+        self.dimension_fields[role] = size
+
+    def _observation_boxes(self, profile, components, hidden=()):
+        """One folder per obs object (obs.robot), a checkbox per attribute of the given module.
+
+        Rows follow the catalogue order on every page; interfaces of `hidden` modules are
+        left out unless already selected."""
+        gui, groups, boxes = self.server.gui, {}, []
+        order = self.observation_order[profile]
+        for key in [key for key in self.observation_meta if key in order] + [key for key in order if key not in self.observation_meta]:
+            if key.partition('.')[0] in hidden and not self.observation_enabled.get((profile, key)):
+                continue
+            meta = self.observation_meta.get(key, {})
+            source = meta.get('source_groups', {}).get('default', {})
+            group, name = observation_group(key, source, components)
+            groups.setdefault(group, []).append((key, name, meta, source))
+        for label, rows in groups.items():
+            with gui.add_folder(label, expand_by_default=any(self.observation_enabled.get((profile, key)) for key, *_ in rows)):
+                for key, name, meta, source in rows:
+                    enabled = bool(self.observation_enabled.get((profile, key)))
+                    available = source.get('available', meta.get('available', enabled)) and meta.get('observation_selectable', True)
+                    hint = f'obs.{key}：' + meta.get('description', '')
+                    if source.get('missing'):
+                        hint += '　缺少：' + ', '.join(source['missing'])
+                    # Rows show the attribute inside the folder's object in English, then the
+                    # description, shape and unit.
+                    box = gui.add_checkbox(f'{name}\n{observation_caption(meta)}'.strip(), enabled,
+                                           disabled=not available and not enabled, hint=hint)
+                    boxes.append(box)
+                    self.observation_boxes[(profile, key)] = box
+                    box.on_update(lambda _, key=key, box=box: (
+                        self.checkpoint(), self.observation_enabled.__setitem__((profile, key), box.value)))
+        return boxes
 
     # ----------------------------------------------------------------- control
     def bindings(self):

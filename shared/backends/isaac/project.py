@@ -22,7 +22,10 @@ def validate_project(description, settings, terms, *, tasks=None, factories=None
     from .task_config import _selection, validate_task_settings
     metadata = scene_metadata(description)
     validate_materials(settings.get("world", {}).get("contact_materials", {}), metadata.keys.values())
-    known = metadata.keys.values()
+    from shared.assembly.robot import frame_observations
+    # Named robot frames are read through the robot interface, not as scene entities.
+    known = set(metadata.keys.values()) | {robot + '__' + frame for robot, frame, _ in
+                                           frame_observations(settings.get('_robot_frames') or {}).values()}
     for signal_path in target_catalog(settings):
         if '.target.' not in signal_path:
             # Abstract entities are validated together with the scene tree.

@@ -25,12 +25,14 @@ def validate_project(description, settings, terms, *, tasks=None, factories=None
     keys = {path.removeprefix(description.root.name + '/').replace('/', '__')
             for path, (node, _) in description.index().items() if node.factory}
     targets = target_catalog(settings)
+    from shared.assembly.robot import frame_observations
+    frames = frame_observations(settings.get('_robot_frames') or {})
     for source in targets:
         if '.target.' in source and source.split('.target.')[0].replace('.', '__') not in keys:
             raise ValueError(f'Target references unknown entity: {source}')
     for role, component in settings.get('control', {}).get('components', {}).items():
         for source in component['observations']:
-            if source in targets or source == 'simulation.gravity' or source in {
+            if source in targets or source in frames or source == 'simulation.gravity' or source in {
                     role + '.output', role + '.previous_output', 'planner.output'}:
                 continue
             parsed = parse_signal(source)

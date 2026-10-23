@@ -101,6 +101,12 @@ def test_memory_partial_reset_does_not_mix_episodes():
     torch.testing.assert_close(memory.mean('x',torch.tensor([10.,12.]),2),torch.tensor([10.,10.]))
     held=memory.hold('h',torch.tensor([True,False]),torch.tensor([.2,.2]))
     torch.testing.assert_close(held,torch.tensor([.2,0.]))
+    dt=torch.tensor([.5,.5])
+    assert torch.isinf(memory.rate('p',torch.tensor([[1.,0.],[2.,0.]]),dt)).all()
+    torch.testing.assert_close(memory.rate('p',torch.tensor([[2.,0.],[2.,1.]]),dt),torch.tensor([[2.,0.],[0.,2.]]))
+    memory.reset(torch.tensor([1]))
+    rate=memory.rate('p',torch.tensor([[2.,0.],[3.,1.]]),dt)
+    torch.testing.assert_close(rate[0],torch.tensor([0.,0.])); assert torch.isinf(rate[1]).all()
 
 
 def test_task_runtime_is_once_per_step_lazy_and_resettable(monkeypatch):

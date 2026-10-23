@@ -44,8 +44,11 @@ def validate(description, settings):
                                           'static and mounted abstract entities are readable')
             continue
         # prim_name only renames the Isaac prim; mjlab keys follow the logical path.
-        if node.frames or node.meshes:
-            raise NotImplementedError(f'{path}: mjlab body frames and ray meshes are not implemented yet')
+        # Robot body frames are read through the shared robot interface; nothing is compiled for them.
+        if node.frames and node.kind != 'robot':
+            raise NotImplementedError(f'{path}: mjlab body frames are read on robot entities only')
+        if node.meshes:
+            raise NotImplementedError(f'{path}: mjlab ray meshes are not implemented yet')
         if node.mount and node.factory not in SENSORS:
             raise NotImplementedError(f'{path}: mjlab mounts only sensors {list(SENSORS)}; physical attachment is not implemented')
         if node.reset is not None and node.factory in SENSORS:
@@ -114,7 +117,8 @@ def build_scene_config(description, settings, factories):
                     entities=entities, sensors=tuple(native_sensors), spec_fn=configure), keys
 
 
-HIDDEN_GEOM_GROUP = 3  # outside the default camera/viewer groups 0-2; contacts are unaffected
+HIDDEN_GEOM_GROUP = 4  # outside the camera sensor groups 0-2 (and the converter's collision group 3);
+                       # record/view enable it, contacts are unaffected
 
 
 def hide_camera_housings(spec, cameras):
@@ -122,7 +126,8 @@ def hide_camera_housings(spec, cameras):
 
     Isaac rasterizes with back-face culling and does not draw colliders, so a camera inside
     its housing sees out; mujoco_warp ray casts hit the housing from inside instead. The geom
-    keeps its collision; it is only moved out of the rendered groups (also in record videos).
+    keeps its collision; it is only moved out of the camera sensors' groups, while record
+    videos and the view window still draw it.
     Returns the hidden geoms as (camera, body, index on that body)."""
     import mujoco
     import numpy as np
@@ -137,6 +142,8 @@ def hide_camera_housings(spec, cameras):
         point = data.cam_xpos[camera.id]
         for offset in range(model.body_geomnum[body]):
             geom = int(model.body_geomadr[body]) + offset
+            if model.geom_group[geom] > 2:  # already outside the camera images
+                continue
             def distance(direction):
                 if model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_MESH:
                     return mujoco.mj_rayMesh(model, data, geom, point, direction)

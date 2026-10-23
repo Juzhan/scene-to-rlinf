@@ -28,6 +28,9 @@
 | `project.py` | `PROJECT_TERMS`（是否接受项目 terms.py 的原生 term）、`UNKEYED_FACTORIES`（项目 assets.py 无后端键的 `FACTORIES` 是否属于该后端）、`validate_scene`、`validate_project`；可选 `inspect_scene`（显式 `--backend` 的场景单独检查/查看，未提供时明确报错） | prepare_scene、backend_scene、scene_backend |
 | `control.py` | `install_terms`：挂接 planner/executor 原生控制项 | compile_control |
 | `environment.py` | `make_environment`；预览窗口可提供 `window_closed` | Project、preview |
+| `robot.py` | `robots(env, settings)`：返回 `shared.assembly.robot.Kinematics` 子类实例，实现 `joint_names`/`joint_position`/`body_names`/`body_pose`/`body_jacobian` 五个原语 | 本后端 control.py、python_task.py 注入到固定组件、decode/initial 与 Task 的观察对象 |
+
+机器人能力接口（`shared/assembly/robot.py`）：生成的 `ExecutorObs`/`PlannerObs`/`SceneInfo` 中 `kind: robot` 的节点继承 `RobotView`，提供 `joint_names()`、`frame_pose(frame)`、`jacobian(frame)`、`differential_ik(frame, position, orientation=None, *, damping, max_step)`，按环境批量计算，环境坐标系、米、wxyz。`frame` 取本体 body 名或命名坐标系；命名坐标系由资产默认（`ASSET_FRAMES`，如 Franka、Piper X 的 `tcp`）加机器人实体的 `frames`（同名覆盖）组成，名称不得与方法、信息字段或子实体重名。命名坐标系同时是观察候选 `<机器人>.<坐标系>.position|orientation`，由公共层经 `frame_pose` 读取，后端无需编译传感器（mjlab 因此允许机器人实体声明 `frames`，非机器人实体仍报错）；`frame_transformer` 传感器保持为独立读数，不算机器人坐标系。运动链由该坐标系决定，不配置关节列表，scene.yaml 也不出现 IK。命名坐标系偏移、雅可比参考点平移和阻尼最小二乘步在公共层计算；后端只提供原语，也可覆盖方法改用原生求解。雅可比在 body 原点处，世界轴，列序同 `joint_position`：Isaac 读 PhysX `get_jacobians()`（其线速度行参考连杆质心，后端平移到连杆原点），mjlab 调 `mujoco_warp.jac` 并在 body 原点取值。这些方法只在环境进程可用；训练组件在 policy worker 只收到张量，调用时明确报错。`differential_ik` 返回一步后的绝对关节目标，不施加关节限位，大误差时用 `max_step` 限制单步。
 
 新后端实现这些模块后加入 `BACKENDS`；暂不支持的能力在钩子内明确报错，不在上层补分支。
 仍有少量非分支的 Isaac 依赖留在上层：check 报告的 native_key、历史公式 Task 校验、观察选择解析（`isaac.task_config._selection`）与 Isaac 导出的可视化缓存键。
@@ -43,7 +46,9 @@ mjlab 已接入：
 - 物理实体的随机根复位（`reset.region/yaw_range/interval`，按环境采样）；关节力矩读数 `joint_effort`。
 - `view` / `record`：用 `env.train.init_params.backend=mjlab` 运行项目 policy（或零/随机动作）；`view` 在 MuJoCo 自带的被动窗口（`mujoco.viewer.launch_passive`）显示 env 0，`record` 离屏录 env 0 的视频。两者都由共享 preview 循环推进策略，窗口只同步显示、不推进物理；不使用 mjlab 自带 viewer 的策略循环。关闭窗口即结束，需要桌面 DISPLAY。
 
-与 Isaac 的已知差异：近平面不裁剪；相机原点落在所挂本体的几何内部（如转换后的 D435 外壳盒）时，光线追踪会从内部击中它，因此构建场景时把这类几何移到不渲染的 geom group 3（碰撞不变，录像中也不显示）；未命中处 rgb 为黑色而非天空。物理连接、抽象体随机复位和抽象体显示尚未接入。
+与 Isaac 的已知差异：近平面不裁剪；相机原点落在所挂本体的几何内部（如转换后的 D435 外壳盒）时，光线追踪会从内部击中它，因此构建场景时把这类几何移到相机传感器不渲染的 geom group 4（碰撞不变；录像与查看窗口打开 group 4，仍会显示）；未命中处 rgb 为黑色而非天空。物理连接、抽象体随机复位和抽象体显示尚未接入。
+
+物理上的对齐处理：MuJoCo 关节限位是软约束，PhysX 是硬限位。位置目标超出关节范围时，执行器会一直顶着限位推（25 g 的夹爪手指在 10 N 下会越界 1–2 cm），因此 mjlab 控制项把 joint_position 目标裁剪到关节范围内（无限位关节不裁剪）。代价是顶在限位时 joint_effort 读数约为 0，而 Isaac 读到的是驱动力上限。每个世界预分配 600 行约束（mujoco_warp 默认估计值在双指夹物时会溢出，并静默丢弃约束行）。mjlab 复位时会把执行器目标清零，所以复位后第一帧的 joint_effort 是按零目标算出的值；Isaac 这一帧读到的则是上一回合残留的值。两边这一帧都没有物理意义。
 
 速度参考点沿用已有 Isaac 语义：position 为根连杆原点，linear_velocity 为根刚体质心速度；四元数 wxyz。各后端同名资产的原生关节数组顺序和动力学不保证相同，跨后端权重迁移还需名称/顺序和动力学验收。
 
@@ -75,9 +80,61 @@ Go2 模型保留上游 LICENSE、README 和固定提交来源。MuJoCo 保留 Me
 - UsdToUrdf 在关节 body1 位姿非单位时把连杆坐标系移到关节坐标系，却未变换质心与惯量主轴（Piper X `gripper_link2` 质心 y 反号、z 差 1.3 mm）。因此 USD 源转换后按 USD MassAPI 在 MJCF 本体坐标系中重新写入质量、质心与惯量，ASSET.json 的 `inertial_from_usd_mass_api` 列出受影响的本体。
 - UsdToUrdf 还可能把连杆坐标系整体转动（Piper X `gripper_link2` 绕自身轴转 π）。相机、TCP 等挂载写在 USD 本体坐标系中，所以对齐比较也检查本体坐标系朝向；USD 源转换时把这类本体改回 USD 朝向，几何、关节、子本体保持世界位姿不变，ASSET.json 的 `body_frames_from_usd` 列出受影响的本体。
 - mjlab 工厂 `piper_x`、`usd_robot`、`usd_object`、`urdf_robot` 经 `mjcf_for` 取 MJCF：资产目录有 ASSET.json 时用记录的转换（源文件变化即报错，并重新比较对齐），否则自动转换并缓存到 `.cache/asset_mjcf/`（键含源文件与转换代码哈希）。`usd_robot` 的增益取自 USD DriveAPI（角度单位按每弧度换算）；`usd_object` 仅写了质量时按碰撞几何求惯量，与 PhysX 一致。
-- 未比较：碰撞形状（MuJoCo 网格取凸包，PhysX 按 USD 碰撞近似）、接触与摩擦、执行器。执行器增益由后端工厂分别声明，等价性另需动态验收。
+- PhysX 关节链中子连杆的位姿由父连杆经关节坐标系推出，不取 USD 中写的位姿。固定关节两端坐标系有微小不一致时（ANYmal-C 的 LH/RH_FOOT 约 1 mrad），UsdToUrdf 会以 1e-3 容差拒绝转换。`physx_stage` 只在会话层把这类子连杆放到 PhysX 实际模拟的位姿（阈值 0.01 rad / 1 mm，超出仍报错；源文件不改），转换与对齐比较都读它，ASSET.json 的 `fixed_joint_children_posed_by_parent` 列出移动的本体与偏差。
+- UsdToUrdf 会丢弃 USD 胶囊碰撞体（M20 腿部因此缺碰撞，站高偏低），转换后按 USD 补回（`capsule_colliders_from_usd`）。对齐比较还逐本体比较各类碰撞体数量。
+- 未比较：碰撞体尺寸与位姿（MuJoCo 网格取凸包，PhysX 按 USD 碰撞近似）、接触与摩擦、执行器。执行器由后端工厂分别声明，等价性另需动态验收。
 - Piper X：`assets/piper_x/mjcf/` 由 `assets/piper_x/piper_x.usda`（Isaac 实际加载的 USD）生成，与直接从厂商 URDF 编译的结果在 50 组随机关节角下连杆位置差 1e-7 m、质量矩阵差 1e-7。厂商仓库自带的 `scripts/urdf_to_mjcf.py` 写死路径且把执行器增益（120/80）写进 MJCF，与 Isaac 配置不一致，未采用。
 - URDF/MJCF→USD 方向已接入命令，但尚未在本机实测（需要启动 Isaac，避开正在运行的训练）。
+
+已转换且两后端都有工厂的资产（`assets/<名>/` 下 USD、`mjcf/`、ASSET.json，`run.py asset check` 全部对齐）：
+
+| 资产 | 来源 | mjlab 执行器（对应 Isaac 配置） |
+| --- | --- | --- |
+| piper、piper_x | 项目内 USD | 内置位置执行器，增益同 PIPER_CFG / PIPER_X_CFG |
+| m20 | 项目内 USD | Isaac DelayedPDActuator → 理想 PD 外包延迟（0–1 物理步，复位后首步抽取，回合内不变） |
+| franka_panda、seattle_table | Isaac 5.1 资产的本地镜像 | 增益同 FRANKA_PANDA_CFG；桌子为静态体 |
+| anymal_c | Isaac 5.1 资产的本地镜像，含 ANYdrive LSTM 网络 | `shared/backends/mjlab/actuators.py` 的 LstmActuator，与 Isaac ActuatorNetLSTM 同一网络、同一输入与按环境复位的隐状态 |
+
+- 本地镜像目录的 `manifest.json` 记录每个文件的原 URL 与 sha256；Isaac 工厂也改为加载镜像，不再联网读取 nucleus。`assets/` 不在 Git 中，换机器时按 manifest 重新下载。
+- Isaac ActuatorNetLSTM 不记录关节速度，DC 电机限幅始终按零速计算，即力矩只裁剪到 ±effort_limit（80 N·m）；mjlab 侧按相同结果实现。
+- 原地站立 2 s（dt 5 ms，从 0.6 m 落下）：Isaac 机身高 0.538 m；mjlab 默认 pyramidal 摩擦锥下，低增益的 LSTM 执行器使足端缓慢蠕滑外撇，机身高 0.406 m。改用 `cone='elliptic', impratio=10` 时为 0.515 m，关节偏差方向与 Isaac 一致。摩擦锥是仿真设置，目前公共配置未暴露。
+- Go2 在 mjlab 使用 Menagerie 原生模型（`assets/go2_mujoco`），不是由 Isaac USD 转换而来。
+- Web 编辑器资产架的网格（`.cache/assembly_visuals/`）与缩略图（`.cache/asset_thumbnails/`）已为以上资产、21 块地形地块及各项目预先生成，打开即可加载。
+
+## 程序化地形
+
+两条路线，名称与参数相同（Isaac Lab 子地形配置的同名字段，见 `shared/backends/isaac/assets.py` 的 `TERRAIN_VARIANTS`，未知名称直接报错并列出可选项；列表自动转为元组）。
+
+**1. 地形资产（两个后端通用，推荐用于固定场地）。** 参数化物体尚未支持，所以先生成一次，再当普通静态物体用：
+
+```bash
+python run.py asset terrain stairs assets/terrains/stairs --size 8 --difficulty 0.6 \
+    --param '{"step_height_range": [0.1, 0.2], "step_width": 0.3, "platform_width": 2.0}'
+```
+
+```yaml
+entities:
+  - name: ground
+    factory: usd_object
+    parameters: {usd_path: assets/terrains/stairs/usd/stairs.usda}
+```
+
+- 不给 `--param` 时使用 `shared/terrain_assets.py` 的 `PRESETS`（即下面验证所用参数）。`python run.py asset terrain all assets/terrains` 按预设把 21 种地块写到 `assets/terrains/<地形名>/`，已有 ASSET.json 的跳过；本机已生成全部 21 块，`asset check` 均通过。
+- Web 编辑器资产架自动列出 `assets/terrains/*/ASSET.json` 中的地块（类别“地面 / 地形”，名称取 ASSET.json 的 `terrain.label`），添加后就是指向该 USD 的 `usd_object`。21 块的网格与缩略图已预先生成到 `.cache/`；新生成的地块首次添加时由 Isaac 后台导出一次网格。
+- 生成在 Isaac 解释器内由 Isaac Lab 完成（启动无界面 Kit，约数秒），写出 `usd/<名>.usda`、`mjcf/<名>.xml` 和 ASSET.json；`usd_object` 与 `mjcf_for` 按普通资产的方式找到记录的 MJCF，不需要地形专用工厂。
+- 地块以实体原点为中心、边长 `--size`。ASSET.json 的 `terrain.spawn_origin` 是原 Isaac 子地形给出的出生点（相对地块中心，例如楼梯顶平台 z=1.5），可作为机器人初始位置的参考。
+- USD 保留原始三角形作为一个静态网格碰撞体。MuJoCo 的网格碰撞取凸包，非凸地形不能整体转成一个网格，因此 MJCF 按可精确表示的部件重建：轴对齐封闭块 → box；其他封闭凸体 → 凸包网格；规则高度网格的开放曲面 → hfield；平坦开放地块 → 薄板。封闭非凸块或不规则曲面直接拒绝，不做近似。
+- 写出后对 MJCF 与生成的三角形在 41×41 个点上做竖直射线比较，最大高度差记入 ASSET.json（`max_height_difference`），超过 2 mm 则报错且不写 ASSET.json。MuJoCo 与 Isaac Lab 高度场用同一条网格对角线，两者吻合。
+- 21 种均已在 Isaac Lab 2.3.2 上生成并通过上述比较：网格型落在 box 和凸包（`stairs` 41 个 box、`random_grid` 294 个、`star` 7 个 box 加 3 个凸包、`repeated_*` 2 个 box 加 7 个凸包），高度场型落在 hfield。MuJoCo 中小球落在 stairs、slope、star、repeated_pyramids、stepping_stones 上的静止高度与 USD 表面一致（误差 ≤ 0.5 mm）；Isaac 侧对 21 块逐一做了落体验证（每块 9 个小球，从 3 m 高处落下，静态网格碰撞体）：球静止时底部与原始三角形表面重合，没有穿透（`rough` 因球落在粗糙面上高 1–4.8 mm）；`inverted_slope`、`waves` 的球在碗形地面上仍在滚动，只确认了未穿透，没有静止数据。
+- 限制：摩擦两侧都是默认值；离开地块边缘即坠落；Isaac 的 `height_scanner` 与射线 `meshes` 在 mjlab 不支持，所以 mjlab 上只能是盲策略；Isaac 侧是每个环境克隆一份，`env_spacing` 须不小于地块边长，mjlab 各环境独立世界无此限制；所有环境用同一块地形，没有课程难度。
+
+**2. `terrain` 工厂（仅 Isaac，用于课程难度的多地块训练）。** 不在 Web 编辑器资产架上，只能在 scene.yaml 中手写。`terrain_generator.sub_terrains` 每项写 `factory` 与 `parameters`（`proportion` 控制占比）。mjlab 后端没有该工厂（没有 `terrain` 导入器和按环境分配地块的机制）。
+
+- 网格型（几何精确）：`flat`、`stairs`、`inverted_stairs`、`random_grid`、`rails`、`pit`、`box`、`gap`、`floating_ring`、`star`、`repeated_pyramids`、`repeated_boxes`、`repeated_cylinders`。
+- 高度场型（按网格采样，适合粗糙地面）：`rough`、`slope`、`inverted_slope`、`hf_stairs`、`hf_inverted_stairs`、`obstacles`、`waves`、`stepping_stones`。
+- `repeated_*` 的 `object_params_start/end` 写成字典（`num_objects`、`height`，以及 `radius` 或 `size`）。
+- 来自 Isaac Lab 的约束：`random_grid` 的 `size` 不能被 `grid_width` 整除（余量作边界，如 8 m 用 0.45）；`stepping_stones` 的 `holes_depth` 默认 -10 m，石间是深坑；高度场型用 `border_width`、`horizontal_scale`、`vertical_scale` 控制精度。
+- 只验证能由真实 `terrain` 工厂构造并生成网格，没有验证机器人能否在其上行走或训练。
 
 ## 后续顺序
 
@@ -92,7 +149,7 @@ Go2 模型保留上游 LICENSE、README 和固定提交来源。MuJoCo 保留 Me
 - test_portable_project.py：同一项目两后端配置一致；对象读取与惰性 Task；原生 mjlab ActionTerm 配置/实例调用公共执行链、实际单位解码、部分环境复位；错误执行器模式拒绝。
 - 原有场景、控制链、对象接口和 Python Task 配置回归测试。
 
-- test_mjlab_runtime.py：可选 RUN_MJLAB_GPU=1，验证 GPU 并行推进、单环境截断/复位、复位前最终观察和返回 Tensor 独立快照；普通测试验证后端接口缓存隔离。
+- test_mjlab_runtime.py：ANYmal-C 的 LSTM 执行器每步输出与 Isaac 计算方式逐项一致、只复位指定环境的隐状态；可选 RUN_MJLAB_GPU=1，验证 GPU 并行推进、单环境截断/复位、复位前最终观察和返回 Tensor 独立快照；普通测试验证后端接口缓存隔离。
 - test_stock_rlinf.py：实际原生训练及评估的观察合并路径；共享边界处理评估的字典列表，不改上游源码。
 - 实机已完成 2 环境 rollout smoke 和原生 RLinf 两次 PPO 迭代，两个检查点间有参数变化。该示例只验证接口与优化链路，不能当作学会站立或爬楼。
 

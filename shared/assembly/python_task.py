@@ -5,7 +5,7 @@ from .signals import Signals, Signal
 
 
 class Runtime:
-    def __init__(self, env, config, settings, *, bind_reader, module_loader=import_module):
+    def __init__(self, env, config, settings, *, bind_reader, robots=None, module_loader=import_module):
         module = module_loader(config['module'] + '.task')
         schema = module_loader(config['module'] + '.observation')
         self.task = module.Task() if hasattr(module, 'Task') else module
@@ -13,7 +13,7 @@ class Runtime:
         self.info_type = schema.SceneInfo
         self.paths = schema.SCENE_FIELDS
         self.env, self.settings = env, settings
-        self.bind_reader = bind_reader
+        self.bind_reader, self.robots = bind_reader, robots
         self.signals = Signals()
         self.step = None
         self.result = None
@@ -28,7 +28,7 @@ class Runtime:
         env = self.env
         if self.step == env.common_step_counter:
             return self.result
-        info = self.info_type(reader=self.read, paths=self.paths)
+        info = self.info_type(reader=self.read, paths=self.paths, robots=self.robots)
         with torch.no_grad():
             result = self.evaluate(info)
         if not isinstance(result, dict) or result.keys() - {'reward','success','failure','metrics'}:

@@ -33,6 +33,16 @@ class TaskMemory:
         count.add_(1)
         return history.sum(dim=1) / count.clamp(max=window).reshape(-1, *([1] * (value.ndim - 1)))
 
+    def rate(self, name, value, dt):
+        """Change of value per second since the previous call; inf on the first call after a reset."""
+        previous = self._get(name + '/previous', value)
+        seen = self._get(name + '/seen', value, (value.shape[0],))
+        shape = (-1, *([1] * (value.ndim - 1)))
+        result = torch.where(seen.reshape(shape) > 0, (value - previous) / dt.reshape(shape), torch.inf)
+        previous.copy_(value)
+        seen.fill_(1)
+        return result
+
     def reset(self, env_ids=None):
         for value in self._values.values():
             value[slice(None) if env_ids is None else env_ids] = 0
