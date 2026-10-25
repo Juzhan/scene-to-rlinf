@@ -62,3 +62,61 @@
 mjlab 环境通过现有环境注册入口构建，底层使用 mjlab 原生 manager 循环。已完成 GPU 部分复位与最终观察测试、原生 RLinf rollout、两次 PPO 更新、检查点保存和加载后的 4 回合评估。记录见 [后端说明](SCENE_BACKENDS.md)。原生评估合并器会把 states 字典变成生产者列表，共享 observations.fields 将其按批次合并；训练的递归字典路径保持不变。未修改上游代码，也未安装全局 monkey patch。
 
 该验收不包含策略学会任务、相机输入、策略渲染或历史 MuJoCo/VLA 项目迁移。
+
+## SuperMimic 类世界模型方法
+
+结论先说：**当前 RLinf 不能通过配置或替换项目模型直接复刻 SuperMimic。**
+它不是一个 PPO 变体，需要“采集 → 拟合确定性世界模型 → 在想象轨迹上做 BPTT → 更新
+actor/critic”的独立训练循环，而现有 RLinf 具身路径没有这个循环。
+
+参考实现：[`Zhengtianjin/go2-supermimic`](https://github.com/Zhengtianjin/go2-supermimic)
+提交 `054a13c`。它的训练循环在 `go2_supermimic/supermimic/train.py`（659 行），
+配套 `state.py`（270）、`imagine.py`（293）、`buffer.py`（117）、`world_model.py`（97）、
+`driver.py`（138），合计约 1.5k 行；单进程 `cuda:0`，不依赖分布式训练。
+
+### 与当前 RLinf 的接口差异
+
+| SuperMimic 需要 | RLinf 现状 | 差距 |
+| --- | --- | --- |
+| 逐 step 的 env 状态、动作、上一动作、接触/落地标记、地形 relief | `rlinf/data/storage/replay/buffer.py` 的 replay 按 `Trajectory` 存，服务 SAC/DAGGER；`EmbodiedRunner` 的 rollout 轨迹按 PPO 批处理组织 | 可复用存储机制，但没有 SuperMimic 的 `WindowArchive`、k-step 窗口和状态切片；需要新的 collector |
+| 确定性世界模型 `s' = f(s, a, a_prev, xi, scan)`，k-step 自回归训练 | 没有 world-model loss 或 dynamics model worker；`rlinf/envs/sim/world_model/env.py` 是 Wan/OpenSora **视频生成**环境，不是可微状态动力学 | 需要新增模型与训练目标，不能把视频 world model 当成动力学模型 |
+| 对 H=32 步想象轨迹 BPTT，奖励/终止在 PyTorch 内解析、可微 | 具身 actor worker 消费轨迹并做 PPO 损失（SAC 另有 worker）；项目 Task 是运行期只读评估，返回非可微标量 | 需要独立的 imagination 模块和可微奖励镜像；不能直接把 `task.py` 反传 |
+| actor 用想象回报更新，critic 用 TD(λ) 拟合想象数据 | PPO 的 advantage/return 计算与 SAC 的 critic 目标都不是这个目标 | 算法层新增，不是超参差异 |
+| 2048–4096 环境、40k 轮、每轮若干次世界模型更新 | 现有模板配方通常是 256–1024 环境、按 epoch 更新 | 计算规模与循环结构都不同 |
+
+`sac`、`dagger`、`offline`、`rlt` 也不能替代：SAC/DAGGER 仍是 model-free；offline 是
+监督式离线训练；RLT 不是状态空间世界模型。`WorldModelEnv` 的后端只生成画面并用奖励
+模型打分，没有梯度穿过动力学。
+
+### 可行路线
+
+1. **独立接入层（推荐先做）**：在 `shared/integrations/supermimic/`（或项目内独立训练
+   入口）实现 collector、世界模型、imagination 和 critic，复用现有 mjlab 环境、
+   `run.py` 的项目/场景/快照与 TensorBoard；PPO 路径保持不动。参考实现本身就是单进程，
+   16 GB GPU 的官方配置是 2048 环境、4096 想象批、400 窗口；本机 RTX 5080 16 GB 与之
+   同级。这条路线能尽快验证方法，但训练循环不等同于“RLinf 已支持”。
+2. **RLinf 原生 runner/worker**：新增 `WorldModelRunner` 与 world-model/imagination
+   workers，并把逐 step 状态接入 replay。只有确实需要 Ray/FSDP 和统一分布式调度时才值得；
+   否则会为了复用框架复制一套训练循环，违背 `docs/RLINF_INTEGRATION.md` 的维护约束。
+
+### 复刻前必须先补的共享能力
+
+- **状态**：70 维 `s`（base 高度、机体系重力/线速度/角速度、q/qd、hip/knee/foot 相对
+  位置）、4 维 context（脚摩擦、COM 偏移）、地形 relief/height scan。当前对象观察只暴露
+  关节与实体位姿，不暴露 hip/knee/foot 点；collector 可在环境进程内直接读 mjlab 实体，
+  或先加共享的 world-model state 适配。
+- **可微任务**：chase/dodge 的奖励与终止要在想象中可微。参考仓库也保留两份定义（env 奖励
+  用于日志，`imagine.py` 用于训练），需要一致性测试；不能把只读 Task 当作训练目标。
+- **历史与复位**：actor 需要 5 帧历史，世界模型需要回合边界。collector 能看到 reset，
+  应在采集端维护历史；共享观察目前不向模型提供回合边界。
+- **地形查询**：参考的 height scan 由解析地形场生成；我们的地形是烘焙的 USD/MJCF 网格，
+  需要射线或高度场查询。mjlab 后端目前没有 height scan / LiDAR 观察。
+- **稀有事件与探索**：OU 探索、driver/expert 策略、rare-event archive、RunningNorm 都是
+  采集/训练循环的一部分，不属于现有 PPO 配方。
+- **权重与实验目录**：SuperMimic actor 输入是 350/430/735 维，当前 `go2_chase` PPO 是
+  49 维；权重不可互换，新实验必须写独立目录并记录接口标识。
+
+本轮没有实现上述训练循环，也没有宣称能复现参考策略。已验证的只是 `projects/go2_chase`
+的 PPO 流程；参考仓库自己也说明 flat 从零训练约 7k 轮时仍常被杆击中，terrain 是多次
+重启后的结果，因此短程 smoke 或损失下降不能当作方法复刻成功。
+

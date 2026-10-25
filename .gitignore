@@ -59,3 +59,4 @@ events.out.tfevents.*
 *.mp4
 *.gif
 *.pptx
+MUJOCO_LOG.TXT

@@ -1,13 +1,16 @@
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 pytest.importorskip('mujoco')
 pytest.importorskip('pxr')
 
-from shared.asset_formats import (compare, physx_stage, urdf_to_mjcf, usd_capsules_into_mjcf,
-                                  usd_frames_into_mjcf)
+from shared.asset_formats import (compare, joint_order_problems, mjcf_joint_order, physx_stage, recorded_joint_order,
+                                  source_problems, upstream_files, urdf_to_mjcf, usd_capsules_into_mjcf,
+                                  usd_frames_into_mjcf, usd_joint_order, vendor, vendor_url)
+from shared.assembly.joint_order import canonical_joints
 
 INERTIAL = '<inertial><origin xyz="{com}"/><mass value="{mass}"/><inertia ixx="0.01" iyy="0.02" izz="0.03" ixy="0" ixz="0" iyz="0"/></inertial>'
 
@@ -114,6 +117,25 @@ def test_compare_reports_misplaced_centre_of_mass(tmp_path):
     report = compare(write_usd(tmp_path / 'robot.usda'), mjcf)
     assert not report['aligned']
     assert [item['item'] for item in report['mismatches']] == ['body arm centre of mass']
+
+
+def test_massless_body_without_colliders_counts_with_the_physx_default_mass(tmp_path):
+    from pxr import Usd, UsdGeom, UsdPhysics
+    mjcf, _ = urdf_to_mjcf(write_urdf(tmp_path), tmp_path / 'mjcf', 'robot')
+    usd = write_usd(tmp_path / 'robot.usda')
+    stage = Usd.Stage.Open(str(usd))
+    world = UsdGeom.Xform.Define(stage, '/robot/world').GetPrim()  # an exported URDF's empty root link
+    UsdPhysics.RigidBodyAPI.Apply(world)
+    UsdPhysics.MassAPI.Apply(world).CreateMassAttr(0.0)
+    UsdPhysics.MassAPI(stage.GetPrimAtPath('/robot/arm')).GetMassAttr().Clear()
+    stage.Save()
+    report = compare(usd, mjcf)
+    assert [item['item'] for item in report['mismatches']] == [
+        'body world (USD only): no mass and no colliders, PhysX assigns 1.0 kg']
+    assert report['masses_from_colliders'] == ['arm']  # derived by each engine, listed rather than compared
+    UsdPhysics.MassAPI(world).GetMassAttr().Set(0.001)
+    stage.Save()
+    assert compare(usd, mjcf)['aligned']
 
 
 def test_turned_body_frame_is_restored_without_moving_geometry(tmp_path):
@@ -275,3 +297,146 @@ def test_mjlab_usd_object_takes_inertia_from_collision_geometry(tmp_path, monkey
     assert free.body_inertia[-1] == pytest.approx([0.5 * 0.06 ** 2 / 6] * 3)
     with pytest.raises(NotImplementedError, match='scale'):
         usd_object(tmp_path / 'cube.usda', scale=2.0)
+
+
+def test_vendored_urdf_keeps_repository_paths_and_resolves_its_package(tmp_path):
+    repository = tmp_path / 'upstream'
+    package = repository / 'src/arm_description'
+    (package / 'urdf').mkdir(parents=True)
+    (package / 'meshes').mkdir()
+    write_urdf(package / 'meshes').rename(package / 'urdf/robot.urdf')
+    urdf = package / 'urdf/robot.urdf'
+    urdf.write_text(urdf.read_text().replace('"part.obj"', '"package://arm_description/meshes/part.obj"'))
+    (package / 'package.xml').write_text('<package><name>arm_description</name><license>MIT</license></package>')
+    (repository / 'LICENSE').write_text('MIT')
+    (repository / 'README.md').write_text('not loaded by the model')
+    git = ['git', '-C', str(repository), '-c', 'user.name=t', '-c', 'user.email=t@t']
+    subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+    subprocess.run([*git, 'remote', 'add', 'origin', 'https://mirror.example/https://github.com/org/arm.git'], check=True)
+    subprocess.run([*git, 'add', '.'], check=True)
+    subprocess.run([*git, 'commit', '-qm', 'arm'], check=True)
+
+    record, copied, unresolved = vendor(urdf, tmp_path / 'asset')
+    assert record['repository'] == 'https://github.com/org/arm' and unresolved == []
+    assert sorted(record['sha256']) == ['LICENSE', 'src/arm_description/meshes/part.mtl',
+                                        'src/arm_description/meshes/part.obj', 'src/arm_description/package.xml',
+                                        'src/arm_description/urdf/robot.urdf']
+    packages = {}
+    upstream_files((tmp_path / 'asset/source/src/arm_description/urdf/robot.urdf').resolve(), packages)
+    assert packages == {'arm_description': (tmp_path / 'asset/source/src/arm_description').resolve()}
+    assert source_problems(tmp_path / 'asset') == []
+    (tmp_path / 'asset/source/src/arm_description/meshes/part.mtl').write_text('edited')
+    assert source_problems(tmp_path / 'asset') == ['changed source/src/arm_description/meshes/part.mtl']
+
+    (package / 'meshes/part.obj').write_text('uncommitted')
+    with pytest.raises(SystemExit, match='Uncommitted upstream changes'):
+        vendor(urdf, tmp_path / 'other')
+
+
+def test_vendored_mjcf_follows_includes_and_compiler_directories(tmp_path):
+    repository = tmp_path / 'upstream'
+    model = repository / 'robots/arm'
+    (model / 'assets').mkdir(parents=True)
+    (model / 'assets/part.obj').write_text('v 0 0 0\nv 0.1 0 0\nv 0 0.1 0\nv 0 0 0.1\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n')
+    (model / 'assets/grid.png').write_bytes(b'png')
+    (model / 'scene.xml').write_text('<mujoco><compiler meshdir="assets" texturedir="assets"/>'
+                                     '<include file="arm.xml"/></mujoco>')
+    (model / 'arm.xml').write_text('<mujoco><asset><mesh file="part.obj"/><texture name="grid" type="2d" file="grid.png"/>'
+                                   '</asset></mujoco>')
+    (model / 'LICENSE').write_text('Apache-2.0')
+    (model / 'unused.obj').write_text('not loaded')
+    (repository / 'LICENSE').write_text('MIT')
+    git = ['git', '-C', str(repository), '-c', 'user.name=t', '-c', 'user.email=t@t']
+    subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+    subprocess.run([*git, 'remote', 'add', 'origin', 'https://github.com/org/models.git'], check=True)
+    subprocess.run([*git, 'add', '.'], check=True)
+    subprocess.run([*git, 'commit', '-qm', 'arm'], check=True)
+
+    record, copied, unresolved = vendor(model / 'scene.xml', tmp_path / 'asset')
+    assert record['repository'] == 'https://github.com/org/models' and unresolved == []
+    assert sorted(record['sha256']) == ['LICENSE', 'robots/arm/LICENSE', 'robots/arm/arm.xml',
+                                        'robots/arm/assets/grid.png', 'robots/arm/assets/part.obj',
+                                        'robots/arm/scene.xml']
+    assert source_problems(tmp_path / 'asset') == []
+
+
+def test_url_vendor_downloads_references_below_base(tmp_path):
+    from pxr import Sdf
+
+    server = tmp_path / 'server'
+    root = server / 'Assets/Isaac/5.1'
+    (root / 'Robots/Arm/Props').mkdir(parents=True)
+    (root / 'Materials').mkdir()
+    (root / 'Materials/paint.mdl').write_text('mdl 1.4;\nexport material paint() = '
+                                              'material(texture: texture_2d("./textures/paint_<UDIM>.png"));\n')
+    (root / 'Materials/textures').mkdir()
+    (root / 'Materials/textures/paint_1001.png').write_bytes(b'png')
+    payload = Sdf.Layer.CreateNew(str(root / 'Robots/Arm/Props/instanceable_meshes.usd'))
+    payload.Save()
+    layer = Sdf.Layer.CreateNew(str(root / 'Robots/Arm/arm.usd'))
+    prim = Sdf.CreatePrimInLayer(layer, '/Arm')
+    prim.specifier = Sdf.SpecifierDef
+    prim.referenceList.Prepend(Sdf.Reference('./Props/instanceable_meshes.usd'))
+    shader = Sdf.CreatePrimInLayer(layer, '/Arm/Paint')
+    shader.specifier = Sdf.SpecifierDef
+    for name, asset in (('custom', '../../Materials/paint.mdl'), ('builtin', 'OmniPBR.mdl')):
+        attribute = Sdf.AttributeSpec(shader, f'info:{name}:sourceAsset', Sdf.ValueTypeNames.Asset)
+        attribute.default = Sdf.AssetPath(asset)
+    layer.Save()
+
+    base = root.as_uri()
+    record, model, unresolved = vendor_url(f'{base}/Robots/Arm/arm.usd', tmp_path / 'asset', base=base)
+    assert record['url'] == base and unresolved == ['OmniPBR.mdl']
+    assert sorted(record['sha256']) == ['Materials/paint.mdl', 'Materials/textures/paint_1001.png',
+                                        'Robots/Arm/Props/instanceable_meshes.usd', 'Robots/Arm/arm.usd']
+    assert (tmp_path / 'asset/source/Robots/Arm/arm.usd').is_file()
+    assert json.loads((tmp_path / 'asset/source/SOURCE.json').read_text()) == record
+    assert source_problems(tmp_path / 'asset') == []
+
+
+def write_legs(directory):
+    """Two two-joint legs: PhysX lists joints by depth (hips, then knees), MuJoCo leg by leg."""
+    from pxr import Usd, UsdGeom, UsdPhysics
+    stage = Usd.Stage.CreateNew(str(directory / 'legs.usda'))
+    UsdGeom.Xform.Define(stage, '/robot')
+    for body in ('base', 'B_upper', 'B_lower', 'A_upper', 'A_lower'):  # authored out of name order
+        UsdPhysics.RigidBodyAPI.Apply(UsdGeom.Xform.Define(stage, f'/robot/{body}').GetPrim())
+    for leg in 'BA':
+        for name, parent, child in ((f'{leg}_hip', 'base', f'{leg}_upper'), (f'{leg}_knee', f'{leg}_upper', f'{leg}_lower')):
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f'/robot/{name}')
+            joint.CreateBody0Rel().SetTargets([f'/robot/{parent}'])
+            joint.CreateBody1Rel().SetTargets([f'/robot/{child}'])
+    stage.Save()
+    legs = ''.join(f'''<body name="{leg}_upper"><joint name="{leg}_hip"/><geom size=".01"/>
+      <body name="{leg}_lower"><joint name="{leg}_knee"/><geom size=".01"/></body></body>''' for leg in 'AB')
+    (directory / 'legs.xml').write_text(f'<mujoco><worldbody><body name="base"><geom size=".1"/>{legs}</body></worldbody></mujoco>')
+    return directory / 'legs.usda', directory / 'legs.xml'
+
+
+def test_joint_order_is_physx_breadth_first_and_checked_against_every_format(tmp_path):
+    usd, mjcf = write_legs(tmp_path)
+    order = ['A_hip', 'B_hip', 'A_knee', 'B_knee']
+    assert usd_joint_order(usd) == order
+    assert mjcf_joint_order(mjcf) == ['A_hip', 'A_knee', 'B_hip', 'B_knee']
+    record = {'source': str(usd), 'formats': {'usd': str(usd), 'mjcf': str(mjcf)}, 'joint_order': order}
+    assert joint_order_problems(record) == []
+    assert joint_order_problems({**record, 'joint_order': order[:3]}) == [
+        "usd joints differ from joint_order: missing [], not listed ['B_knee']",
+        "mjcf joints differ from joint_order: missing [], not listed ['B_knee']"]
+    assert joint_order_problems({**record, 'joint_order': None}) and not joint_order_problems(
+        {'source': str(usd), 'formats': {}})
+    (tmp_path / 'ASSET.json').write_text(json.dumps(record))
+    assert recorded_joint_order(mjcf) == tuple(order) and recorded_joint_order(tmp_path / 'other.xml') is None
+    (tmp_path / 'ASSET.json').write_text(json.dumps({key: value for key, value in record.items() if key != 'joint_order'}))
+    with pytest.raises(ValueError, match='no joint_order'):
+        recorded_joint_order(usd)
+
+
+def test_canonical_joints_reorders_only_when_the_engine_order_differs():
+    native = ('A_hip', 'A_knee', 'B_hip', 'B_knee')
+    assert canonical_joints(native, None, 'robot') == (native, None)
+    assert canonical_joints(native, native, 'robot') == (native, None)
+    assert canonical_joints(native, ('A_hip', 'B_hip', 'A_knee', 'B_knee'), 'robot') == (
+        ('A_hip', 'B_hip', 'A_knee', 'B_knee'), [0, 2, 1, 3])
+    with pytest.raises(ValueError, match='differ from the asset joint_order'):
+        canonical_joints(native, ('A_hip', 'B_hip', 'A_knee'), 'robot')

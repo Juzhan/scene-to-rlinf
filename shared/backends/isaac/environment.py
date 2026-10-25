@@ -38,6 +38,8 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, viewer=None):
     settings = prepared.settings
     simulation = deepcopy(settings.get("simulation", {}))
     simulation["device"] = parameters.get("device", simulation.get("device", "cuda:0"))
+    # Native MuJoCo solver options belong to the mjlab backend, as `physx` belongs to this one.
+    simulation.pop("mujoco", None)
     if "physx" in simulation:
         simulation["physx"] = sim.PhysxCfg(**simulation["physx"])
     if "physics_material" in simulation:

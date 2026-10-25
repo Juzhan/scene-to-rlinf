@@ -33,6 +33,7 @@ _ASSETS = {
     "dex_cube": ("可抓取方块", "原生 DexCube 刚体；尺寸由资产与 scale 决定。", ["rigid_body", "root_state"]),
     "ground_plane": ("平面地面", "各并行环境共享的物理地面。", ["geometry"]),
     "box": ("长方体", "完整边长（米）；质量为空时是静态设施。", ["geometry"]),
+    "ball": ("球", "自由刚体球；半径、质量、颜色与摩擦可调。", ["rigid_body", "root_state"]),
     "urdf_robot": ("导入的 URDF 机器人", "工作区内的 URDF，首次使用时转换为 USD（缓存于 .cache/urdf_usd）；所有关节共用一组隐式 PD 增益，请按机器人调整。", ["articulation", "root_state", "joint_state"]),
     "usd_robot": ("导入的 USD 机器人", "工作区内带关节的 USD；未填增益时沿用 USD 中的关节驱动。", ["articulation", "root_state", "joint_state"]),
     "usd_object": ("导入的 USD 物体", "质量为空时是静态设施；填写质量时 USD 内需已有刚体与碰撞属性。`run.py asset terrain` 生成的双格式地形地块也用它。", ["geometry"]),
@@ -129,6 +130,7 @@ _PARAMETER_LABELS = {
                "focal_length": "焦距（mm，水平孔径 20.955 mm）", "clipping_range": "近 / 远裁剪面（m）",
                "depth_clipping": "超出远裁剪面的深度"},
     "box": {"size": "边长 xyz（m）", "mass": "质量（kg，空为静态）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
+    "ball": {"radius": "半径（m）", "mass": "质量（kg）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
 }
 _OPTION_LABELS = {
     "rgb": "RGB 彩色", "distance_to_image_plane": "深度 · 到成像平面", "distance_to_camera": "深度 · 到光心",

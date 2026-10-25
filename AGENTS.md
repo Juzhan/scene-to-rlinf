@@ -181,6 +181,6 @@
 - `projects/dual_backend_scene` 已具备同一份 scene/policy/task/observation/train 定义；train 的 `env.train.init_params.backend` 选择后端，不复制配方。
 - 公共观察字段、双组件调度、动作结果校验和 Python Task runtime 位于 shared/assembly；两后端只绑定原生读数/控制项/managers。不得在 mjlab 复制策略或 Task 计算循环。
 - mjlab 已接通原生 GPU 环境及原生 RLinf PPO，支持 check/inspect/smoke/train/evaluate/view/record（view 用 MuJoCo 被动窗口显示 env 0）；已验证短 rollout、部分复位、终止观察和参数更新。显式 --backend mjlab 的 inspect/view 仍仅查看物理场景，不运行策略。
-- `.venv-mjlab` 为增量验证环境，不升级现有 Isaac 依赖；Go2 来源见 `assets/go2_mujoco/SOURCE.json`。
+- `.venv-mjlab` 为增量验证环境，不升级现有 Isaac 依赖；Go2 两后端共用 `assets/go2/`（USD 与其转换 MJCF，来源见 `source/SOURCE.json`）。
 - 新机器人/物体资产用 `run.py asset convert` 同时备好 USD 与 MJCF，记录 ASSET.json 并通过对齐检查；不手写转换器，不在转换文件里写执行器增益，对齐不通过时不静默修正。
-- 后续按 `docs/SCENE_BACKENDS.md` 扩展传感器和连接，不把短训练参数更新当作学会任务；同名资产不保证原生关节顺序/动力学/权重兼容。
+- 后续按 `docs/SCENE_BACKENDS.md` 扩展传感器和连接，不把短训练参数更新当作学会任务；关节顺序以 ASSET.json `joint_order`（= Isaac 顺序）为准，由各后端读数换序；同名资产仍不保证动力学/权重兼容。

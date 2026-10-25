@@ -36,8 +36,16 @@ class Runtime:
         def tensor(value, name, boolean=False):
             value = torch.as_tensor(value, device=env.device)
             if value.ndim == 0: value = value.expand(env.num_envs)
-            if value.shape != (env.num_envs,) or (value.is_floating_point() and not torch.isfinite(value).all()):
-                raise ValueError(f'Task {name} must contain one finite value per environment')
+            if value.shape != (env.num_envs,):
+                raise ValueError(f'Task {name} must contain one value per environment, got shape {tuple(value.shape)}')
+            if value.is_floating_point() and not torch.isfinite(value).all():
+                envs = torch.nonzero(~torch.isfinite(value)).flatten()
+                # Name the metric terms that are also non-finite, e.g. one reward_* component.
+                terms = [key for key, item in result.get('metrics', {}).items()
+                         if torch.is_tensor(item) and item.is_floating_point() and not torch.isfinite(item).all()]
+                raise ValueError(f'Task {name} is non-finite in {envs.numel()} environments '
+                                 f'(first {envs[:8].tolist()}, values {value[envs[:8]].tolist()})'
+                                 + (f'; non-finite metrics: {terms}' if terms else ''))
             if boolean and value.dtype != torch.bool:
                 raise TypeError(f'Task {name} must be boolean')
             return value.detach().clone()

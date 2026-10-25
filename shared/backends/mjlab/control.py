@@ -20,7 +20,8 @@ class Endpoint:
             raise ValueError(f'Control target selected no joints: {binding}')
         mode = binding['type']
         supported = {
-            'joint_position': (actuator.BuiltinPositionActuator, actuator.XmlPositionActuator, actuator.IdealPdActuator),
+            'joint_position': (actuator.BuiltinPositionActuator, actuator.XmlPositionActuator,
+                               actuator.DcMotorActuator, actuator.IdealPdActuator),
             'joint_velocity': (actuator.BuiltinVelocityActuator, actuator.XmlVelocityActuator, actuator.IdealPdActuator),
             'joint_effort': (actuator.BuiltinMotorActuator, actuator.XmlMotorActuator, actuator.IdealPdActuator),
         }
@@ -34,6 +35,10 @@ class Endpoint:
         self.action_dim = len(indices)
         self.write = getattr(self.entity, 'set_' + mode + '_target')
         self.clamp = mode == 'joint_position'
+        # Isaac PD actuators under effort control add the effort to a PD hold of the default pose
+        # (reset writes it as their position target); mjlab reset clears the targets to zero.
+        self.hold = mode == 'joint_effort' and any(isinstance(act, actuator.IdealPdActuator)
+                                                   and set(act.target_names) & set(names) for act in self.entity.actuators)
 
     def apply(self, value):
         if self.clamp:
@@ -43,6 +48,9 @@ class Endpoint:
             lower, upper = self.entity.data.joint_pos_limits[:, self.ids].unbind(-1)
             limited = lower < upper
             value = torch.where(limited, torch.minimum(torch.maximum(value, lower), upper), value)
+        if self.hold:
+            self.entity.set_joint_position_target(self.entity.data.default_joint_pos[:, self.ids], joint_ids=self.ids)
+            self.entity.set_joint_velocity_target(torch.zeros_like(value), joint_ids=self.ids)
         self.write(value, joint_ids=self.ids)
 
 

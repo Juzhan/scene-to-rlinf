@@ -724,7 +724,7 @@ def _preview(node, directory, metadata=None):
                 return {"path": str(candidate), "exact": True}
     root = Path(__file__).resolve().parents[2]
     if node.get("factory") == "franka_panda":
-        candidate = root / "assets/franka_panda/panda_instanceable.usd"
+        candidate = root / "assets/franka_panda/source/Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd"
         if candidate.is_file():
             return {"path": str(candidate), "exact": False,
                     "note": "Local Panda visual reference; native factory joint defaults and physics remain authoritative"}

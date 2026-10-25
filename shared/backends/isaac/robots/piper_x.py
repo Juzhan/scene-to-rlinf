@@ -49,7 +49,7 @@ PIPER_X_CFG = ArticulationCfg(
     init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={
             "joint1": 0.0, "joint2": 1.4, "joint3": -1.2,
-            "joint4": 0.0, "joint5": 1.2, "joint6": 0.0,
+            "joint4": 0.0, "joint5": 0.0, "joint6": 0.0,
             "gripper_joint1": 0.05, "gripper_joint2": -0.05,
         },
     ),

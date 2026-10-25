@@ -51,8 +51,20 @@ def _config_type():
                 self._marker.set_visibility(debug_vis)
 
         def _debug_vis_callback(self, event):
-            self._marker.visualize(translations=self.command[:, :3] + self._env.scene.env_origins,
-                                   orientations=self.command[:, 3:7])
+            position = self.command[:, :3] + self._env.scene.env_origins
+            orientation = self.command[:, 3:7]
+            edges = marker_edges(self.cfg.entity)
+            if edges is None:
+                self._marker.visualize(translations=position, orientations=orientation)
+                return
+            from isaaclab.utils.math import quat_apply
+            offsets, indices = (torch.tensor(value, device=self.device) for value in edges)
+            count = len(indices)
+            orientation = orientation.repeat_interleave(count, 0)
+            translations = position.repeat_interleave(count, 0) + quat_apply(
+                orientation, offsets.repeat(self.num_envs, 1))
+            self._marker.visualize(translations=translations, orientations=orientation,
+                                   marker_indices=indices.repeat(self.num_envs))
 
     @configclass
     class AbstractPoseCfg(CommandTermCfg):
@@ -63,20 +75,52 @@ def _config_type():
     return AbstractPoseCfg
 
 
+EDGE_WIDTH = 0.008
+
+
+def marker_edges(entity):
+    """Edge centres in the entity frame and their axis prototype, or None for solid markers.
+
+    Rectangles and boxes are drawn as wireframes: RTX real-time rendering
+    ignores surface opacity, so a solid volume would hide the robot inside it.
+    """
+    if entity['shape'] not in ('rectangle', 'box'):
+        return None
+    size = list(entity['size']) + [0.] * (3 - len(entity['size']))
+    offsets, indices = [], []
+    for axis in range(3):
+        if not size[axis]:
+            continue
+        others = [other for other in range(3) if other != axis]
+        corners = [(a, b) for a in ((-.5, .5) if size[others[0]] else (0.,))
+                   for b in ((-.5, .5) if size[others[1]] else (0.,))]
+        for a, b in corners:
+            offset = [0.] * 3
+            offset[others[0]], offset[others[1]] = a * size[others[0]], b * size[others[1]]
+            offsets.append(offset)
+            indices.append(axis)
+    return offsets, indices
+
+
 def marker_config(entity, path):
-    """Translucent geometry: sphere point, arrow direction, thin sheet rectangle, cuboid box."""
+    """Sphere point, arrow direction, wireframe rectangle/box."""
     import isaaclab.sim as sim_utils
     from isaaclab.markers import VisualizationMarkersCfg
     from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
     if entity['shape'] == 'direction':
         return GREEN_ARROW_X_MARKER_CFG.replace(prim_path=path)
-    material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.6, 1.0), opacity=0.35)
+    material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.6, 1.0))
     if entity['shape'] == 'point':
-        shape = sim_utils.SphereCfg(radius=0.04, visual_material=material)
-    else:
-        size = list(entity['size']) + [0.002] * (3 - len(entity['size']))
-        shape = sim_utils.CuboidCfg(size=tuple(size), visual_material=material)
-    return VisualizationMarkersCfg(prim_path=path, markers={'abstract': shape})
+        return VisualizationMarkersCfg(prim_path=path, markers={
+            'abstract': sim_utils.SphereCfg(radius=0.04, visual_material=material)})
+    size = list(entity['size']) + [0.] * (3 - len(entity['size']))
+    markers = {}
+    for axis in range(3):
+        edge = [EDGE_WIDTH] * 3
+        edge[axis] = size[axis] + EDGE_WIDTH
+        # Prototype order is the marker index: x, y, z edges.
+        markers['edge_' + 'xyz'[axis]] = sim_utils.CuboidCfg(size=tuple(edge), visual_material=material)
+    return VisualizationMarkersCfg(prim_path=path, markers=markers)
 
 
 def term_name(name):

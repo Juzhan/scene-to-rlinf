@@ -19,6 +19,13 @@ each backend's asset factory declares them.
     run.py asset convert assets/piper_x/piper_x.usda assets/piper_x
     run.py asset check assets/piper_x
 
+Upstream model files (USD, URDF or MJCF and everything they load) are copied unmodified,
+at their repository or URL paths, into ASSET/source/, with SOURCE.json recording the origin
+and the sha256 of each file:
+
+    run.py asset vendor <checkout>/piper_description/urdf/piper_description.urdf assets/piper
+    run.py asset vendor $NUCLEUS/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd assets/go2 --base $NUCLEUS
+
 MuJoCo backends call mjcf_for(): the recorded conversion when present, else a cached one.
 """
 import argparse
@@ -29,6 +36,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 USD_SUFFIXES = {'.usd', '.usda', '.usdc'}
 MESH_SUFFIXES = {'.stl'}
 TOLERANCE = {'position': 1e-4, 'mass': 1e-3, 'inertia': 1e-3, 'angle': 1e-4, 'axis': 1e-4}
+PHYSX_DEFAULT_MASS = 1.0      # kg, PhysX's mass for a rigid body with neither a positive mass nor colliders
 APPEARANCE_TOLERANCE = 0.005  # m, visual vs collision bounding box corners of one link
 COLLISION_GROUP = 3           # MuJoCo viewers and mjlab cameras draw groups 0-2 by default
 MESH_FACE_LIMIT = 200000      # MuJoCo mesh loader
@@ -680,7 +689,8 @@ def usd_bodies(path):
             rotation = transform.RemoveScaleShear().ExtractRotationQuat()
             entry = {'position': list(transform.ExtractTranslation()),
                      'orientation': [rotation.GetReal(), *rotation.GetImaginary()]}
-            if mass is not None and mass.GetMassAttr().HasAuthoredValue():
+            # UsdPhysics reads mass <= 0 as unset: PhysX then integrates the colliders at their density.
+            if mass is not None and mass.GetMassAttr().HasAuthoredValue() and mass.GetMassAttr().Get() > 0:
                 entry['mass'] = mass.GetMassAttr().Get()
             if 'mass' in entry and authored_inertial(mass):
                 entry['com'] = list(transform.Transform(Gf.Vec3d(mass.GetCenterOfMassAttr().Get())))
@@ -704,6 +714,9 @@ def usd_bodies(path):
             colliders = bodies[body.GetName()].setdefault('colliders', {})
             kind = COLLIDER_TYPES.get(prim.GetTypeName(), prim.GetTypeName())
             colliders[kind] = colliders.get(kind, 0) + 1
+    for entry in bodies.values():
+        if 'mass' not in entry and not entry.get('colliders'):
+            entry['mass'], entry['physx_default_mass'] = PHYSX_DEFAULT_MASS, True
     return bodies, joints
 
 
@@ -731,6 +744,73 @@ def mjcf_bodies(path):
         'range': model.jnt_range[index].tolist() if model.jnt_limited[index] else None}
         for index in range(model.njnt)}
     return bodies, joints
+
+
+def usd_joint_order(path):
+    """Movable joints in PhysX articulation order: breadth-first from the root link, the links of
+    one depth sorted by name. This is Isaac's joint_names order for every asset recorded here."""
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(str(path))
+    edges = []
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.Joint):
+            continue
+        joint = UsdPhysics.Joint(prim)
+        ends = joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets()
+        if all(ends) and not joint.GetExcludeFromArticulationAttr().Get():
+            movable = prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint)
+            edges.append((ends[0][0], ends[1][0], prim.GetName(), movable))
+    if not edges:
+        return []
+    roots = {parent for parent, *_ in edges} - {child for _, child, *_ in edges}
+    if len(roots) != 1:
+        raise ValueError(f'{path}: expected one articulation root link, found {sorted(map(str, roots))}')
+    order, level = [], sorted(roots)
+    while level:
+        below = sorted((edge for edge in edges if edge[0] in level), key=lambda edge: edge[1].name)
+        order += [name for _, _, name, movable in below if movable]
+        level = [child for _, child, *_ in below]
+    return order
+
+
+def mjcf_joint_order(path):
+    """Hinge and slide joints in MuJoCo's order (depth-first through the body tree)."""
+    import mujoco
+    model = mujoco.MjModel.from_xml_path(str(path))
+    return [model.joint(index).name for index in range(model.njnt)
+            if model.jnt_type[index] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)]
+
+
+def joint_order_problems(record):
+    """The recorded joint_order must name exactly the movable joints of every format."""
+    found = {format_: (usd_joint_order if format_ == 'usd' else mjcf_joint_order)(ROOT / path)
+             for format_, path in record['formats'].items() if format_ in ('usd', 'mjcf')}
+    order = record.get('joint_order')
+    if order is None:
+        return ['ASSET.json has no joint_order; rerun run.py asset convert'] if any(found.values()) else []
+    problems = [f'joint_order repeats {name}' for name, count in Counter(order).items() if count > 1]
+    for format_, names in found.items():
+        missing, extra = sorted(set(order) - set(names)), sorted(set(names) - set(order))
+        if missing or extra:
+            problems.append(f'{format_} joints differ from joint_order: missing {missing}, not listed {extra}')
+    return problems
+
+
+def recorded_joint_order(path):
+    """Canonical joint order of the asset whose ASSET.json lists `path` as its source or a format;
+    None for files no ASSET.json lists. Backends present joint readings in this order."""
+    path = Path(path).resolve()
+    for record_path in (directory / 'ASSET.json' for directory in path.parents):
+        if not record_path.is_file():
+            continue
+        record = json.loads(record_path.read_text())
+        if path not in {(ROOT / item).resolve() for item in (record['source'], *record['formats'].values())}:
+            continue
+        if 'joint_order' not in record:
+            raise ValueError(f'{workspace_path(record_path)} has no joint_order; rerun: '
+                             f'run.py asset convert {record["source"]} <asset directory>')
+        return tuple(record['joint_order'])
+    return None
 
 
 def compare(usd, mjcf):
@@ -771,6 +851,10 @@ def compare(usd, mjcf):
         check('axis', f'joint {name}', a['axis'], b['axis'])
         if a['range'] is not None:  # both continuous otherwise
             check('angle', f'joint {name} range', a['range'], b['range'])
+    for name in sorted(usd_body.keys() - mj_body.keys()):
+        if usd_body[name].get('physx_default_mass'):
+            mismatches.append({'item': f'body {name} (USD only): no mass and no colliders, PhysX assigns '
+                                       f'{PHYSX_DEFAULT_MASS} kg', 'kind': 'mass', 'usd': [PHYSX_DEFAULT_MASS], 'mjcf': None})
     massive = lambda bodies, name: bodies[name].get('mass', 1.0) > 0
     return {
         'aligned': not mismatches,
@@ -781,7 +865,8 @@ def compare(usd, mjcf):
         'usd_only_bodies': sorted(name for name in usd_body.keys() - mj_body.keys() if massive(usd_body, name)),
         'mjcf_only_bodies': sorted(name for name in mj_body.keys() - usd_body.keys() if massive(mj_body, name)),
         'mismatches': mismatches,
-        'not_compared': ['collision shape sizes (MuJoCo uses mesh convex hulls; PhysX follows the USD collider '
+        'masses_from_colliders': sorted(name for name, body in usd_body.items() if 'mass' not in body),
+        'not_compared': ['masses_from_colliders (each engine integrates its own collision shapes at a density)', 'collision shape sizes (MuJoCo uses mesh convex hulls; PhysX follows the USD collider '
                          'approximation); collider counts per body and type are compared', 'contact/friction parameters', 'actuators (declared by backend factories)'],
     }
 
@@ -830,6 +915,9 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
         'source': workspace_path(source), 'source_format': kind, 'source_sha256': digest(source),
         **({'source_layers_sha256': usd_layers(source)} if kind == 'usd' else {}),
         'formats': formats, 'steps': steps,
+        # Joint readings use this order in every backend (Isaac's own order for a USD).
+        'joint_order': (usd_joint_order(ROOT / formats['usd']) if 'usd' in formats
+                        else mjcf_joint_order(ROOT / formats['mjcf'])),
         'alignment': (compare(ROOT / formats['usd'], ROOT / formats['mjcf'])
                       if formats.keys() == {'usd', 'mjcf'} else None),
         'sha256': {path.relative_to(output).as_posix(): digest(path)
@@ -856,12 +944,232 @@ def source_hashes(source, packages=None):
     return hashes
 
 
+def upstream_files(source, packages):
+    """Files a USD, URDF or MJCF model loads (plus each named ROS package.xml), and references left unresolved."""
+    if source_format(source) == 'usd':
+        from pxr import UsdUtils
+        layers, assets, unresolved = UsdUtils.ComputeAllDependencies(str(source))
+        return {Path(layer.realPath) for layer in layers if layer.realPath} | {Path(item) for item in assets}, unresolved
+    if source_format(source) == 'mjcf':
+        return mjcf_files(source)
+    files, missing = {source}, []
+    for mesh in ElementTree.parse(source).getroot().iter('mesh'):
+        path = resolve_mesh(mesh.get('filename'), source, packages)
+        if not path.is_file():
+            missing.append(mesh.get('filename'))
+        files |= {item for item in (path, path.with_suffix('.mtl')) if item.is_file()}
+    return files | {directory / 'package.xml' for directory in packages.values()}, missing
+
+
+def mjcf_files(source):
+    """Files an MJCF model loads: its <include>s and the mesh/texture/hfield/skin files they name.
+
+    Paths follow MuJoCo: includes are relative to the main file, assets to the compiler's
+    meshdir/texturedir (assetdir sets both), each relative to the main file."""
+    source = Path(source).resolve()
+    documents, pending = [], [source]
+    while pending:
+        path = pending.pop()
+        documents.append(path)
+        pending += [source.parent / item.get('file') for item in ElementTree.parse(path).getroot().iter('include')]
+    directories = {}
+    for path in documents:
+        for compiler in ElementTree.parse(path).getroot().iter('compiler'):
+            for key in ('assetdir', 'meshdir', 'texturedir'):
+                if compiler.get(key) is not None:
+                    directories[key] = compiler.get(key)
+    meshes = directories.get('meshdir', directories.get('assetdir', ''))
+    textures = directories.get('texturedir', directories.get('assetdir', ''))
+    files, missing = set(documents), []
+    for path in documents:
+        for element in ElementTree.parse(path).getroot().iter():
+            names = [element.get('file')] if element.tag in ('mesh', 'hfield', 'skin', 'texture') else []
+            if element.tag == 'texture':
+                names += [element.get(key) for key in ('fileright', 'fileleft', 'fileup', 'filedown',
+                                                       'filefront', 'fileback')]
+            for name in filter(None, names):
+                target = source.parent / (textures if element.tag == 'texture' else meshes) / name
+                (files.add if target.is_file() else missing.append)(target.resolve() if target.is_file() else name)
+    return files, missing
+
+
+def _git(directory, *args):
+    return subprocess.run(['git', '-C', str(directory), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def vendor(source, output, packages=None):
+    """Copy an upstream USD/URDF/MJCF model and every file it loads to OUTPUT/source/<repository path>.
+
+    Files keep their repository paths, so relative USD references and package:// URIs (via the
+    copied package.xml) still resolve. OUTPUT/source/SOURCE.json records the repository, commit
+    and sha256 of each file; `asset check` verifies them. Only committed, unmodified files are copied.
+    """
+    source, output = Path(source).resolve(), Path(output).resolve()
+    packages = {key: Path(value).resolve() for key, value in (packages or {}).items()}
+    files, unresolved = upstream_files(source, packages)
+    top = Path(_git(source.parent, 'rev-parse', '--show-toplevel'))
+    outside = sorted(str(path) for path in files if not path.resolve().is_relative_to(top))
+    if outside:
+        raise SystemExit(f'{source} loads files outside its repository {top}: {outside}')
+    folders = [source.parent, *(folder for folder in source.parent.parents if folder.is_relative_to(top))]
+    files |= {path for folder in folders for path in folder.iterdir()
+              if path.is_file() and path.name.upper().startswith(('LICENSE', 'COPYING'))}
+    relative = sorted(path.resolve().relative_to(top).as_posix() for path in files)
+    changed = _git(top, 'status', '--porcelain', '--', *relative)
+    if changed:
+        raise SystemExit(f'Uncommitted upstream changes; commit or revert them first:\n{changed}')
+    url = _git(top, 'remote', 'get-url', 'origin')
+    if 'https://' in url:  # drop mirror prefixes such as https://proxy/https://github.com/...
+        url = 'https://' + url.rsplit('https://', 1)[1]
+    record_path = output / 'source' / 'SOURCE.json'
+    record = {'repository': url.removesuffix('.git'), 'commit': _git(top, 'rev-parse', 'HEAD'),
+              'note': 'Unmodified upstream files at their repository paths; '
+                      "the URDF's package:// URIs resolve against this directory.", 'sha256': {}}
+    if record_path.is_file():
+        existing = json.loads(record_path.read_text())
+        if (existing.get('repository'), existing.get('commit')) != (record['repository'], record['commit']):
+            raise SystemExit(f"{record_path} records {existing.get('repository') or existing.get('url')}"
+                             f"@{existing.get('commit')}; "
+                             'one asset vendors one upstream commit')
+        record = existing
+    for name in relative:
+        hash_ = digest(top / name)
+        if record['sha256'].get(name, hash_) != hash_:
+            raise SystemExit(f'{record_path.parent / name} already holds different content')
+        target = record_path.parent / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(top / name, target)
+        record['sha256'][name] = hash_
+    record['sha256'] = dict(sorted(record['sha256'].items()))
+    record_path.write_text(json.dumps(record, indent=2) + '\n')
+    return record, workspace_path(record_path.parent / source.relative_to(top)), unresolved
+
+
+NUCLEUS_URL = 'https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1'
+
+
+def nucleus_copy(asset, path):
+    """Vendored copy of NUCLEUS_URL/PATH in assets/ASSET/source/ (the Isaac release our Isaac Lab loads)."""
+    file = ROOT / 'assets' / asset / 'source' / path
+    if not file.is_file():
+        raise FileNotFoundError(f'{workspace_path(file)} is missing; download it with: '
+                                f'run.py asset vendor {NUCLEUS_URL}/{path} assets/{asset} --base {NUCLEUS_URL}')
+    return file
+
+
+def _download(url, attempts=3):
+    from urllib.error import HTTPError, URLError
+    from urllib.request import urlopen
+    for attempt in range(attempts):
+        try:
+            with urlopen(url, timeout=120) as response:
+                return response.read()
+        except HTTPError:
+            raise
+        except (URLError, OSError):
+            if attempt == attempts - 1:
+                raise
+
+
+def _exists(url):
+    """False when the server reports no such file (S3 answers 403 for missing keys); other errors raise."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+    try:
+        with urlopen(Request(url, method='HEAD'), timeout=60):
+            return True
+    except HTTPError as error:
+        if error.code in (403, 404):
+            return False
+        raise
+    except URLError as error:
+        if isinstance(error.reason, FileNotFoundError):
+            return False
+        raise
+
+
+def url_dependencies(path):
+    """Relative references a downloaded file makes: USD layers/assets, or the textures an MDL material names."""
+    if path.suffix in USD_SUFFIXES:
+        from pxr import UsdUtils
+        return [item for group in UsdUtils.ExtractExternalReferences(str(path)) for item in group]
+    if path.suffix == '.mdl':
+        return re.findall(r'texture_2d\(\s*"([^"]+)"', path.read_text(errors='ignore'))
+    return []
+
+
+def vendor_url(url, output, base=None):
+    """Download a model (and every file it references, recursively) to OUTPUT/source/<path below BASE>.
+
+    BASE is the source root recorded in SOURCE.json, by default the URL's scheme and host; for
+    Isaac Nucleus pass the release directory (…/Assets/Isaac/5.1). References that are absolute,
+    point outside BASE, or do not exist there (Kit's built-in MDLs such as OmniPBR.mdl) are not
+    copied and are returned as unresolved."""
+    from urllib.parse import urljoin, urlsplit
+    output = Path(output).resolve()
+    parts = urlsplit(url)
+    base = (base or f'{parts.scheme}://{parts.netloc}').rstrip('/') + '/'
+    if not url.startswith(base):
+        raise SystemExit(f'{url} is not below --base {base}')
+    record_path = output / 'source' / 'SOURCE.json'
+    record = {'url': base.rstrip('/'), 'note': 'Unmodified downloads at their paths below url; '
+                                               'relative references resolve within this directory.', 'sha256': {}}
+    if record_path.is_file():
+        existing = json.loads(record_path.read_text())
+        if existing.get('url') != record['url']:
+            raise SystemExit(f"{record_path} records {existing.get('repository') or existing.get('url')}; "
+                             'one asset vendors one source')
+        record = existing
+    pending, seen, unresolved = [url], set(), []
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        name = current[len(base):]
+        content = _download(current)
+        hash_ = hashlib.sha256(content).hexdigest()
+        if record['sha256'].get(name, hash_) != hash_:
+            raise SystemExit(f'{record_path.parent / name} already holds different content')
+        target = record_path.parent / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        record['sha256'][name] = hash_
+        print(f'{name}: {len(content)} bytes', flush=True)
+        for reference in url_dependencies(target):
+            reference = reference.replace('<UDIM>', '1001')
+            dependency = urljoin(current, reference)
+            if '://' in reference or not dependency.startswith(base):
+                unresolved.append(reference)
+                continue
+            if dependency in seen:
+                continue
+            if not _exists(dependency):
+                unresolved.append(reference)
+                continue
+            pending.append(dependency)
+    record['sha256'] = dict(sorted(record['sha256'].items()))
+    record_path.write_text(json.dumps(record, indent=2) + '\n')
+    return record, workspace_path(record_path.parent / url[len(base):]), sorted(set(unresolved))
+
+
+def source_problems(directory):
+    """Files listed in DIRECTORY/source/SOURCE.json that are missing or changed (None without the record)."""
+    record_path = Path(directory) / 'source' / 'SOURCE.json'
+    if not record_path.is_file():
+        return None
+    expected = json.loads(record_path.read_text())['sha256']
+    return [f'{"changed" if (record_path.parent / name).is_file() else "missing"} source/{name}'
+            for name, hash_ in expected.items()
+            if not (record_path.parent / name).is_file() or digest(record_path.parent / name) != hash_]
+
+
 def recorded_mjcf(source):
     """MJCF recorded by `asset convert` next to a USD/URDF source, or None.
 
     A record whose source changed afterwards is an error, never silently reused."""
     source = Path(source).resolve()
-    for record_path in (source.parent / 'ASSET.json', source.parent.parent / 'ASSET.json'):
+    for record_path in (directory / 'ASSET.json' for directory in source.parents):
         if not record_path.is_file():
             continue
         record = json.loads(record_path.read_text())
@@ -947,8 +1255,8 @@ def mjcf_for(source, *, packages=None, root=None):
 def summary(report):
     lines = [f"aligned: {report['aligned']}  bodies {report['bodies_compared']}  joints {len(report['joints'])}",
              '  worst: ' + ', '.join(f'{key} {value:.2e}' for key, value in report['worst'].items())]
-    for key in ('usd_only_bodies', 'mjcf_only_bodies'):
-        if report[key]:
+    for key in ('usd_only_bodies', 'mjcf_only_bodies', 'masses_from_colliders'):
+        if report.get(key):
             lines.append(f'  {key}: {", ".join(report[key])}')
     lines += [f"  mismatch {item['kind']}: {item['item']} usd={item['usd']} mjcf={item['mjcf']}"
               for item in report['mismatches']]
@@ -978,8 +1286,15 @@ def main(argv=None):
     create.add_argument('--fix-base', action='store_true', help='URDF/MJCF source: fixed-base articulation in USD')
     create.add_argument('--keep-visuals', action='store_true',
                         help='Keep visual meshes in MJCF for every link; collision geoms then go to the hidden group')
-    verify = commands.add_parser('check', help='Compare the USD and MJCF forms of an asset')
-    verify.add_argument('asset', type=Path, help='Asset directory with ASSET.json, or a USD file')
+    copy = commands.add_parser('vendor', help='Copy an upstream USD/URDF/MJCF and the files it loads into ASSET/source/')
+    copy.add_argument('source', help='USD, URDF or MJCF file inside a git checkout, or an http(s) URL')
+    copy.add_argument('output', type=Path, help='Asset directory; writes source/<upstream path> and SOURCE.json')
+    copy.add_argument('--base', help='URL source: root recorded in SOURCE.json; files keep their path below it')
+    copy.add_argument('--package', action='append', default=[], metavar='NAME=PATH',
+                      help='URDF package:// root (default: nearest package.xml with that name)')
+    verify = commands.add_parser('check', help='Verify vendored sources and compare the USD and MJCF forms')
+    verify.add_argument('asset', type=Path, help='Asset directory with ASSET.json and/or source/SOURCE.json, '
+                                                 'or a USD file')
     verify.add_argument('mjcf', type=Path, nargs='?', help='MJCF file when the first argument is a USD file')
     tile = commands.add_parser('terrain', help='Generate a terrain tile as an ordinary USD + MJCF asset')
     tile.add_argument('variant', help='Terrain variant name (shared/backends/isaac/assets.py TERRAIN_VARIANTS), '
@@ -1009,26 +1324,53 @@ def main(argv=None):
             print(json.dumps(record['steps'][0]['mjcf_collision']),
                   'max height difference', f"{record['steps'][0]['max_height_difference']:.2e} m", flush=True)
         return 0
+    packages = {}
+    for item in getattr(options, 'package', []):
+        key, separator, value = item.partition('=')
+        if not separator:
+            parser.error('--package expects NAME=PATH')
+        packages[key] = value
+    if options.command == 'vendor':
+        if '://' in options.source:
+            record, copied, unresolved = vendor_url(options.source, options.output, options.base)
+            origin = record['url']
+        else:
+            record, copied, unresolved = vendor(options.source, options.output, packages)
+            origin = f"{record['repository']}@{record['commit']}"
+        print(f"{origin}: {len(record['sha256'])} files; model at {copied}")
+        if unresolved:
+            print('unresolved (not copied):', ', '.join(map(str, unresolved)))
+        return 0
     if options.command == 'convert':
-        packages = {}
-        for item in options.package:
-            key, separator, value = item.partition('=')
-            if not separator:
-                parser.error('--package expects NAME=PATH')
-            packages[key] = value
         record = convert(options.source, options.output, options.name, packages, options.root,
                          options.fix_base, options.keep_visuals)
         print(json.dumps(record['formats'], indent=2))
         print(summary(record['alignment']))
         return 0 if record['alignment']['aligned'] else 1
     if options.mjcf is None:
-        formats = json.loads((options.asset / 'ASSET.json').read_text())['formats']
-        usd, mjcf = ROOT / formats['usd'], ROOT / formats['mjcf']
+        problems = source_problems(options.asset)
+        if problems:
+            print('vendored sources differ from source/SOURCE.json:', *problems, sep='\n  ')
+            return 1
+        if not (options.asset / 'ASSET.json').is_file():
+            if problems is None:
+                parser.error(f'{options.asset} has neither ASSET.json nor source/SOURCE.json')
+            print('vendored sources match source/SOURCE.json; no ASSET.json, so no USD/MJCF comparison')
+            return 0
+        if problems is not None:
+            print('vendored sources match source/SOURCE.json')
+        record = json.loads((options.asset / 'ASSET.json').read_text())
+        order = joint_order_problems(record)
+        if order:
+            print('joint order problems:', *order, sep='\n  ')
+        else:
+            print('joint order:', ', '.join(record.get('joint_order', [])) or 'no movable joints')
+        usd, mjcf = ROOT / record['formats']['usd'], ROOT / record['formats']['mjcf']
     else:
-        usd, mjcf = options.asset, options.mjcf
+        usd, mjcf, order = options.asset, options.mjcf, []
     report = compare(usd, mjcf)
     print(summary(report))
-    return 0 if report['aligned'] else 1
+    return 0 if report['aligned'] and not order else 1
 
 
 if __name__ == '__main__':

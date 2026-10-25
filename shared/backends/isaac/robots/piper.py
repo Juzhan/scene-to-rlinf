@@ -1,10 +1,11 @@
 """松灵（AgileX）Piper 六轴机械臂的 Isaac Lab 资产配置。
 
 模型来源：官方 `agilexrobotics/piper_ros`（noetic 分支）的 `piper_description`，
+原样存于 `assets/piper/source/`（保持仓库路径，SOURCE.json 记录提交与 sha256），
 用 Isaac Lab 官方 URDF 导入器转成 USD：
 
     python <IsaacLab>/scripts/tools/convert_urdf.py \
-        third_party/piper_ros/src/piper_description/urdf/piper_description.urdf \
+        assets/piper/source/src/piper_description/urdf/piper_description.urdf \
         assets/piper/piper.usd \
         --merge-joints --fix-base --joint-stiffness 0.0 --joint-damping 0.0 --joint-target-type none
 

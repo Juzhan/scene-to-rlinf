@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 
-from shared.assembly.assets import DEFAULT_BACKEND, selected_backend
+from shared.assembly.assets import DEFAULT_BACKEND, backend_module, selected_backend
 
 
 def native_interface(native):
@@ -55,11 +55,15 @@ def native_interface(native):
             }
     articulations = (native.scene.articulations if hasattr(native.scene, 'articulations') else
                      {name: asset for name, asset in native.scene.entities.items() if asset.is_articulated})
+    joint_layout = backend_module(result["backend"], 'robot').joint_layout
     for name, asset in articulations.items():
+        # Joints in the asset's recorded order, the order policies and replay checks see.
+        names, index = joint_layout(native, name)
+        columns = (lambda value: value) if index is None else (lambda value: value[index])
         result["articulations"][name] = {
-            "joint_names": list(asset.joint_names), "body_names": list(asset.body_names),
-            "default_joint_position": asset.data.default_joint_pos[0].cpu().tolist(),
-            "joint_position_limits": asset.data.soft_joint_pos_limits[0].cpu().tolist(),
+            "joint_names": list(names), "body_names": list(asset.body_names),
+            "default_joint_position": columns(asset.data.default_joint_pos[0]).cpu().tolist(),
+            "joint_position_limits": columns(asset.data.soft_joint_pos_limits[0]).cpu().tolist(),
         }
     return result
 

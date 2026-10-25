@@ -1,39 +1,29 @@
 """MuJoCo counterparts of public asset names; no SDK imports at discovery time."""
 from typing import Literal
-from shared.assembly.assets import CameraData, box_parameters, camera_parameters, checked, workspace_file
+from shared.assembly.assets import (CameraData, ball_parameters, box_parameters, camera_parameters,
+                                   checked, checked_gains, workspace_file)
 
 # Factories that return mjlab sensors; only these may be mounted on an entity body.
-SENSORS = ('camera', 'frame_transformer')
+SENSORS = ('camera', 'frame_transformer', 'contact_sensor')
 
 
 def go2():
-    from pathlib import Path
-    import mujoco
-    from mjlab.entity import EntityCfg, EntityArticulationInfoCfg
-    from mjlab.actuator import XmlMotorActuatorCfg
-    path = Path(__file__).resolve().parents[3] / 'assets/go2_mujoco/go2.xml'
-    def spec_fn():
-        spec = mujoco.MjSpec.from_file(str(path))
-        spec.assets = {f'assets/{mesh.name}': mesh.read_bytes()
-                       for mesh in (path.parent / 'assets').iterdir() if mesh.is_file()}
-        # Authored initial state replaces Menagerie's home keyframe. Preserve
-        # the original torque motors; control integration is a separate step.
-        for key in list(spec.keys):
-            spec.delete(key)
-        return spec
-    class MotorRobotCfg(EntityCfg):
-        def build(self):
-            entity = super().build()
-            # mjlab 1.1.1 seeds actuator controls from joint positions. For
-            # XML torque motors, initial effort must instead be zero.
-            for key in entity.spec.keys:
-                key.ctrl = [0.] * len(entity.spec.actuators)
-            return entity
-    return MotorRobotCfg(spec_fn=spec_fn,
-        articulation=EntityArticulationInfoCfg(actuators=(XmlMotorActuatorCfg(target_names_expr=('.*_joint',)),)),
-        init_state=EntityCfg.InitialStateCfg(
-        pos=(0., 0., .42), joint_pos={'.*_hip_joint': 0.,
-        '.*_thigh_joint': .8, '.*_calf_joint': -1.5}))
+    """Go2 from the MJCF recorded for its vendored Isaac 5.1 USD (assets/go2), driven like the Isaac
+    UNITREE_GO2_CFG: explicit DC motors (kp 25, kd 0.5, 23.5 N·m, 30 rad/s) and its initial pose.
+    Masses, foot and head bodies and colliders are the USD's; like Isaac's explicit actuators the
+    converted joints have no passive damping, friction or armature."""
+    from mjlab.actuator import DcMotorActuatorCfg
+    from mjlab.entity import EntityArticulationInfoCfg
+    from shared.asset_formats import mjcf_for, nucleus_copy
+    usd = nucleus_copy('go2', 'Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd')
+    cfg = _mjcf_entity(mjcf_for(usd), False, joint_pos={
+        '.*L_hip_joint': .1, '.*R_hip_joint': -.1, 'F[L,R]_thigh_joint': .8, 'R[L,R]_thigh_joint': 1.,
+        '.*_calf_joint': -1.5})
+    cfg.articulation = EntityArticulationInfoCfg(actuators=(DcMotorActuatorCfg(
+        target_names_expr=('.*_hip_joint', '.*_thigh_joint', '.*_calf_joint'), stiffness=25., damping=.5,
+        effort_limit=23.5, saturation_effort=23.5, velocity_limit=30.),))
+    cfg.init_state.pos = (0., 0., .4)
+    return cfg
 
 
 def ground_plane():
@@ -62,6 +52,24 @@ def box(size: tuple[float, float, float] = (1., 1., 1.), mass: float | None = No
         body.add_geom(name='geometry', type=mujoco.mjtGeom.mjGEOM_BOX,
                       size=[v / 2 for v in size], rgba=[*color, 1.],
                       friction=[friction, .005, .0001], **attributes)
+        return spec
+    return EntityCfg(spec_fn=spec_fn)
+
+
+@checked(ball_parameters)
+def ball(radius: float = .12, mass: float = .2,
+         color: tuple[float, float, float] = (.2, .8, .3), friction: float = 1.):
+    """Free sphere with a free root joint; the radius and mass are explicit (SI)."""
+    ball_parameters(radius, mass, color, friction)
+    import mujoco
+    from mjlab.entity import EntityCfg
+    def spec_fn():
+        spec = mujoco.MjSpec()
+        body = spec.worldbody.add_body(name='body')
+        body.add_freejoint(name='root')
+        body.add_geom(name='geometry', type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                      size=[radius], mass=mass, rgba=[*color, 1.],
+                      friction=[friction, .005, .0001])
         return spec
     return EntityCfg(spec_fn=spec_fn)
 
@@ -114,6 +122,7 @@ def _mjcf_entity(path, fixed, gains=None, joint_pos=None, mass=None, pads=None, 
                 for key, value in attributes.items():
                     setattr(geom, key, value)
         return spec
+    spec_fn.asset_path = path  # robot.joint_layout finds the asset's joint_order from it
     groups = {}
     for joint, values in (gains or {}).items():
         groups.setdefault(values, []).append(re.escape(joint))
@@ -132,8 +141,13 @@ def _joint_names(path):
             if model.jnt_type[index] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)]
 
 
-def piper_x(usd_path=None, fix_root_link=True):
+@checked(lambda gains=None, **_: checked_gains(gains or {}))
+def piper_x(usd_path=None, fix_root_link=True, gains=None):
     """Piper X from the MJCF recorded beside its USD; gains match the Isaac PIPER_X_CFG.
+
+    gains optionally maps exact joint names to [stiffness, damping]. The default 400/40 arm
+    gains suit a fixed base; on a base welded to a moving robot they excite a stiff
+    oscillation of the light arm base, so mobile setups pass lower gains (on both backends).
 
     The fingers touch a held object only through the flat 2.5 x 1 cm tip face of their
     collision hulls. MuJoCo returns one contact point per mesh pair, which wanders over
@@ -146,10 +160,13 @@ def piper_x(usd_path=None, fix_root_link=True):
     from shared.asset_formats import mjcf_for
     usd = workspace_file(usd_path or Path(__file__).resolve().parents[3] / 'assets/piper_x/piper_x.usda')
     arm, gripper = (400., 40., 100.), (1000., 50., 10.)
+    native = {**{f'joint{index}': arm for index in range(1, 7)}, 'gripper_joint1': gripper, 'gripper_joint2': gripper}
+    gains = checked_gains(gains or {})
+    if gains.keys() - native.keys():
+        raise ValueError(f'gains: unknown joints {sorted(gains.keys() - native.keys())}; expected names among {list(native)}')
     return _mjcf_entity(mjcf_for(usd), fix_root_link,
-                        {**{f'joint{index}': arm for index in range(1, 7)},
-                         'gripper_joint1': gripper, 'gripper_joint2': gripper},
-                        {'joint1': 0., 'joint2': 1.4, 'joint3': -1.2, 'joint4': 0., 'joint5': 1.2,
+                        {joint: (*gains.get(joint, values[:2]), values[2]) for joint, values in native.items()},
+                        {'joint1': 0., 'joint2': 1.4, 'joint3': -1.2, 'joint4': 0., 'joint5': 0.,
                          'joint6': 0., 'gripper_joint1': .05, 'gripper_joint2': -.05},
                         pads={finger: ([.0115, .005, .0005], [0., -.005, .0005])
                               for finger in ('gripper_link1', 'gripper_link2')},
@@ -197,27 +214,26 @@ def m20(usd_path=None, fix_root_link=False):
 
 
 def anymal_c():
-    """ANYmal-C from the MJCF recorded beside its local Isaac 5.1 USD mirror, driven like ANYMAL_C_CFG
-    by the same ANYdrive LSTM network (assets/anymal_c/ActuatorNets, see manifest.json)."""
-    from pathlib import Path
+    """ANYmal-C from the MJCF recorded for its vendored Isaac 5.1 USD, driven like ANYMAL_C_CFG
+    by the same vendored ANYdrive LSTM network (assets/anymal_c/source)."""
     from mjlab.entity import EntityArticulationInfoCfg
-    from shared.asset_formats import mjcf_for
+    from shared.asset_formats import mjcf_for, nucleus_copy
     from .actuators import LstmActuatorCfg
-    root = Path(__file__).resolve().parents[3] / 'assets/anymal_c'
-    cfg = _mjcf_entity(mjcf_for(root / 'anymal_c.usd'), False, joint_pos={
+    network = nucleus_copy('anymal_c', 'Isaac/IsaacLab/ActuatorNets/ANYbotics/anydrive_3_lstm_jit.pt')
+    usd = nucleus_copy('anymal_c', 'Isaac/IsaacLab/Robots/ANYbotics/ANYmal-C/anymal_c.usd')
+    cfg = _mjcf_entity(mjcf_for(usd), False, joint_pos={
         '.*HAA': 0., '.*F_HFE': .4, '.*H_HFE': -.4, '.*F_KFE': -.8, '.*H_KFE': .8})
     cfg.articulation = EntityArticulationInfoCfg(actuators=(LstmActuatorCfg(
-        target_names_expr=('.*HAA', '.*HFE', '.*KFE'), network_file=str(root / 'ActuatorNets/anydrive_3_lstm_jit.pt'),
+        target_names_expr=('.*HAA', '.*HFE', '.*KFE'), network_file=str(network),
         saturation_effort=120., effort_limit=80., velocity_limit=7.5),))
     cfg.init_state.pos = (0., 0., .6)
     return cfg
 
 
 def franka_panda(fix_root_link=True):
-    """Franka Panda from the local mirror of the Isaac 5.1 USD; gains and pose match FRANKA_PANDA_CFG."""
-    from pathlib import Path
-    from shared.asset_formats import mjcf_for
-    usd = Path(__file__).resolve().parents[3] / 'assets/franka_panda/panda_instanceable.usd'
+    """Franka Panda from the vendored Isaac 5.1 USD; gains and pose match FRANKA_PANDA_CFG."""
+    from shared.asset_formats import mjcf_for, nucleus_copy
+    usd = nucleus_copy('franka_panda', 'Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd')
     shoulder, forearm, hand = (80., 4., 87.), (80., 4., 12.), (2e3, 1e2, 200.)
     return _mjcf_entity(mjcf_for(usd), fix_root_link,
                         {**{f'panda_joint{index}': shoulder for index in range(1, 5)},
@@ -229,10 +245,9 @@ def franka_panda(fix_root_link=True):
 
 
 def seattle_table():
-    """Static Seattle lab table from the local mirror of the Isaac 5.1 USD (collider: its top box)."""
-    from pathlib import Path
-    from shared.asset_formats import mjcf_for
-    return _mjcf_entity(mjcf_for(Path(__file__).resolve().parents[3] / 'assets/seattle_table/table_instanceable.usd'),
+    """Static Seattle lab table from the vendored Isaac 5.1 USD (collider: its top box)."""
+    from shared.asset_formats import mjcf_for, nucleus_copy
+    return _mjcf_entity(mjcf_for(nucleus_copy('seattle_table', 'Isaac/Props/Mounts/SeattleLabTable/table_instanceable.usd')),
                         True)
 
 
@@ -361,6 +376,26 @@ def frame_transformer(target_body, target_position=(0.0, 0.0, 0.0),
     return FrameSensorCfg(name='', target_body=target_body, target_name=target_name)
 
 
+def contact_sensor(update_period=0.0, history_length=0, track_air_time=False):
+    """Native mjlab net contact force on each body of the mount entity matched by the mount body pattern.
+
+    Forces are summed per body in world axes like Isaac's net_forces_w; the history keeps the last
+    history_length physics steps, most recent first. Only per-step updates exist, so update_period
+    must be 0 or the physics dt (checked by the scene builder)."""
+    from dataclasses import dataclass
+    from mjlab.sensor import ContactMatch, ContactSensorCfg
+    if not isinstance(history_length, int) or history_length < 0:
+        raise ValueError('contact_sensor.history_length must be a nonnegative integer')
+    if not update_period >= 0:
+        raise ValueError('contact_sensor.update_period must be nonnegative')
+    @dataclass(kw_only=True)
+    class BodyContactCfg(ContactSensorCfg):
+        update_period: float
+    return BodyContactCfg(name='', primary=ContactMatch(mode='body', pattern=''), fields=('found', 'force'),
+                          reduce='netforce', history_length=history_length, track_air_time=bool(track_air_time),
+                          update_period=float(update_period))
+
+
 FACTORIES = {factory.__name__: factory for factory in
-             (go2, anymal_c, ground_plane, box, piper, piper_x, m20, franka_panda, seattle_table, urdf_robot, usd_robot,
-              usd_object, dex_cube, clear_sky, camera, frame_transformer)}
+             (go2, anymal_c, ground_plane, box, ball, piper, piper_x, m20, franka_panda, seattle_table, urdf_robot, usd_robot,
+              usd_object, dex_cube, clear_sky, camera, frame_transformer, contact_sensor)}

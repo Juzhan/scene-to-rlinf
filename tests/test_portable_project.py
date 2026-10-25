@@ -62,11 +62,11 @@ def test_mjlab_native_terms_build_without_simulation():
 def test_native_control_rejects_wrong_actuator_mode_and_executes_shared_chain():
     pytest.importorskip('mjlab')
     from mjlab.entity import EntityArticulationInfoCfg
-    from mjlab.actuator import XmlMotorActuatorCfg
+    from mjlab.actuator import BuiltinMotorActuatorCfg
     from shared.backends.mjlab.assets import go2
     from shared.backends.mjlab.control import Endpoint
     cfg = go2()
-    cfg.articulation = EntityArticulationInfoCfg(actuators=(XmlMotorActuatorCfg(target_names_expr=('.*',)),))
+    cfg.articulation = EntityArticulationInfoCfg(actuators=(BuiltinMotorActuatorCfg(target_names_expr=('.*',), effort_limit=23.5),))
     robot = cfg.build()
     env = SimpleNamespace(scene={'robot':robot},device='cpu')
     binding = {'asset_name':'robot','joint_names':['.*_joint'],'type':'joint_effort'}
@@ -90,6 +90,26 @@ def test_native_control_rejects_wrong_actuator_mode_and_executes_shared_chain():
     action.reset(torch.tensor([0]))
     assert not action.raw_action[0].any()
     assert action.raw_action[1].all()
+
+
+def test_mjlab_effort_on_pd_motors_adds_to_default_pose_hold():
+    pytest.importorskip('mjlab')
+    from shared.backends.mjlab.control import Endpoint
+    from shared.backends.mjlab.assets import go2
+    robot = go2().build()
+    writes = {}
+    record = lambda name: lambda value, joint_ids: writes.update({name: value.clone()})
+    default = torch.arange(12.).expand(2, -1)
+    proxy = SimpleNamespace(actuators=robot.actuators, find_joints=robot.find_joints,
+        data=SimpleNamespace(default_joint_pos=default),
+        set_joint_position_target=record('position'), set_joint_velocity_target=record('velocity'),
+        set_joint_effort_target=record('effort'))
+    env = SimpleNamespace(scene={'robot': proxy}, device='cpu')
+    # Isaac DC motors under effort control hold the default pose and add the effort.
+    endpoint = Endpoint({'asset_name': 'robot', 'joint_names': ['FR_.*_joint'], 'type': 'joint_effort'}, env)
+    endpoint.apply(torch.ones(2, 3))
+    torch.testing.assert_close(writes['position'], default[:, endpoint.ids])
+    assert not writes['velocity'].any() and writes['effort'].eq(1.).all()
 
 
 def test_command_line_train_backend_also_moves_evaluation():

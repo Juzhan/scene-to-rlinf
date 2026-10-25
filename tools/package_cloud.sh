@@ -84,7 +84,7 @@ for package in "$DEST"/*.tar.zst; do
     zstd -t "$package"
     tar --use-compress-program=zstd -tf "$package" > "$package.contents.txt"
 done
-for required in projects/franka_isaac/train.yaml projects/franka_lift/train.yaml projects/go2/train.yaml projects/go2/platforms.yaml projects/frankasim_stack_v2/train.yaml projects/frankasim_stack_v2/project.py assets/franka_panda/panda_instanceable.usd third_party/RLinf/rlinf/algorithms/utils.py third_party/IsaacLab/isaaclab.sh models/dinov2-small/model.safetensors; do
+for required in projects/franka_isaac/train.yaml projects/franka_lift/train.yaml projects/go2/train.yaml projects/go2/platforms.yaml projects/frankasim_stack_v2/train.yaml projects/frankasim_stack_v2/project.py assets/franka_panda/source/Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd third_party/RLinf/rlinf/algorithms/utils.py third_party/IsaacLab/isaaclab.sh models/dinov2-small/model.safetensors; do
     grep -Fx "rlinf-workspace/$required" "$DEST/project.tar.zst.contents.txt" >/dev/null
 done
 if grep -E '^rlinf-workspace/(outputs|\.venv[^/]*)(/|$)' "$DEST/project.tar.zst.contents.txt"; then

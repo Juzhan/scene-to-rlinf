@@ -1,5 +1,6 @@
 """Read native batched mjlab EntityData using the public information names."""
 from shared.assembly.entity_information import parse_signal
+from shared.assembly.joint_order import JOINT_FIELDS
 from shared.assembly.readers import bind_common
 
 # Names/units belong to the public catalog; only native storage names live here.
@@ -9,7 +10,8 @@ FIELDS = {'orientation': 'root_link_quat_w', 'linear_velocity': 'root_com_lin_ve
           'angular_velocity': 'root_com_ang_vel_w', 'joint_position': 'joint_pos',
           'joint_velocity': 'joint_vel', 'default_joint_position': 'default_joint_pos',
           'default_joint_velocity': 'default_joint_vel'}
-SENSOR_FIELDS = {'frame_positions', 'rgb', 'distance_to_image_plane', 'distance_to_camera'}
+SENSOR_FIELDS = {'frame_positions', 'rgb', 'distance_to_image_plane', 'distance_to_camera',
+                 'contact_force', 'contact_force_samples'}
 SUPPORTED = {*FIELDS, *SENSOR_FIELDS, 'position', 'joint_effort'}
 
 
@@ -42,6 +44,17 @@ def bind_reader(env, settings, path):
                 raise ValueError(f'{source}: {key} is not a frame_transformer')
             # One measured frame, (N, frames, 3) relative to each environment origin.
             return lambda: (native.data - env.scene.env_origins)[:, None, :]
+        if field in ('contact_force', 'contact_force_samples'):
+            if not hasattr(cfg, 'primary'):
+                raise ValueError(f'{source}: {key} is not a contact sensor')
+            # MuJoCo's net force is the one the body exerts on the others; Isaac reports the force
+            # acting on the body (ground support is +z).
+            if field == 'contact_force':
+                return lambda: -native.data.force
+            if not cfg.history_length:
+                return lambda: -native.data.force[:, None]
+            # mjlab keeps (N, bodies, samples, 3); Isaac's history is samples before bodies.
+            return lambda: -native.data.force_history.transpose(1, 2)
         if cfg is None or not hasattr(cfg, 'depth_clipping'):
             raise ValueError(f'{source}: {key} is not a camera')
         if field == 'rgb':
@@ -54,6 +67,15 @@ def bind_reader(env, settings, path):
         return lambda: depth(native.data.depth, cfg, field, cosine)
 
     def physical(source):
+        read = native(source)
+        parsed = parse_signal(source)
+        if parsed and parsed[1] in JOINT_FIELDS:
+            index = joint_index(env, parsed[0])
+            if index is not None:
+                return lambda: read()[:, index]
+        return read
+
+    def native(source):
         if source == 'simulation.gravity':
             import torch
             value = settings.get('simulation', {}).get('gravity', [0., 0., -9.81])
@@ -80,6 +102,6 @@ def bind_reader(env, settings, path):
         return lambda: getattr(data, attribute)
     def sampled(value):
         raise NotImplementedError('mjlab randomized abstract entities are not connected yet')
-    from .robot import robots
+    from .robot import joint_index, robots
     return bind_common(env, settings, path, bind_physical=physical, bind_sampled_target=sampled,
                        robots=robots(env, settings))

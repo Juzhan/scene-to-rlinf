@@ -100,7 +100,7 @@ def test_mounted_camera_hides_only_its_enclosing_housing_and_frames_compile():
     assert model.geom_contype[model.body('housing/body').geomadr[0]] == 1
     assert model.camera('eye').bodyid == model.body('housing/body').id
     assert model.sensor('tip').objid == model.site(model.sensor('tip').objid[0]).id
-    events = event_configuration(world, keys)['assembly_root_resets'].params
+    events = event_configuration(world, keys, scene.entities)['assembly_root_resets'].params
     assert list(events['rules']) == ['cube'] and list(events['areas']) == ['world/area']
 
 

@@ -52,6 +52,18 @@ def box_parameters(size, mass, color, friction):
         raise ValueError('box.friction must be nonnegative and finite')
 
 
+def ball_parameters(radius, mass, color, friction):
+    """A free sphere: radius and mass in SI units, colour in [0,1]."""
+    if not isfinite(radius) or radius <= 0:
+        raise ValueError('ball.radius must be positive and finite')
+    if not isfinite(mass) or mass <= 0:
+        raise ValueError('ball.mass must be positive and finite')
+    if len(color) != 3 or any(not isfinite(v) or not 0 <= v <= 1 for v in color):
+        raise ValueError('ball.color requires three values in [0,1]')
+    if not isfinite(friction) or friction < 0:
+        raise ValueError('ball.friction must be nonnegative and finite')
+
+
 def checked(check):
     """Attach an SDK-free value check that check/editor saves run without building the asset.
 
@@ -62,6 +74,19 @@ def checked(check):
         factory.check_parameters = check
         return factory
     return attach
+
+
+def checked_gains(gains):
+    """Validate a factory's {joint name: [stiffness, damping]} override; returns float pairs."""
+    if not isinstance(gains, dict):
+        raise ValueError('gains maps joint names to [stiffness, damping]')
+    result = {}
+    for joint, values in gains.items():
+        if (not isinstance(joint, str) or not isinstance(values, (list, tuple)) or len(values) != 2
+                or not all(isinstance(value, (int, float)) and value >= 0 for value in values)):
+            raise ValueError(f'gains.{joint}: expected [stiffness, damping] with nonnegative numbers')
+        result[joint] = (float(values[0]), float(values[1]))
+    return result
 
 
 def check_parameters(factory, parameters):

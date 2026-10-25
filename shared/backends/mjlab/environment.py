@@ -63,12 +63,13 @@ def build_config(prepared, *, num_envs, seed, horizon):
     cfg = ManagerBasedRlEnvCfg(scene=scene, seed=seed, decimation=decimation,
         episode_length_s=math.nextafter(horizon * dt * decimation, 0.),
         sim=SimulationCfg(njmax=NJMAX, mujoco=MujocoCfg(timestep=dt,
-            gravity=tuple(settings.get('simulation', {}).get('gravity', [0.,0.,-9.81])))),
+            gravity=tuple(settings.get('simulation', {}).get('gravity', [0.,0.,-9.81])),
+            **settings.get('simulation', {}).get('mujoco', {}))),
         actions={'control_chain': prepared.terms['actions']['control_chain']()},
         observations={source: ObservationGroupCfg(terms={'value':prepared.terms['observations'][source]()})
                       for source in settings['observations']['policy']})
-    # Authored root resets run after mjlab's default reset to the initial state.
-    cfg.events.update(event_configuration(prepared.description, keys))
+    # Authored root resets and attachments run after mjlab's default reset to the initial state.
+    cfg.events.update(event_configuration(prepared.description, keys, scene.entities))
     output = {'rewards':cfg.rewards, 'terminations':cfg.terminations, 'events':cfg.events}
     attach_task(output, prepared.terms['object_api'], settings)
     cfg.terminations['workspace_time_limit'] = TerminationTermCfg(func=mdp.time_out, time_out=True)

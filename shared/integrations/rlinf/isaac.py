@@ -2,6 +2,8 @@
 
 from functools import partial
 from copy import deepcopy
+import queue
+import traceback
 
 import torch
 from rlinf.envs.sim.isaaclab.isaaclab_env import IsaaclabBaseEnv
@@ -10,6 +12,81 @@ from .tensors import _make_environment, _prepare_actions, _validate_config, _wra
 from .observations import pack, copy_rows, same_schema
 
 _ENVIRONMENT_FACTORIES = {}
+
+
+class EnvironmentFailure(RuntimeError):
+    """Exception raised inside the Isaac subprocess, sent back as a result."""
+
+
+class _ReportingEnvironment:
+    """Child side: RLinf's worker loop does not catch step/reset errors, so the
+    parent would wait forever for a result. Send the traceback instead."""
+
+    def __init__(self, environment):
+        self._environment = environment
+
+    def __getattr__(self, name):
+        return getattr(self._environment, name)
+
+    def _call(self, method, *args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except Exception:
+            return EnvironmentFailure(traceback.format_exc()), None
+
+    def reset(self, *args, **kwargs):
+        return self._call(self._environment.reset, *args, **kwargs)
+
+    def step(self, *args, **kwargs):
+        return self._call(self._environment.step, *args, **kwargs)
+
+
+def _make_reporting_environment(*args, **kwargs):
+    environment, owner = _make_environment(*args, **kwargs)
+    return _ReportingEnvironment(environment), owner
+
+
+class _LiveQueue:
+    """Parent side: stop waiting when the subprocess died without a result."""
+
+    def __init__(self, results, process):
+        self._results, self._process = results, process
+
+    def get(self):
+        while True:
+            try:
+                return self._results.get(timeout=5)
+            except queue.Empty:
+                if not self._process.is_alive():
+                    raise RuntimeError(
+                        f"Isaac environment process exited with code {self._process.exitcode}; "
+                        "see its log above") from None
+
+    def __getattr__(self, name):
+        return getattr(self._results, name)
+
+
+class _CheckedTransport:
+    def __init__(self, transport):
+        self._transport = transport
+        process = getattr(transport, "isaac_lab_process", None)
+        if process is not None:
+            transport.obs_queue = _LiveQueue(transport.obs_queue, process)
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
+
+    @staticmethod
+    def _checked(result):
+        if isinstance(result, tuple) and result and isinstance(result[0], EnvironmentFailure):
+            raise EnvironmentFailure("Isaac environment failed in its subprocess:\n" + str(result[0]))
+        return result
+
+    def reset(self, *args, **kwargs):
+        return self._checked(self._transport.reset(*args, **kwargs))
+
+    def step(self, *args, **kwargs):
+        return self._checked(self._transport.step(*args, **kwargs))
 
 
 class IsaacAssemblyRLinfEnv(IsaaclabBaseEnv):
@@ -26,8 +103,14 @@ class IsaacAssemblyRLinfEnv(IsaaclabBaseEnv):
         super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
 
     def _make_env_function(self):
-        return partial(_make_environment, self.cfg.init_params, self.num_envs,
+        return partial(_make_reporting_environment, self.cfg.init_params, self.num_envs,
                        self.seed, self.cfg.max_episode_steps, factory=self.factory)
+
+    def _init_isaaclab_env(self):
+        from rlinf.envs.sim.isaaclab import isaaclab_env
+
+        self.env = _CheckedTransport(isaaclab_env.SubProcIsaacLabEnv(self._make_env_function()))
+        self.env.reset(seed=self.seed)
 
     def _wrap_obs(self, observations):
         return pack(_wrap_observations(observations, self.num_envs), self.num_envs,

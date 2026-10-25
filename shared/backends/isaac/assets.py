@@ -3,7 +3,9 @@
 from pathlib import Path
 from typing import Literal
 
-from shared.assembly.assets import CameraData, box_parameters, camera_parameters, checked, workspace_file
+from shared.assembly.assets import (CameraData, ball_parameters, box_parameters, camera_parameters,
+                                   checked, checked_gains, workspace_file)
+from shared.asset_formats import nucleus_copy
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -23,9 +25,28 @@ def piper(usd_path=None, fix_root_link=True):
     return _local_robot(PIPER_CFG, usd_path, fix_root_link)
 
 
-def piper_x(usd_path=None, fix_root_link=True):
+def _override_gains(config, gains):
+    """gains maps exact joint names to [stiffness, damping], replacing the native values of those joints."""
+    import re
+
+    joints = list(config.init_state.joint_pos)
+    unknown = set(gains) - set(joints)
+    if unknown:
+        raise ValueError(f"gains: unknown joints {sorted(unknown)}; expected names among {joints}")
+    for actuator in config.actuators.values():
+        names = [joint for joint in joints if any(re.fullmatch(expr, joint) for expr in actuator.joint_names_expr)]
+        if set(names) & set(gains):
+            actuator.stiffness = {re.escape(joint): float(gains.get(joint, (actuator.stiffness,))[0]) for joint in names}
+            actuator.damping = {re.escape(joint): float(gains.get(joint, (0., actuator.damping))[1]) for joint in names}
+    return config
+
+
+@checked(lambda gains=None, **_: checked_gains(gains or {}))
+def piper_x(usd_path=None, fix_root_link=True, gains=None):
+    """gains: optional {joint: [stiffness, damping]} replacing PIPER_X_CFG's fixed-base arm gains."""
     from .robots.piper_x import PIPER_X_CFG
-    return _local_robot(PIPER_X_CFG, usd_path, fix_root_link)
+    config = _local_robot(PIPER_X_CFG, usd_path, fix_root_link)
+    return _override_gains(config, checked_gains(gains)) if gains else config
 
 
 def m20(usd_path=None, fix_root_link=False):
@@ -34,25 +55,34 @@ def m20(usd_path=None, fix_root_link=False):
 
 
 def go2():
+    """Native UNITREE_GO2_CFG on the vendored copy of its Isaac 5.1 USD (assets/go2/source)."""
     from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
-    return UNITREE_GO2_CFG.copy()
+    config = UNITREE_GO2_CFG.copy()
+    config.spawn.usd_path = str(nucleus_copy("go2", "Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd"))
+    return config
 
 
 def anymal_c():
-    """Native ANYMAL_C_CFG on the local mirror of its Isaac 5.1 USD and ANYdrive LSTM (assets/anymal_c/manifest.json)."""
+    """Native ANYMAL_C_CFG on the vendored copies of its Isaac 5.1 USD and ANYdrive LSTM (assets/anymal_c/source)."""
     from isaaclab_assets.robots.anymal import ANYMAL_C_CFG
 
-    config = _local_robot(ANYMAL_C_CFG, ASSETS / "anymal_c/anymal_c.usd", False)
-    config.actuators["legs"].network_file = str(ASSETS / "anymal_c/ActuatorNets/anydrive_3_lstm_jit.pt")
+    config = _local_robot(ANYMAL_C_CFG, nucleus_copy("anymal_c", "Isaac/IsaacLab/Robots/ANYbotics/ANYmal-C/anymal_c.usd"),
+                          False)
+    config.actuators["legs"].network_file = str(
+        nucleus_copy("anymal_c", "Isaac/IsaacLab/ActuatorNets/ANYbotics/anydrive_3_lstm_jit.pt"))
     return config
 
 
 def franka_panda(fix_root_link=True):
-    """Native FRANKA_PANDA_CFG on the local mirror of its Isaac 5.1 USD (assets/franka_panda/manifest.json)."""
+    """Native FRANKA_PANDA_CFG on the vendored copy of its Isaac 5.1 USD (assets/franka_panda/source)."""
     from isaaclab_assets.robots.franka import FRANKA_PANDA_CFG
 
-    return _local_robot(FRANKA_PANDA_CFG, ASSETS / "franka_panda/panda_instanceable.usd", fix_root_link)
+    return _local_robot(FRANKA_PANDA_CFG, franka_panda_usd(), fix_root_link)
+
+
+def franka_panda_usd():
+    return nucleus_copy("franka_panda", "Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd")
 
 
 def ground_plane():
@@ -71,21 +101,20 @@ def dome_light(color=(0.75, 0.75, 0.75), intensity=3000.0):
 
 
 def seattle_table():
-    """Local mirror of the Isaac 5.1 SeattleLabTable USD (assets/seattle_table/manifest.json)."""
+    """Vendored copy of the Isaac 5.1 SeattleLabTable USD (assets/seattle_table/source)."""
     import isaaclab.sim as sim
     from isaaclab.assets import AssetBaseCfg
 
-    return AssetBaseCfg(prim_path="",
-                        spawn=sim.UsdFileCfg(usd_path=str(ASSETS / "seattle_table/table_instanceable.usd")))
+    usd = nucleus_copy("seattle_table", "Isaac/Props/Mounts/SeattleLabTable/table_instanceable.usd")
+    return AssetBaseCfg(prim_path="", spawn=sim.UsdFileCfg(usd_path=str(usd)))
 
 
 def dex_cube(scale=(0.8, 0.8, 0.8)):
     import isaaclab.sim as sim
     from isaaclab.assets import RigidObjectCfg
-    from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     return RigidObjectCfg(prim_path="", spawn=sim.UsdFileCfg(
-        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+        usd_path=str(dex_cube_usd()),
         scale=tuple(scale),
         rigid_props=sim.RigidBodyPropertiesCfg(
             solver_position_iteration_count=16, solver_velocity_iteration_count=1,
@@ -95,13 +124,16 @@ def dex_cube(scale=(0.8, 0.8, 0.8)):
     ))
 
 
+def dex_cube_usd():
+    return nucleus_copy("dex_cube", "Isaac/Props/Blocks/DexCube/dex_cube_instanceable.usd")
+
+
 def white_marble():
     import isaaclab.sim as sim
-    from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 
     return sim.MdlFileCfg(
-        mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/"
-                 "TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+        mdl_path=str(nucleus_copy("white_marble", "Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/"
+                                                  "TilesMarbleSpiderWhiteBrickBondHoned.mdl")),
         project_uvw=True, texture_scale=(0.25, 0.25),
     )
 
@@ -109,14 +141,13 @@ def white_marble():
 def clear_sky(intensity=750.0):
     import isaaclab.sim as sim
     from isaaclab.assets import AssetBaseCfg
-    from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
     return AssetBaseCfg(
         prim_path="",
         spawn=sim.DomeLightCfg(
             intensity=intensity,
-            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/"
-                         "kloofendal_43d_clear_puresky_4k.hdr",
+            texture_file=str(nucleus_copy("clear_sky", "Isaac/Materials/Textures/Skies/PolyHaven/"
+                                                       "kloofendal_43d_clear_puresky_4k.hdr")),
         ),
     )
 
@@ -258,6 +289,22 @@ def box(size: tuple[float, float, float] = (1., 1., 1.), mass: float | None = No
     return RigidObjectCfg(prim_path='', spawn=spawn)
 
 
+@checked(ball_parameters)
+def ball(radius: float = .12, mass: float = .2,
+         color: tuple[float, float, float] = (.2, .8, .3), friction: float = 1.):
+    """Free sphere with a rigid root; radius and mass are explicit (SI)."""
+    ball_parameters(radius, mass, color, friction)
+    import isaaclab.sim as sim
+    from isaaclab.assets import RigidObjectCfg
+    spawn = sim.SphereCfg(radius=radius, collision_props=sim.CollisionPropertiesCfg(),
+                          visual_material=sim.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+                          physics_material=sim.RigidBodyMaterialCfg(static_friction=friction,
+                                                                   dynamic_friction=friction))
+    spawn.rigid_props = sim.RigidBodyPropertiesCfg()
+    spawn.mass_props = sim.MassPropertiesCfg(mass=mass)
+    return RigidObjectCfg(prim_path='', spawn=spawn)
+
+
 def urdf_robot(urdf_path, fix_base=True, stiffness=100.0, damping=10.0, merge_fixed_joints=True):
     """Imported URDF articulation; every joint shares one implicit PD drive, tune it per robot."""
     import hashlib
@@ -307,7 +354,7 @@ def usd_object(usd_path, mass=None, scale=1.0):
 FACTORIES = {factory.__name__: factory for factory in
              (go2, anymal_c, terrain, height_scanner, contact_sensor, clear_sky,
               franka_panda, ground_plane, dome_light, seattle_table, dex_cube, camera, frame_transformer,
-              piper, piper_x, m20, box, urdf_robot, usd_robot, usd_object)}
+              piper, piper_x, m20, box, ball, urdf_robot, usd_robot, usd_object)}
 
 # Native manager-scene defaults belong to named presets, not inferred SDK types.
 # Explicit scene scope overrides these defaults; unlisted factories are per-env.

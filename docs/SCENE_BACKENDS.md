@@ -70,19 +70,26 @@ warp-lang==1.12.1
 
 这是现有机器上的隔离增量环境，不是完整可搬运锁文件。已补齐原生 RLinf PPO 运行依赖，版本记录在 shared/backends/mjlab/requirements.txt。Warp 1.17 与当前 mjlab 的运行接口不兼容，实际 GPU 验证使用 1.12.1；PyArrow 使用 20.0.0 兼容现有 NumPy。没有升级现有 Isaac 环境。
 
-Go2 模型保留上游 LICENSE、README 和固定提交来源。MuJoCo 保留 Menagerie 的原生力矩电机；本阶段没有将其冒充为 Isaac 的关节位置控制器，也没有添加站立策略。XML 中的原有 home keyframe 在构建时替换为项目初始状态，原始资产文件不修改。
+Go2 两后端共用 `assets/go2/`：Isaac 5.1 `go2.usd`（`source/` 内 URL vendor）及由它 `asset convert` 得到的 `mjcf/go2.xml`，质量与 USD 一致（15.02 kg）。mjlab 执行器按 Isaac Lab UNITREE_GO2_CFG 写 DC 电机（kp 25、kd 0.5、力矩 23.5 N·m、速度 30 rad/s），不在 MJCF 中写增益。旧的 Menagerie 模型（`assets/go2_mujoco/`）不再被工厂使用。
 
 ## 资产双格式
 
 `run.py asset convert` 让同一资产同时具备 USD（Isaac）与 MJCF（MuJoCo/mjlab）：USD→URDF 用 Isaac Sim 自带的 `isaacsim.asset.exporter.urdf`（nvidia.srl UsdToUrdf，仅需 pxr），URDF→MJCF 用 MuJoCo 编译器，URDF/MJCF→USD 用 Isaac Lab `UrdfConverter`/`MjcfConverter`。目前没有成熟的直接 USD→MJCF 工具，所以经 URDF 中转。
 
+- 资产目录统一为 `assets/<名>/`：ASSET.json、`mjcf/`，有本地覆盖时再加入口 USD；引用的上游文件按原仓库（或 URL）相对路径原样复制到 `source/`，`source/SOURCE.json` 记录 `{repository, commit}` 或 `{url}`，以及逐文件 sha256。`run.py asset check` 先核对这些 sha256。
+  - Git 来源：`run.py asset vendor <上游 USD/URDF/MJCF> assets/<名>`。带上它加载的全部文件（MJCF 跟随 `<include>` 与 compiler 的 meshdir/texturedir/assetdir）、所用 ROS 包的 package.xml（`package://` 由此在 `source/` 内解析），以及从模型目录到仓库根各级的 LICENSE/COPYING。只接受已提交、未修改的上游文件。
+  - URL 来源：`run.py asset vendor <URL> assets/<名> --base <根 URL>`。递归下载 USD 引用的图层/资产与 MDL 引用的贴图，保存为 `source/<URL 在 base 下的路径>`，相对引用因此原样可用。绝对引用、base 之外的引用和服务器上不存在的文件（Kit 内置的 OmniPBR.mdl 等）不下载，命令列出它们。Isaac 资产用 `--base https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1`（`shared.asset_formats.NUCLEUS_URL`）。
+  - 代码用 `nucleus_copy(资产名, Nucleus 相对路径)` 取本地副本；文件缺失时报错，并给出对应的 vendor 命令，不回退到联网读取。
+  - 已迁移：Piper X、Piper、SO-101、Go2（USD 及其转换 MJCF）、ANYmal-C（含 ANYdrive LSTM 与导航用 Blind 策略）、Franka Panda、Seattle 桌、DexCube、白色大理石材质、天空 HDR、UR5e、Robotiq 2F-85、FrankaSim Panda（RLinf/serl）。这些资产及引用它们的项目不再读 `third_party/`、其他工作区的模型文件或在线 Nucleus。
+  - 尚未迁移：直接使用 Isaac Lab 原生预设的旧项目（Go2/M20 粗糙地形环境、Piper lift、OpenArm 等）中，预设内部仍按 `ISAAC_NUCLEUS_DIR` 联网加载地面材质、天空、桌子等，只有项目显式引用的机器人与物体改为本地副本。`piper_phone_sim` 保留项目内修改过的 Piper X 副本。m20、m20_piper_pendulum、franka_reference 没有上游来源记录，无法 vendor。
 - 对齐比较直接读 USD（pxr，静止位姿）与编译后的 MJCF，不经过转换代码，容差记录在 ASSET.json；不一致时命令返回非零并逐项列出，不静默修正。
 - UsdToUrdf 在关节 body1 位姿非单位时把连杆坐标系移到关节坐标系，却未变换质心与惯量主轴（Piper X `gripper_link2` 质心 y 反号、z 差 1.3 mm）。因此 USD 源转换后按 USD MassAPI 在 MJCF 本体坐标系中重新写入质量、质心与惯量，ASSET.json 的 `inertial_from_usd_mass_api` 列出受影响的本体。
 - UsdToUrdf 还可能把连杆坐标系整体转动（Piper X `gripper_link2` 绕自身轴转 π）。相机、TCP 等挂载写在 USD 本体坐标系中，所以对齐比较也检查本体坐标系朝向；USD 源转换时把这类本体改回 USD 朝向，几何、关节、子本体保持世界位姿不变，ASSET.json 的 `body_frames_from_usd` 列出受影响的本体。
 - mjlab 工厂 `piper_x`、`usd_robot`、`usd_object`、`urdf_robot` 经 `mjcf_for` 取 MJCF：资产目录有 ASSET.json 时用记录的转换（源文件变化即报错，并重新比较对齐），否则自动转换并缓存到 `.cache/asset_mjcf/`（键含源文件与转换代码哈希）。`usd_robot` 的增益取自 USD DriveAPI（角度单位按每弧度换算）；`usd_object` 仅写了质量时按碰撞几何求惯量，与 PhysX 一致。
 - PhysX 关节链中子连杆的位姿由父连杆经关节坐标系推出，不取 USD 中写的位姿。固定关节两端坐标系有微小不一致时（ANYmal-C 的 LH/RH_FOOT 约 1 mrad），UsdToUrdf 会以 1e-3 容差拒绝转换。`physx_stage` 只在会话层把这类子连杆放到 PhysX 实际模拟的位姿（阈值 0.01 rad / 1 mm，超出仍报错；源文件不改），转换与对齐比较都读它，ASSET.json 的 `fixed_joint_children_posed_by_parent` 列出移动的本体与偏差。
 - UsdToUrdf 会丢弃 USD 胶囊碰撞体（M20 腿部因此缺碰撞，站高偏低），转换后按 USD 补回（`capsule_colliders_from_usd`）。对齐比较还逐本体比较各类碰撞体数量。
-- 未比较：碰撞体尺寸与位姿（MuJoCo 网格取凸包，PhysX 按 USD 碰撞近似）、接触与摩擦、执行器。执行器由后端工厂分别声明，等价性另需动态验收。
+- 质量按 PhysX 实际语义比较：UsdPhysics 中 mass ≤ 0 或未写表示由碰撞体按密度积分；既无正质量又无碰撞体的刚体，PhysX 给默认 1 kg。旧检查直接比较写入的 0，漏掉了 Piper X 导出 URDF 留下的空 `world` 连杆（浮动安装时臂多 1 kg，MJCF 为 0）。现在这类本体按 1 kg 计入，只在 USD 中存在时列为不对齐；`assets/piper_x/piper_x.usda` 给 `world` 写了 0.001 kg 与极小惯量，保留该本体（连接焊接在它上面）。按碰撞体推算质量的本体（Isaac 5.1 Panda 全部连杆）列在 `masses_from_colliders`，两引擎各按自己的碰撞形状积分，不逐项比较：Panda 实测 PhysX 18.78 kg、MuJoCo 19.73 kg。
+- 未比较：碰撞体尺寸与位姿（MuJoCo 网格取凸包，PhysX 按 USD 碰撞近似）、由碰撞体推算的质量、接触与摩擦、执行器。执行器由后端工厂分别声明，等价性另需动态验收。
 - Piper X：`assets/piper_x/mjcf/` 由 `assets/piper_x/piper_x.usda`（Isaac 实际加载的 USD）生成，与直接从厂商 URDF 编译的结果在 50 组随机关节角下连杆位置差 1e-7 m、质量矩阵差 1e-7。厂商仓库自带的 `scripts/urdf_to_mjcf.py` 写死路径且把执行器增益（120/80）写进 MJCF，与 Isaac 配置不一致，未采用。
 - URDF/MJCF→USD 方向已接入命令，但尚未在本机实测（需要启动 Isaac，避开正在运行的训练）。
 
@@ -92,14 +99,26 @@ Go2 模型保留上游 LICENSE、README 和固定提交来源。MuJoCo 保留 Me
 | --- | --- | --- |
 | piper、piper_x | 项目内 USD | 内置位置执行器，增益同 PIPER_CFG / PIPER_X_CFG |
 | m20 | 项目内 USD | Isaac DelayedPDActuator → 理想 PD 外包延迟（0–1 物理步，复位后首步抽取，回合内不变） |
-| franka_panda、seattle_table | Isaac 5.1 资产的本地镜像 | 增益同 FRANKA_PANDA_CFG；桌子为静态体 |
-| anymal_c | Isaac 5.1 资产的本地镜像，含 ANYdrive LSTM 网络 | `shared/backends/mjlab/actuators.py` 的 LstmActuator，与 Isaac ActuatorNetLSTM 同一网络、同一输入与按环境复位的隐状态 |
+| franka_panda、seattle_table | Isaac 5.1 资产（`source/` 内 URL vendor） | 增益同 FRANKA_PANDA_CFG；桌子为静态体 |
+| go2 | Isaac 5.1 资产（`source/` 内 URL vendor） | DC 电机，参数同 UNITREE_GO2_CFG |
+| anymal_c | Isaac 5.1 资产（`source/` 内 URL vendor），含 ANYdrive LSTM 网络 | `shared/backends/mjlab/actuators.py` 的 LstmActuator，与 Isaac ActuatorNetLSTM 同一网络、同一输入与按环境复位的隐状态 |
 
-- 本地镜像目录的 `manifest.json` 记录每个文件的原 URL 与 sha256；Isaac 工厂也改为加载镜像，不再联网读取 nucleus。`assets/` 不在 Git 中，换机器时按 manifest 重新下载。
+- Isaac 工厂同样加载 `source/` 中的副本，不再联网读取 Nucleus。`assets/` 不在 Git 中，换机器时按 SOURCE.json 的 url 与路径重新运行 vendor（sha256 不符时命令拒绝覆盖）。
 - Isaac ActuatorNetLSTM 不记录关节速度，DC 电机限幅始终按零速计算，即力矩只裁剪到 ±effort_limit（80 N·m）；mjlab 侧按相同结果实现。
 - 原地站立 2 s（dt 5 ms，从 0.6 m 落下）：Isaac 机身高 0.538 m；mjlab 默认 pyramidal 摩擦锥下，低增益的 LSTM 执行器使足端缓慢蠕滑外撇，机身高 0.406 m。改用 `cone='elliptic', impratio=10` 时为 0.515 m，关节偏差方向与 Isaac 一致。摩擦锥是仿真设置，目前公共配置未暴露。
-- Go2 在 mjlab 使用 Menagerie 原生模型（`assets/go2_mujoco`），不是由 Isaac USD 转换而来。
+- Go2 背负 Piper X、零动作保持默认姿态 3 s（go2_piper_wholebody）：Isaac 机身高 0.247 m、腿部最大偏离默认角 0.51 rad；mjlab 0.258 m、0.44 rad。两边都因 kp 25 承载机械臂而下沉，属于同一现象，不等于动力学一致。
 - Web 编辑器资产架的网格（`.cache/assembly_visuals/`）与缩略图（`.cache/asset_thumbnails/`）已为以上资产、21 块地形地块及各项目预先生成，打开即可加载。
+
+## 关节顺序
+
+PhysX 按广度优先列出关节（Go2：4 个 hip、4 个 thigh、4 个 calf），MuJoCo 按深度优先（FL hip、thigh、calf，再 FR……）。单链机械臂两者恰好相同，多腿机器人不同。各后端原样暴露原生顺序时，同一权重换后端会静默读错关节。
+
+- `asset convert` 在 ASSET.json 写入 `joint_order`：取 USD 的 PhysX 顺序（从根连杆逐层广度优先，同层按连杆名排序；已在本机 Isaac 上对 go2、m20、anymal_c、piper、piper_x、franka 实测一致），无 USD 时取 MJCF 顺序。即规范顺序 = Isaac 现有顺序，Isaac 已有 checkpoint（含冻结 Go2 235 特征行走网络）不受影响。
+- `asset check` 要求每种格式的关节集合与 `joint_order` 完全相同，缺失或多出都报错；没有 `joint_order` 而格式中有关节时也报错，提示重新 convert。
+- 后端读数（`shared/backends/<后端>/readers.py`）把 `joint_position`、`joint_velocity`、`joint_effort`、`default_joint_position`、`default_joint_velocity` 在设备上按 `joint_order` 取列；机器人接口的 `joint_names()`、`joint_position()` 和雅可比列同样换序；`inspect` 报告（快照回放核对的 `articulations.joint_names`）也是规范顺序。每个后端经 `robot.joint_layout` 钩子提供，上层不分支。
+- 控制目标在两后端都按关节名解析，动作不需换序。policy.py、task.py 无需任何处理。
+- 引擎关节集合与记录不一致时直接报错，不做部分映射。没有 ASSET.json 记录的资产保持引擎原生顺序。
+- mjlab 下 Go2 的读数顺序因此改变；此前在 mjlab 上训练的 Go2 权重（且当时是 Menagerie 模型）语义已变，新训练写独立目录。
 
 ## 程序化地形
 
@@ -139,7 +158,7 @@ entities:
 ## 后续顺序
 
 1. 扩展接触/固定连接、抽象体随机复位，补充 Blender 的后端能力提示。
-2. 对齐具体资产关节顺序和动力学，再开展跨后端权重迁移与策略学习验收。公共配置一致不等于物理行为一致。
+2. 关节顺序已按 ASSET.json 统一（见“关节顺序”）；继续对齐动力学，再开展跨后端权重迁移与策略学习验收。公共配置一致不等于物理行为一致。
 
 仍有部分编辑器目录与历史 term 元数据使用 Isaac 的静态目录，未宣称已完全后端无关；新 runtime 和 mjlab 状态读取不依赖这些 SDK 实现。后续按实际能力抽离，不为尚未实现的功能造空适配。
 

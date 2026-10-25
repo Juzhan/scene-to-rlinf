@@ -24,6 +24,9 @@ def test_native_batch_partial_reset_and_terminal_observation():
         assert observations['robot.joint_position'].shape == (2,12)
         report = native_interface(env.native)
         assert report['backend'] == 'mjlab' and report['action_dim'] == 12
+        # Go2's MJCF is depth-first per leg; the report keeps the asset's (Isaac) order.
+        assert report['articulations']['robot']['joint_names'][:4] == [
+            'FL_hip_joint', 'FR_hip_joint', 'RL_hip_joint', 'RR_hip_joint']
         env.native.episode_length_buf[:] = torch.tensor([2,0], device=env.device)
         observations, reward, terminated, truncated, info = env.step(torch.ones(2,12,device=env.device))
         assert truncated.tolist() == [True,False]
