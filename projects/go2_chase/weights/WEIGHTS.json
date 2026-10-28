@@ -1,0 +1,13 @@
+{
+  "files": {
+    "flat.pt": {
+      "sha256": "574e53a90d8dcb29a398c9b940ca0f2fe9ee5ac90fa6a3b6721ffcc794085220",
+      "bytes": 1388559,
+      "source": "https://github.com/Zhengtianjin/go2-supermimic weights/flat.pt, commit 054a13c13285a1c94b2e69dc8ac7331f9a8c71cf",
+      "license": "MIT, see LICENSE.go2-supermimic",
+      "trained_with": "SuperMimic on the reference MuJoCo Warp Go2, flat ground; not trained in this workspace",
+      "contents": "actor only (RunningNorm + MLP 350-512-256-128-12); no critic",
+      "loaded_by": "policy.py build_executor(weights=...)"
+    }
+  }
+}

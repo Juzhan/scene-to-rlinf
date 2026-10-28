@@ -1,0 +1,1 @@
+"""Independent projects loaded through RLinf's official extension hook."""

@@ -218,12 +218,13 @@ def _flatten_spatial_signal(env, path):
     return value.reshape(value.shape[0], -1)
 
 
-def build_task_config(settings, *, term_registry=None, task_presets=None):
+def build_task_config(settings, *, term_registry=None, task_presets=None, visualize=False):
     """Return native manager configs; call only after starting Isaac Sim.
 
     Observation list order is the policy input order. Presets supply an
     observation catalog and task terms, never a hidden observation vector.
     Actions are explicit native terms concatenated in YAML insertion order.
+    ``visualize`` adds markers for ``visualization.abstract``; only the preview window/video sets it.
     """
     validate_task_settings(settings, term_registry=term_registry, task_presets=task_presets)
     from isaaclab.managers import ObservationGroupCfg
@@ -303,7 +304,7 @@ def build_task_config(settings, *, term_registry=None, task_presets=None):
             _patch(entries[name], update, f"task.{category}.{name}")
         output[category] = SimpleNamespace(**entries) if category == "commands" else entries
     from .abstract_terms import attach_abstract
-    attach_abstract(output, settings)
+    attach_abstract(output, settings, visualize=visualize)
     if 'object_api' not in registry and (settings.get("variables") or task.keys() & {"reward", "success", "failure", "metrics"}):
         from shared.assembly.legacy.task import evaluation_config
         from .task_evaluation import attach_evaluation

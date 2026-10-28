@@ -51,18 +51,6 @@ def test_defaults_cycles_are_not_mistaken_for_recipes(tmp_path):
     assert run.recipe_paths(tmp_path) == ()
 
 
-def test_test_command_delegates_to_pytest(monkeypatch):
-    pytest_main = Mock(return_value=0)
-    monkeypatch.setattr(pytest, "main", pytest_main)
-    monkeypatch.setattr(sys, "argv", ["run.py", "test", "-q", "-k", "assembly"])
-    with pytest.raises(SystemExit) as exit_info:
-        run.main()
-    assert exit_info.value.code == 0
-    pytest_main.assert_called_once_with(
-        [str(run.ROOT / "tests"), "--import-mode=importlib", "-q", "-k", "assembly"]
-    )
-
-
 def test_check_runs_project_static_hook(monkeypatch, capsys):
     import rlinf.envs
 

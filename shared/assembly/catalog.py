@@ -114,12 +114,12 @@ def entity_category(capabilities, kind="entity", factory=None):
 def asset_capabilities(factory, capabilities, parameters=None):
     """Parameter-dependent capabilities a factory declares only by its arguments.
 
-    ``box`` is a static facility without a mass and a rigid root body with one, which the
-    backends already read as ``position``/``linear_velocity``; the metadata must follow or
-    such a body cannot be selected as an observation.
+    ``box`` and ``usd_object`` are static facilities without a mass and a rigid root body with
+    one, which the backends already read as ``position``/``linear_velocity``; the metadata must
+    follow or such a body cannot be selected as an observation.
     """
     parameters = parameters or {}
-    if factory == "box" and parameters.get("mass") is not None and "rigid_body" not in capabilities:
+    if factory in ("box", "usd_object") and parameters.get("mass") is not None and "rigid_body" not in capabilities:
         return [*capabilities, "rigid_body", "root_state"]
     return capabilities
 
@@ -132,6 +132,12 @@ _PARAMETER_LABELS = {
     "box": {"size": "边长 xyz（m）", "mass": "质量（kg，空为静态）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
     "ball": {"radius": "半径（m）", "mass": "质量（kg）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
 }
+# Starting values the editor fills in for required parameters when an asset is added from the shelf.
+_PARAMETER_EXAMPLES = {
+    "height_scanner": {"pattern": {"resolution": 0.1, "size": [1.6, 1.0]}},
+}
+# Parameters naming a body of the entity the sensor is mounted on; the editor offers that entity's bodies.
+_MOUNT_BODY_PARAMETERS = {"frame_transformer": ("target_body",)}
 _OPTION_LABELS = {
     "rgb": "RGB 彩色", "distance_to_image_plane": "深度 · 到成像平面", "distance_to_camera": "深度 · 到光心",
     "normals": "表面法向", "max": "取远裁剪面距离", "zero": "置 0", "none": "保留 inf",
@@ -179,6 +185,10 @@ def _factory_parameters(factory, name=None):
             entry["option_labels"] = {option: _OPTION_LABELS.get(option, option) for option in entry["options"]}
         if parameter.default is not parameter.empty and isinstance(parameter.default, (str, int, float, bool, tuple, list, dict, type(None))):
             entry["default"] = deepcopy(parameter.default)
+        if key in _PARAMETER_EXAMPLES.get(name, {}):
+            entry["example"] = deepcopy(_PARAMETER_EXAMPLES[name][key])
+        if key in _MOUNT_BODY_PARAMETERS.get(name, ()):
+            entry["mount_body"] = True
         result[key] = entry
     return result
 
@@ -457,9 +467,11 @@ project registries and metadata are discovered for ordinary Python packages.
         if abstract_name in abstracts:
             node = abstracts[abstract_name]
             labels = {'position': ('位置', 'm · 环境坐标'), 'orientation': ('朝向', 'wxyz 四元数 · 环境坐标'),
-                      'size': ('尺寸（全长）', 'm'), 'direction': ('方向（本地 +X）', '单位向量 · 环境坐标')}
-            state = ('随机放置' if node.reset is not None else '跟随 ' + node.mount.entity
-                     if node.mount is not None else '固定')
+                      'size': ('尺寸（全长）', 'm'), 'direction': ('方向（本地 +X）', '单位向量 · 环境坐标'),
+                      'linear_velocity': ('线速度（Task set 位移 / 决策步长）', 'm/s · 环境坐标')}
+            state = '，'.join(part for part in (
+                '随机放置' if node.reset is not None else None,
+                '跟随 ' + node.mount.entity if node.mount is not None else None) if part) or '固定'
             entry.update(label=labels[field][0], units=labels[field][1],
                          description=f'抽象{ABSTRACT_LABELS[node.shape]}（{state}），环境坐标；无模型、无物理。',
                          requires=[] if node.mount is None else [entity_key(settings, node.mount.entity)],

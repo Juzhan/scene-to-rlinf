@@ -1,9 +1,11 @@
 """Browser editor: shared frame math, Blender-free previews and headless round trips."""
 import gzip
+from importlib.util import find_spec
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -12,7 +14,8 @@ from shared.assembly import frames
 from shared.assembly.mesh_preview import TRIANGLE_BUDGET, simplify_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
-EDITOR_PYTHON = ROOT / '.venv-editor/bin/python'
+# The editor shares the simulator environment; headless round trips run under this interpreter.
+EDITOR_PYTHON = Path(sys.executable)
 
 
 def test_pose_and_euler_round_trip():
@@ -64,7 +67,7 @@ def test_numpy_preview_keeps_source_parts_and_frames(tmp_path):
     assert [part['name'] for part in light['parts']] == ['big', 'tiny'] and light['frames'] == exported
 
 
-@pytest.mark.skipif(not EDITOR_PYTHON.exists(), reason='.venv-editor (viser) unavailable')
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_headless_editor_round_trip(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
@@ -87,12 +90,15 @@ pending = {{k: v for k, v in editor.collect().items() if k != 'revision' and v}}
 assert not pending, pending
 pose = SceneDocument(scene).entities['world/table']['pose']
 assert [round(float(v), 6) for v in pose['position']] == [0.6, 0.1, 0.0], pose
-editor.undo_edit()
-pose = SceneDocument(scene).entities['world/table']['pose']
+saved = open(scene).read()
+editor.undo_edit()  # Undo edits the working copy; scene.yaml keeps what was saved.
+pose = SceneDocument(editor.scene).entities['world/table']['pose']
 assert [round(float(v), 6) for v in pose['position']] != [0.6, 0.1, 0.0], 'undo kept the saved move'
-assert open(scene).read() == before, 'undo did not restore scene.yaml'
+assert editor.scene.read_text() == before, 'undo did not restore the working copy'
+assert open(scene).read() == saved and editor.unsaved()
 editor.redo_edit()
-assert [round(float(v), 6) for v in SceneDocument(scene).entities['world/table']['pose']['position']] == [0.6, 0.1, 0.0]
+assert [round(float(v), 6) for v in SceneDocument(editor.scene).entities['world/table']['pose']['position']] == [0.6, 0.1, 0.0]
+assert not editor.unsaved()
 import tools.web_editor as W
 assert W.observation_group('robot.target.linear_velocity', {{'group_label': 'robot'}}) == ('robot', 'target.linear_velocity')
 assert W.observation_group('planner.output', {{}}, {{'planner': {{}}}}) == ('planner · 组件接口', 'output')
@@ -105,15 +111,22 @@ library = W.load_library()
 assert library[0]['factory'] == 'urdf_robot' and library[0]['parameters']['urdf_path'].endswith('piper_x.urdf'), library
 assert editor.asset_choice == 'library:piper_x', editor.asset_choice
 editor._add_asset()
-assert any(item.get('factory') == 'urdf_robot' for item in SceneDocument(scene).snapshot()['entities'])
+assert any(item.get('factory') == 'urdf_robot' for item in SceneDocument(editor.scene).snapshot()['entities'])
+assert open(scene).read() == saved and editor.unsaved(), 'adding an entity wrote scene.yaml before save'
 assert {{'abstract:point', 'abstract:box'}} <= set(editor.gallery_cards)
 editor._choose_asset('abstract:box')
 assert editor.asset_size.visible and not editor.asset_parameters.visible
 editor.asset_position.value, editor.asset_size.value = (0.5, 0.0, 0.1), (0.2, 0.3, 0.4)
 name = editor.asset_name.value
 editor._add_asset()
-added = SceneDocument(scene).entities['world/' + name]
+added = SceneDocument(editor.scene).entities['world/' + name]
 assert added['kind'] == 'abstract' and added['shape'] == 'box' and added['size'] == [0.2, 0.3, 0.4], added
+editor._remove('world/' + name, editor.deletion_plan('world/' + name))
+editor._refresh_native()
+assert open(scene).read() == saved, 'delete or mesh refresh wrote scene.yaml before save'
+editor.save()
+assert open(scene).read() == editor.scene.read_text() != saved and not editor.unsaved()
+assert any(item.get('factory') == 'urdf_robot' for item in SceneDocument(scene).snapshot()['entities'])
 editor._choose_asset('abstract:point')
 assert not editor.asset_size.visible
 import json
@@ -150,7 +163,7 @@ assert thumbnail_key('box', {{}}) == 'box' != thumbnail_key('box', {{'size': [1,
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-@pytest.mark.skipif(not EDITOR_PYTHON.exists(), reason='.venv-editor (viser) unavailable')
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_headless_picking_parent_and_axes(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
@@ -219,7 +232,7 @@ editor.server.stop()
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-@pytest.mark.skipif(not EDITOR_PYTHON.exists(), reason='.venv-editor (viser) unavailable')
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_deleting_a_placement_region_keeps_dependants_static(tmp_path):
     project = tmp_path / 'navigation'
     shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
@@ -240,6 +253,48 @@ editor._delete('world/arena')
 handles['删除'].value = True
 entities = {{item['path']: item for item in SceneDocument(editor.scene).snapshot()['entities']}}
 assert 'world/arena' not in entities and not entities['world/destination'].get('reset'), entities['world/destination']
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_deleting_a_ray_target_leaves_the_scanner_to_be_retargeted(tmp_path):
+    project = tmp_path / 'navigation'
+    shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    script = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import tools.web_editor as W
+from shared.assembly.editing import SceneDocument
+editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
+gui, handles = editor.server.gui, {{}}
+def wrap(label, *args, _original=gui.add_button, **kwargs):
+    handles[label] = _original(label, *args, **kwargs)
+    return handles[label]
+gui.add_button = wrap
+texts = []
+def note(text, *args, _original=gui.add_markdown, **kwargs):
+    texts.append(text)
+    return _original(text, *args, **kwargs)
+gui.add_markdown = note
+assert editor.backend_problem is None, editor.backend_problem
+editor._delete('world/robot')  # The dialog names the targets and observations that go with it.
+modal = next(text for text in texts if text.startswith('删除 **robot**'))
+assert '删除控制目标：`legs`' in modal and '`robot.joint_position`' in modal, modal
+assert editor.deletion_plan('world/ground')['retargeted'] == ['world/height_scanner']
+editor._delete('world/ground')
+handles['删除'].value = True
+entities = {{item['path']: item for item in SceneDocument(editor.scene).snapshot()['entities']}}
+assert 'world/ground' not in entities and entities['world/height_scanner']['meshes'] == [], entities
+# Saved, but the project's isaaclab3 backend has no global ground for the rays: the page says so.
+assert 'scope: global' in editor.backend_problem and 'scope: global' in editor.status.content, editor.backend_problem
+editor.select('world/height_scanner')
+editor.pending['meshes']['world/height_scanner'] = ['world/robot']
+editor.save()
+entities = {{item['path']: item for item in SceneDocument(editor.scene).snapshot()['entities']}}
+assert entities['world/height_scanner']['meshes'] == ['world/robot'], entities['world/height_scanner']
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -314,7 +369,10 @@ editor.observation_boxes[('planner', key)].value = True
 # Group folders holding a ticked box are highlighted client-side via :checked.
 uuid = editor.observation_boxes[('planner', key)]._impl.uuid
 assert any(f'input[id="{{uuid}}"]:checked' in getattr(item, 'content', '') for item in editor.observation_items)
-assert editor.collect()['observations'] == {{'planner': saved['planner']['observations'] + [key]}}
+# A newly ticked term takes its catalog slot; the saved terms keep their relative order.
+ticked = [item for item in editor.observation_order['planner'] if item in {{key, *saved['planner']['observations']}}]
+assert [item for item in ticked if item != key] == saved['planner']['observations']
+assert editor.collect()['observations'] == {{'planner': ticked}}
 editor.period_fields['planner'].value = '0.015'  # Not a multiple of dt 0.01: rejected on save.
 editor.save()
 assert 'error' in editor.status.content
@@ -336,7 +394,74 @@ editor.server.stop()
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-@pytest.mark.skipif(not EDITOR_PYTHON.exists(), reason='.venv-editor (viser) unavailable')
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_shelf_sensors_arrive_mounted_and_ray_sensors_keep_the_ground(tmp_path):
+    project = tmp_path / 'navigation'
+    shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    script = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import tools.web_editor as W
+import shared.assembly.visuals as V
+V.SHARED_CACHE = V.Path({str(tmp_path / 'cold_cache')!r})  # Ignore meshes cached on this machine.
+from shared.assembly.editing import SceneDocument
+editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
+texts = []
+def note(text, *args, _original=editor.server.gui.add_markdown, **kwargs):
+    texts.append(text)
+    return _original(text, *args, **kwargs)
+editor.server.gui.add_markdown = note
+def entities():
+    return {{item['path']: item for item in SceneDocument(editor.scene).snapshot()['entities']}}
+editor.initial_display = lambda path: {{}}  # Link names come from the native export, not done yet.
+editor._choose_asset('contact_sensor')
+editor._add_asset()
+assert '刷新原生网格' in editor.status.content and 'world/contact_sensor' not in entities(), editor.status.content
+editor.initial_display = lambda path: {{'root_body': 'base', 'body_names': ['base', 'FL_foot', 'FR_foot']}} \
+    if path == 'world/robot' else {{}}
+for factory in ('contact_sensor', 'frame_transformer', 'height_scanner', 'camera'):
+    editor._choose_asset(factory)
+    assert editor.asset_mount.visible and editor.asset_mount.value.startswith('robot'), editor.asset_mount.options
+    assert W.FREE not in editor.asset_mount.options  # isaaclab3: every sensor follows a body
+    editor._add_asset()
+    assert editor.backend_problem is None, (factory, editor.backend_problem)
+added = entities()
+for path in ('world/contact_sensor', 'world/frame_transformer', 'world/height_scanner_2', 'world/camera'):
+    assert added[path]['mount'] == {{'entity': 'world/robot', 'body': 'base'}}, added[path]
+assert added['world/frame_transformer']['parameters']['target_body'] == 'base'
+assert added['world/height_scanner_2']['meshes'] == ['world/ground']
+editor.select(('entity', 'world/frame_transformer'))  # The reported frame is picked from the mount's links.
+assert editor.parameter_fields['target_body'].options == ('base', 'FL_foot', 'FR_foot')
+editor._delete('world/ground')
+assert '将没有射线目标' in next(text for text in texts if text.startswith('删除 **ground**'))
+editor._remove('world/ground', editor.deletion_plan('world/ground'))
+assert editor.backend_problem and entities()['world/height_scanner']['meshes'] == []
+editor._choose_asset('ground_plane')  # A new ground becomes the target of scanners aiming at all ground.
+editor._add_asset()
+after = entities()
+assert after['world/height_scanner']['meshes'] == after['world/height_scanner_2']['meshes'] == ['world/ground_plane']
+assert editor.backend_problem is None, editor.backend_problem
+editor._choose_asset('ground_plane')
+editor._add_asset()
+assert entities()['world/height_scanner']['meshes'] == ['world/ground_plane', 'world/ground_plane_2']
+assert editor.backend_problem is None, editor.backend_problem
+editor._remove('world/robot', editor.deletion_plan('world/robot'))  # isaaclab3: no sensor stays without its body
+left = entities()
+assert not {{path for path, item in left.items() if item['category'] == 'sensor'}}, sorted(left)
+assert editor.backend_problem is None, editor.backend_problem
+editor._choose_asset('box')
+editor._add_asset()
+editor.items['world/box']['exported'] = True  # Exported without a body: a static box (no mass) holds no sensor.
+editor.select(('entity', 'world/box'))
+editor._choose_asset('camera')
+assert 'world/box' not in editor.mount_targets.values(), editor.mount_targets
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_typed_camera_parameters(tmp_path):
     project = tmp_path / 'piper_pick'
     shutil.copytree(ROOT / 'projects/piper_pick', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
@@ -372,4 +497,39 @@ assert SceneDocument(editor.scene).entities['world/wrist_camera']['parameters'] 
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_new_environment_names_its_backend_and_keeps_observation_order(tmp_path):
+    script = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import yaml
+import tools.web_editor as W
+from shared.assembly import starter
+starter.PROJECTS = __import__('pathlib').Path({str(tmp_path)!r})
+editor = W.Editor({str(ROOT / 'projects/planner_executor/scene.yaml')!r}, port=0, native_preview=False)
+editor.new_name.value, editor.new_template.value = 'fresh_nav', 'planner_executor'
+editor._new_environment()
+assert editor.draft == 'fresh_nav' and editor.snapshot.get('control'), editor.status.content
+# Untick an observation, save, tick it again: it returns to its old slot.
+role = editor.train_role
+before = [key for key in editor.observation_order[role] if editor.observation_enabled.get((role, key))]
+middle = before[1]
+editor.observation_enabled[(role, middle)] = False
+editor.save()
+assert editor.draft is None and editor.target == starter.PROJECTS / 'fresh_nav/scene.yaml'
+assert editor.scene.parent == editor.target.parent and editor.scene.read_text() == editor.target.read_text()
+assert [p.name for p in editor.target.parent.glob('.scene.yaml.*.editing')] == [editor.scene.name]  # only the live copy
+assert yaml.safe_load((editor.scene.parent / 'train.yaml').read_text())['env']['train']['init_params']['backend'] == 'isaaclab3'
+assert editor.backend_problem is None, editor.backend_problem
+editor.observation_enabled[(role, middle)] = True
+editor.save()
+text = editor.target.read_text()
+assert not text.lstrip().startswith('{{')
+assert yaml.safe_load(text)['control']['components'][role]['observations'] == before
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]

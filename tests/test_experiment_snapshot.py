@@ -401,3 +401,67 @@ def test_frozen_snapshot_packages_keep_their_recorded_observation_types(monkeypa
     assert not calls
     refresh_observation_types("live/scene.yaml", "projects.piper_pick")
     assert calls == ["live/scene.yaml"]
+
+
+def write_runtime_sources(root):
+    (root / "network.py").write_text("WIDTH = 64\n")
+    (root / "policy.py").write_text(
+        f"from {root.name}.network import WIDTH\n\nSCALE = 1.0\n\n\ndef build_model(config):\n    return WIDTH * SCALE\n")
+    (root / "task.py").write_text("def evaluate(obs):\n    return {'reward': 1.0}\n")
+
+
+def test_unrelated_files_comments_and_docstrings_do_not_block_replay(project, tmp_path):
+    root, cfg, module = project
+    write_runtime_sources(root)
+    snapshot = create_snapshot(cfg, module, tmp_path / "run")
+    assert set(read_manifest(snapshot)[1]["signature"]["runtime_sources"]) == {
+        "__init__.py", "policy.py", "network.py", "task.py"}
+    (root / "test_task.py").write_text("def test_reward():\n    assert True\n")
+    (root / "notes.ipynb").write_text("{}")
+    (root / "README.md").write_text("# notes\n")
+    (root / "policy.py").write_text(
+        '"""Policy docstring."""\n'
+        f"from {root.name}.network import WIDTH  # hidden width\n\nSCALE = 1.0\n\n\n"
+        "def build_model(config):\n    \"\"\"Build.\"\"\"\n    # comment only\n    return WIDTH * SCALE\n")
+    report = compare_project(snapshot, cfg, module)
+    assert report["changed"] == [] and report["differences"] == []
+
+
+@pytest.mark.parametrize("name, edit, message", [
+    ("policy.py", lambda root: (root / "policy.py").write_text(
+        (root / "policy.py").read_text().replace("SCALE = 1.0", "SCALE = 2.0")), "semantics"),
+    ("network.py", lambda root: (root / "network.py").write_text("WIDTH = 32\n"), "Project differs"),
+    ("task.py", lambda root: (root / "task.py").write_text(
+        "def evaluate(obs):\n    return {'reward': 2.0}\n"), "Project differs"),
+    ("scene.yaml", lambda root: save_scene(root, lambda scene: scene.entities[0].pose.position.__setitem__(0, 3)),
+     "Project differs"),
+])
+def test_runtime_changes_name_the_file(project, tmp_path, name, edit, message):
+    root, cfg, module = project
+    write_runtime_sources(root)
+    snapshot = create_snapshot(cfg, module, tmp_path / "run")
+    edit(root)
+    with pytest.raises(ValueError, match=message) as error:
+        compare_project(snapshot, cfg, module)
+    assert name in str(error.value) and f"--snapshot {snapshot}" in str(error.value)
+    if message == "Project differs":
+        assert compare_project(snapshot, cfg, module, allow_scene_change=True)["uses_current_scene"]
+
+
+def test_snapshots_with_byte_source_hashes_compare_from_their_frozen_copy(project, tmp_path):
+    root, cfg, module = project
+    write_runtime_sources(root)
+    snapshot = create_snapshot(cfg, module, tmp_path / "run")
+    # Manifests before 2026-10-26 stored raw hashes of every project *.py file.
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    signature = manifest["signature"]
+    signature.pop("runtime_sources")
+    signature["source_sha256"] = {name: "0" * 64 for name in ("__init__.py", "policy.py", "network.py", "task.py")}
+    signature["interface"]["code"] = {"policy.py": "0" * 64}
+    (snapshot / "manifest.json").write_text(json.dumps(manifest))
+    (root / "test_task.py").write_text("def test_reward():\n    assert True\n")
+    (root / "policy.py").write_text("# edited comment\n" + (root / "policy.py").read_text())
+    assert compare_project(snapshot, cfg, module)["changed"] == []
+    (root / "task.py").write_text("def evaluate(obs):\n    return {'reward': 2.0}\n")
+    with pytest.raises(ValueError, match="task.py"):
+        compare_project(snapshot, cfg, module)

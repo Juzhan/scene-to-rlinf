@@ -3,14 +3,15 @@
 Same contract as the Blender add-on: every change goes through
 ``shared.assembly.editing.apply_edits`` against the loaded revision, so the
 terminal, Blender and the browser edit one scene.yaml. Native meshes are
-exported by the Isaac environment in the background; until then entities show
+exported by the project's simulator environment in the background; until then entities show
 schematic proxies (or the previous mesh). Layout parents and groups never create
 physical constraints; only "physical" attachments write connections/mounts.
 
-  python run.py edit <project>                # default editor; uses .venv-editor (see README)
-  .venv-editor/bin/python tools/web_editor.py --scene projects/x/scene.yaml
+  python run.py edit <project>                # runs in the project's backend environment
+  .venv-il3/bin/python tools/web_editor.py --scene projects/x/scene.yaml
 """
 import argparse
+import atexit
 import contextlib
 import copy
 import functools
@@ -23,9 +24,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
-import shutil
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -38,9 +37,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from shared.assembly import frames as F  # noqa: E402
-from shared.assembly.editing import SceneDocument, apply_edits  # noqa: E402
+from shared.assembly.editing import SceneDocument, apply_edits, editing_copy  # noqa: E402
 from shared.assembly.mesh_preview import triangles  # noqa: E402
-from shared.assembly.visuals import ExportWorker, cache_path, ensure_visuals, geometry_keys, load_visuals  # noqa: E402
+from shared.assembly.visuals import (ExportWorker, SceneChanged, cache_path, ensure_visuals, exporter_available,  # noqa: E402
+                                    exporter_python, geometry_backend, geometry_keys, load_visuals)
 
 CATEGORY_LABELS = {'robot': '机器人', 'object': '物体 / 设备', 'terrain': '地面 / 地形',
                    'sensor': '传感器', 'light': '照明', 'group': '组合', 'abstract': '抽象体'}
@@ -60,6 +60,7 @@ COLORS = {'mesh': (178, 189, 201), 'terrain': (89, 110, 128), 'dex_cube': (217, 
           'light': (255, 220, 120), 'sensor': (60, 60, 60)}
 NONE = '（未选择）'
 ROOT_BODY = '根部'
+FREE = '（不安装，固定在世界中）'
 ICONS = {'robot': 'robot', 'object': 'box', 'terrain': 'mountain', 'sensor': 'radar', 'light': 'bulb',
          'group': 'stack-2', 'abstract': 'map-pin'}
 TREE_INDENT = 14
@@ -207,6 +208,12 @@ GALLERY_CARD = ('[id="{id}"]{{height:auto!important;min-height:104px;padding:{pa
 
 def _resolve(owner, reference):
     return posixpath.normpath(posixpath.join(owner, reference)) if reference.startswith('.') else reference
+
+
+def _body_bound(category, factory, scene):
+    """Sensors that exist only on a body; the backend declares which may also stand alone (FREE_SENSORS)."""
+    from shared.assembly.assets import backend_module
+    return category == 'sensor' and factory not in backend_module(geometry_backend(scene), 'assets').FREE_SENSORS
 
 
 def _body_pattern_matches(pattern, name):
@@ -438,7 +445,10 @@ def terrain_tiles():
             usd, terrain = record['formats']['usd'], record['terrain']
         except (OSError, ValueError, KeyError):
             continue
-        tiles.append({'id': 'terrain_' + path.parent.name, 'label': terrain.get('label') or path.parent.name,
+        label = terrain.get('label') or path.parent.name
+        if any(tile['label'] == label for tile in tiles):  # same kind, other size: tell the cards apart
+            label += f' {terrain["size"]:g} m'
+        tiles.append({'id': 'terrain_' + path.parent.name, 'label': label,
                       'factory': 'usd_object', 'parameters': {'usd_path': usd}, 'category': 'terrain',
                       'note': f'地形地块 · {terrain["size"]:g} m 见方，以实体原点为中心；'
                               f'参考出生点（相对中心）{[round(v, 3) for v in terrain["spawn_origin"]]}'})
@@ -463,13 +473,16 @@ def action(method):
 class Editor:
     def __init__(self, scene, *, host='127.0.0.1', port=8080, native_preview=True):
         import viser
-        self.scene = Path(scene).resolve()
+        self.scene = None
+        self._edit(scene)
+        atexit.register(self.discard_copy)
         self.server = viser.ViserServer(host=host, port=port, label='RLinf 场景编辑器')
         self.lock = threading.RLock()
         self.syncing = 0
         self.dragging = False
         self.selected = None
         self.draft = None
+        self.backend_problem = None  # Why the project's backend rejects the saved scene, if it does.
         self.export_thread = None
         self.export_again = None
         # Isaac starts only when an asset lacks cached meshes, then serves follow-up imports until idle.
@@ -501,6 +514,20 @@ class Editor:
         return wrapper
 
     # ------------------------------------------------------------------ loading
+    def _edit(self, target):
+        """Edit ``target`` through a fresh working copy (``self.scene``); only save writes ``target``."""
+        target = Path(target).resolve()
+        text = target.read_text()
+        working = editing_copy(target)
+        working.write_text(text)
+        if self.scene is not None and self.scene != working:
+            self.discard_copy()  # the previous environment's copy
+        self.target, self.scene, self.saved_text = target, working, text
+
+    def discard_copy(self):
+        if self.scene is not None:
+            self.scene.unlink(missing_ok=True)
+
     def load(self, snapshot=None, state=None):
         with self.lock:
             self.snapshot = snapshot or SceneDocument(self.scene).snapshot()
@@ -512,7 +539,7 @@ class Editor:
             except (OSError, ValueError, KeyError):
                 self.manifest = {}
             self.preview_restore = None  # Previews refer to the nodes being replaced.
-            self.pending = {'actions': {}, 'resets': {}, 'shapes': {}, 'shown': None, 'components': {}}
+            self.pending = {'actions': {}, 'resets': {}, 'meshes': {}, 'shapes': {}, 'shown': None, 'components': {}}
             self.labels, self.parameters = {}, {}
             self._build_tree()
             if state:
@@ -532,8 +559,28 @@ class Editor:
                 self.select(keep)
             else:
                 self._rebuild_inspector()
-            self.report(f'已加载 {len(self.snapshot["entities"])} 个实体 · {self.scene.parent.name}/{self.scene.name}')
+            self._check_backend()
+            self.report(f'已加载 {len(self.snapshot["entities"])} 个实体 · {self.target.parent.name}/{self.target.name}')
         threading.Thread(target=self._harvest_thumbnails, daemon=True).start()
+
+    def _check_backend(self):
+        """Run the project backend's static scene check on what was just written.
+
+        Saving never waits on it: an edit can pass through a state the backend rejects
+        (a scanner whose targets are being chosen), but the page says so until it is fixed."""
+        from shared.assembly.backend_scene import prepare
+        backend = geometry_backend(self.scene)
+        try:
+            prepare(self.scene, backend)
+            problem = None
+        except ImportError:
+            problem = None  # A project asset needing the simulator SDK is checked by run.py check.
+        except Exception as error:  # noqa: BLE001 - shown in the page, never blocks saving
+            problem = f'{backend} 后端不接受当前场景：{error}'
+        if problem and problem != self.backend_problem:
+            for client in self.server.get_clients().values():
+                client.add_notification('已保存，但无法训练', problem, color='yellow', auto_close_seconds=15)
+        self.backend_problem = problem
 
     def visual(self, item):
         """Current native visual, else the last exported one (marked stale)."""
@@ -550,6 +597,10 @@ class Editor:
         item = self.items.get(path, {})
         record, _ = self.visual(item) if item else (None, False)
         return (record or {}).get('initial_state', {}) or item.get('initial_display', {})
+
+    def bodies(self, path):
+        """Link names of an entity, known once its native visual was exported."""
+        return self.initial_display(path).get('body_names', []) or list(self.info[path]['bodies'])
 
     def _needs_native(self):
         return any(item.get('factory') and item['category'] in ('robot', 'object', 'terrain')
@@ -703,6 +754,8 @@ class Editor:
             return info['node']
         if body in info['bodies']:
             return info['bodies'][body]
+        if body == self.initial_display(path).get('root_body'):
+            return info['node']  # A rigid object without link frames (a USD cube) is its own root body.
         # A contact sensor may cover a link group such as .*_foot; preview it on the first match.
         matches = [name for name in info['bodies'] if _body_pattern_matches(body, name)]
         if not matches:
@@ -722,7 +775,8 @@ class Editor:
                 node.parent = self.info[target]['node']
                 with contextlib.suppress(ValueError):
                     node.parent = self.body_node(target, body)
-            if body and not any(_body_pattern_matches(body, name) for name in bodies):
+            if body and body != self.initial_display(target).get('root_body') \
+                    and not any(_body_pattern_matches(body, name) for name in bodies):
                 self.info[item['path']]['note'] = '机身坐标预览不可用（暂用资产原点）；仿真按连杆安装'
         joints = list(snapshot.get('connections', []))
         for item in snapshot['entities']:
@@ -880,6 +934,7 @@ class Editor:
         centre = np.mean(points, axis=0)
         radius = max(1.0, float(np.max(np.linalg.norm(np.asarray(points) - centre, axis=1))) * 2.5)
         client.camera.up_direction = (0.0, 0.0, 1.0)
+        # viser shifts look_at along with position, so the target is set last.
         client.camera.position = tuple(centre + radius * np.array([1.2, -1.2, 0.9]))
         client.camera.look_at = tuple(centre)
 
@@ -999,8 +1054,14 @@ class Editor:
         for client in self.server.get_clients().values():
             direction = np.asarray(client.camera.position) - np.asarray(client.camera.look_at)
             direction = direction / max(np.linalg.norm(direction), 1e-6)
-            client.camera.look_at = tuple(centre)
+            # Keep the current heading but look down on the selection, never up from below the ground.
+            if np.linalg.norm(direction[:2]) < .1:
+                direction = np.array([1.2, -1.2, 0.9])
+            direction[2] = max(direction[2], .3)
+            direction = direction / np.linalg.norm(direction)
+            # viser shifts look_at along with position, so the target is set last.
             client.camera.position = tuple(centre + direction * distance)
+            client.camera.look_at = tuple(centre)
 
     def _place_gizmo(self):
         node = self._node_of(self.selected)
@@ -1163,6 +1224,8 @@ class Editor:
                     changes['parameters'] = parameters
             if path in self.pending['resets']:
                 changes['reset'] = self.pending['resets'][path]
+            if path in self.pending['meshes'] and self.pending['meshes'][path] != item.get('meshes', []):
+                changes['meshes'] = self.pending['meshes'][path] or None
             if path in self.pending['shapes']:
                 shape, size = self.pending['shapes'][path]
                 if shape != item['shape'] or list(size) != list(item.get('size') or []):
@@ -1194,6 +1257,10 @@ class Editor:
                 payload['observations'][profile] = selected
         return payload
 
+    def unsaved(self):
+        """Edits not yet in scene.yaml: pending fields, or structural edits held in the working copy."""
+        return self.dirty() or self.disk_text != self.saved_text
+
     def dirty(self):
         try:
             return any(value for key, value in self.collect().items() if key != 'revision')
@@ -1224,26 +1291,37 @@ class Editor:
     def save(self, *, quiet=False):
         # Saving is not an undo step: undo still returns to the edit before it.
         result = self._apply(self.collect(), record=False)
+        if self.target.read_text() != self.saved_text:
+            raise ValueError('scene.yaml 已在编辑器外被修改，未覆盖；点击“放弃修改并重新加载”读取新内容')
+        text = self.scene.read_text()
+        result = {**result, 'changed': text != self.saved_text}
+        if result['changed']:
+            temporary = self.target.with_name(f'.{self.target.name}.save')
+            temporary.write_text(text)
+            os.replace(temporary, self.target)
+            self.saved_text = text
         if self.draft:
-            destination = ROOT / 'projects' / self.draft
-            destination.mkdir()  # Never overwrite an existing project.
-            shutil.copy2(self.scene, destination / 'scene.yaml')
-            self.scene, self.draft = (destination / 'scene.yaml').resolve(), None
+            from shared.assembly.starter import publish_draft
+            self.discard_copy()  # not part of the published project
+            target, self.draft = publish_draft(self.target, self.draft).resolve(), None
+            self.scene = None
+            self._edit(target)
             self.load()
-            self.report(f'环境已保存：{destination}；训练模型和任务可继续配置')
+            self.report(f'环境已保存：{target.parent}；训练模型和任务可继续配置')
             return result
         if not quiet:
             self.report('已写入 scene.yaml；训练前请运行 run.py check' if result['changed'] else '没有配置变化')
         return result
 
     def _save_first(self):
-        """Structural edits reload the expanded scene: persist pending edits first."""
+        """Structural edits reload the expanded scene: move pending edits into the working copy first."""
         if self.dirty():
             self._apply(self.collect(), record=False)
 
     @action
     def reload(self):
         self.checkpoint()  # Discarded edits can be brought back with undo.
+        self._edit(self.target)  # scene.yaml as saved, or as changed outside the editor
         self.load()
 
     # -------------------------------------------------------------------- undo
@@ -1310,7 +1388,7 @@ class Editor:
         target.append(current)
         self.undo_tag, self.open_section = None, None
         if state['text'] != self.disk_text:
-            # Structural edits were saved when made, so undoing them restores the file too.
+            # Structural edits were applied to the working copy when made; undoing restores it too.
             temporary = self.scene.with_name(f'.{self.scene.name}.undo')
             temporary.write_text(state['text'])
             os.replace(temporary, self.scene)
@@ -1321,19 +1399,26 @@ class Editor:
 
     # ----------------------------------------------------------- native meshes
     def _export_visuals(self, scene, force=False):
-        """Lightweight native meshes of ``scene``; Isaac is started only for uncached assets (serialised)."""
+        """Lightweight native meshes of ``scene``; the backend SDK starts only for uncached assets (serialised)."""
         with self.exporter_lock:
             if not force and geometry_keys(scene).keys() <= load_visuals(scene).keys():
-                return ensure_visuals(scene)  # every mesh is saved already: no Isaac needed
+                return ensure_visuals(scene)  # every mesh is saved already: no SDK needed
+            python = exporter_python(geometry_backend(scene))
+            if self.exporter is not None and self.exporter.python != python:
+                self.exporter.close()  # another project's backend: its own interpreter
+                self.exporter = None
             if self.exporter is None:
-                python = Path(os.environ.get('RLINF_ISAAC_PYTHON', ROOT / '.venv/bin/python'))
-                self.exporter = ExportWorker(python, cache_path(self.scene).with_suffix('.exporter.log'))
+                self.exporter = ExportWorker(python, cache_path(scene).with_suffix('.exporter.log'))
             return self.exporter.request(scene, force=force)
 
     def start_export(self, force=False):
-        python = Path(os.environ.get('RLINF_ISAAC_PYTHON', ROOT / '.venv/bin/python'))
+        backend = geometry_backend(self.scene)
+        if not exporter_available(backend):
+            self.report(f'后端 {backend} 没有原生网格导出；继续显示示意代理')
+            return
+        python = exporter_python(backend)
         if not python.exists():
-            self.report(f'未找到 Isaac 环境 {python}；继续显示示意代理（设置 RLINF_ISAAC_PYTHON）')
+            self.report(f'未找到 {backend} 的环境 {python}；继续显示示意代理（可设置 RLINF_EXPORT_PYTHON）')
             return
         with self.lock:
             if self.export_thread and self.export_thread.is_alive():
@@ -1349,6 +1434,8 @@ class Editor:
                 try:
                     self._export_visuals(scene, force)
                     error = None
+                except SceneChanged:
+                    continue  # saved again mid-export: export the current file
                 except Exception as exception:
                     error = str(exception)[-1500:]
                 with self.lock:
@@ -1360,13 +1447,16 @@ class Editor:
                     self.report(f'原生网格导出失败：{error}', error=True)
                 elif scene != self.scene:
                     pass
-                elif self.dirty() or self.preview_restore:
-                    self.report(f'原生网格已就绪（{time.time() - started:.0f}s）；保存后自动显示，或点击“放弃修改并重新加载”')
-                    self.reload_after_save = True
+                elif self.preview_restore:
+                    self.report(f'原生网格已就绪（{time.time() - started:.0f}s）；保存或下一次添加、删除后显示')
                 else:
-                    self.load()
-                    self.report(f'原生网格已更新（{time.time() - started:.0f}s）')
-        self.reload_after_save = False
+                    try:  # Pending fields move into the working copy (not scene.yaml) so loading keeps them.
+                        self._save_first()
+                    except ValueError as problem:
+                        self.report(f'原生网格已就绪；修正后显示：{problem}', error=True)
+                    else:
+                        self.load()
+                        self.report(f'原生网格已更新（{time.time() - started:.0f}s）')
         self.export_thread = threading.Thread(target=run, daemon=True)
         self.export_thread.start()
         self.report('后台导出原生网格（通常 5–20 秒），期间可继续编辑')
@@ -1374,8 +1464,9 @@ class Editor:
     # ---------------------------------------------------------------------- GUI
     def report(self, text, error=False):
         if hasattr(self, 'status'):
-            text = text.replace('&', '&amp;').replace('<', '&lt;')
-            self.status.content = f'<div class="rl-status{" error" if error else ""}">{text}</div>'
+            shown = text if not self.backend_problem else f'{text}\n⚠️ {self.backend_problem}'
+            shown = shown.replace('&', '&amp;').replace('<', '&lt;').replace('\n', '<br>')
+            self.status.content = f'<div class="rl-status{" error" if error else ""}">{shown}</div>'
         if error:
             for client in self.server.get_clients().values():
                 client.add_notification('操作未完成', text, color='red', auto_close_seconds=8)
@@ -1398,10 +1489,14 @@ class Editor:
                 self.gallery_cards, self.gallery_signature, self.asset_choice = {}, None, None
                 self.asset_card = gui.add_markdown('')
                 self.asset_name = gui.add_text('实体名称', 'new_object')
+                self.asset_mount = gui.add_dropdown('安装到', [NONE], hint='传感器随该实体的连杆运动')
+                self.asset_mount_body = gui.add_dropdown('安装连杆', [ROOT_BODY])
+                self.asset_mount.on_update(lambda _: self.syncing or self.guarded(self._offer_mount_bodies)())
+                self.mount_targets, self.mount_groups = {}, {}
                 self.asset_parameters = gui.add_text('参数 (JSON)', '{}', multiline=True)
                 self.asset_placement = gui.add_dropdown('初始位置', ['资产默认初始位置', '指定位置'])
-                self.asset_position = gui.add_vector3('位置 (m)', (0.0, 0.0, 0.0), step=.02)
-                self.asset_size = gui.add_vector3('尺寸 (m)', (.5, .5, .5), min=(.001, .001, .001), step=.01,
+                self.asset_position = gui.add_vector3('位置 (m)', (0.0, 0.0, 0.0), step=.001)
+                self.asset_size = gui.add_vector3('尺寸 (m)', (.5, .5, .5), min=(.001, .001, .001), step=.001,
                                                   hint='全长；矩形取前两项')
                 gui.add_button('添加到场景', color='green', icon='plus').on_click(lambda _: self._add_asset())
                 gui.add_button('生成缺失示意图（Isaac 后台）', icon='photo').on_click(lambda _: self.start_thumbnails())
@@ -1442,8 +1537,10 @@ class Editor:
             gui.add_button('放弃修改并重新加载', icon='refresh').on_click(lambda _: self.reload())
             gui.add_button('刷新原生网格（Isaac 后台导出）', icon='cube').on_click(lambda _: self._refresh_native())
             with gui.add_folder('新建 / 打开环境'):
+                from tools.create import MAINTAINED_TEMPLATES
                 self.new_name = gui.add_text('新项目名称', 'new_environment')
-                gui.add_button('新建环境（地面、机械臂、方块）').on_click(lambda _: self._new_environment())
+                self.new_template = gui.add_dropdown('模板（同 run.py new）', MAINTAINED_TEMPLATES)
+                gui.add_button('新建环境').on_click(lambda _: self._new_environment())
                 self.open_path = gui.add_text('scene.yaml 路径', '')
                 gui.add_button('打开').on_click(lambda _: self._open_environment())
         panel.dock_left()
@@ -1599,7 +1696,7 @@ class Editor:
             time.sleep(.8)
             try:
                 with self.lock:
-                    changed, dirty = self.changed_owners(), self.dirty()
+                    changed, dirty = self.changed_owners(), self.unsaved()
                     self._label_tree(changed)
                     label, color = ('保存到 scene.yaml', 'green') if dirty else ('已保存', 'gray')
                     if self.save_button.label != label:
@@ -1653,10 +1750,10 @@ class Editor:
             else:
                 self._add(gui.add_markdown(f'### {name}\n布局组合 · 仅编辑器摆放，不产生物理约束'))
             locked = self._locked(owner)
-            position = self._add(gui.add_vector3('位置 (m)', tuple(round(v, 5) for v in _xyz(node.local)), step=.02,
+            position = self._add(gui.add_vector3('位置 (m)', tuple(round(v, 5) for v in _xyz(node.local)), step=.001,
                                                  disabled=locked))
             rotation = self._add(gui.add_vector3('旋转 XYZ (°)', tuple(round(v, 3) for v in F.matrix_euler(node.local)),
-                                                 step=1.0, disabled=locked))
+                                                 step=.1, disabled=locked))
             self.pose_fields = (position, rotation)
             position.on_update(self._pose_field_changed)
             rotation.on_update(self._pose_field_changed)
@@ -1705,6 +1802,8 @@ class Editor:
             self._initial_section(path)
         if item['category'] not in ('sensor', 'terrain', 'light') and not info['fixed']:
             self._reset_section(path)
+        if item.get('meshes') or 'height_scan' in self.asset_entry(item['factory']).get('capabilities', []):
+            self._meshes_section(path)
         self._add(gui.add_button('删除实体', color='red', icon='trash')).on_click(lambda _: self._delete(path))
 
     def _parameter_fields(self, path, schema):
@@ -1742,7 +1841,11 @@ class Editor:
                         n, [option for option in o if b[option].value]))
                 self.parameter_fields[name] = boxes
                 continue
-            if kind == 'choice' and value in field['options']:
+            mounted = _resolve(path, item['mount']['entity']) if field.get('mount_body') and item.get('mount') else None
+            if mounted in self.info and value in self.bodies(mounted):
+                handle = gui.add_dropdown(label + '（连杆）', self.bodies(mounted), initial_value=value)
+                handle.on_update(lambda _, n=name, h=handle: store(n, h.value))
+            elif kind == 'choice' and value in field['options']:
                 handle = gui.add_dropdown(label, [names.get(o, o) for o in field['options']],
                                           initial_value=names.get(value, value))
                 handle.on_update(lambda _, n=name, h=handle, f=field: store(
@@ -1751,7 +1854,7 @@ class Editor:
                 handle = gui.add_checkbox(label, value)
                 handle.on_update(lambda _, n=name, h=handle: store(n, bool(h.value)))
             elif kind in ('integer', 'number') and not field.get('nullable') and isinstance(value, (int, float)):
-                handle = gui.add_number(label, value, step=1 if kind == 'integer' else .01)
+                handle = gui.add_number(label, value, step=1 if kind == 'integer' else .001)
                 handle.on_update(lambda _, n=name, h=handle, k=kind: store(n, int(h.value) if k == 'integer' else float(h.value)))
             elif kind == 'vector' and field['length'] in (2, 3) and isinstance(value, (list, tuple)) and len(value) == field['length']:
                 handle = (gui.add_vector2 if field['length'] == 2 else gui.add_vector3)(label, tuple(map(float, value)), step=.001)
@@ -1777,8 +1880,8 @@ class Editor:
             pick = gui.add_dropdown('形状', list(ABSTRACT_SHAPES.values()), initial_value=ABSTRACT_SHAPES[shape])
             field = None
             if shape in ('rectangle', 'box'):
-                field = gui.add_vector3('尺寸 (m)', tuple(size), min=(.001,) * 3, step=.01) if len(size) == 3 else \
-                    gui.add_vector2('尺寸 (m)', tuple(size), min=(.001,) * 2, step=.01)
+                field = gui.add_vector3('尺寸 (m)', tuple(size), min=(.001,) * 3, step=.001) if len(size) == 3 else \
+                    gui.add_vector2('尺寸 (m)', tuple(size), min=(.001,) * 2, step=.001)
             gui.add_markdown('<small>矩形/长方体为全长；方向读取本地 +X 轴。观察字段：position、orientation'
                              + ('、size' if field else '、direction' if shape == 'direction' else '') + '。</small>')
         saved = self.snapshot.get('visualization', {}).get('abstract', [])
@@ -1826,10 +1929,13 @@ class Editor:
                     and item['instance_component'] is None and entry['instance_component'] is None]
         removed = {other for other in self.items if (other == path or other.startswith(path + '/'))
                    and not any(other == kept or other.startswith(kept + '/') for kept in promoted)}
-        detached, dropped, released, unplaced = [], [], [], []
+        detached, dropped, released, unplaced, retargeted = [], [], [], [], []
         for other, entry in self.items.items():
             if other in removed:
                 continue
+            meshes = self.pending['meshes'].get(other, entry.get('meshes', []))
+            if any(_resolve(other, ref) in removed for ref in meshes):
+                retargeted.append(other)  # SceneDocument drops the ray targets that go away.
             reset = self.pending['resets'][other] if other in self.pending['resets'] else entry.get('reset')
             if (reset or {}).get('region') in removed:
                 unplaced.append(other)  # Its placement region goes away; it stays at its authored pose.
@@ -1839,7 +1945,7 @@ class Editor:
             fixed = bool(joint and joint.get('parent')) and joint['parent']['entity'] in removed
             if fixed and not info['fixed']:
                 raise ValueError(f'{other} 的连杆坐标尚未就绪，无法确定保留位置；请稍候再删除')
-            if mounted and entry['category'] == 'sensor' and entry.get('factory') != 'camera':
+            if mounted and _body_bound(entry['category'], entry.get('factory'), self.scene):
                 dropped.append(other)  # Contact sensors and ray casters only exist on their body.
             elif mounted or fixed:
                 if fixed and not info['fixed']['project']:
@@ -1848,7 +1954,7 @@ class Editor:
             elif info['layout_parent'] in removed:
                 released.append(other)
         return {'removed': sorted(removed), 'promoted': promoted, 'detached': detached,
-                'dropped': dropped, 'released': released, 'unplaced': unplaced}
+                'dropped': dropped, 'released': released, 'unplaced': unplaced, 'retargeted': retargeted}
 
     @action
     def _delete(self, path):
@@ -1865,6 +1971,23 @@ class Editor:
             lines.append(f'解除依附、保持原位：{names(plan["detached"] + plan["released"])}')
         if plan['unplaced']:
             lines.append(f'不再在该区域内随机复位、固定在当前位置：{names(plan["unplaced"])}')
+        effects = SceneDocument(self.scene).removal_effects(set(plan['removed']) | set(plan['dropped']))
+        if effects['outputs']:
+            lines.append('删除控制目标：' + '、'.join(f'`{name}`' for name in effects['outputs']) +
+                         '（policy.py 的 decode_action 需同步；没有控制目标时无法训练）')
+        if effects['observations']:
+            lines.append('移除观察：' + '、'.join(f'`{term}`' for term in effects['observations']) +
+                         '（policy.py / task.py 中对应的 obs 属性需同步删除）')
+        if plan['retargeted']:
+            gone = set(plan['removed'])
+            blind = [other for other in plan['retargeted'] if all(
+                _resolve(other, ref) in gone for ref in self.pending['meshes'].get(other, self.items[other].get('meshes', [])))]
+            kept = [other for other in plan['retargeted'] if other not in blind]
+            if kept:
+                lines.append(f'不再以其为射线目标：{names(kept)}')
+            if blind:
+                lines.append(f'⚠️ {names(blind)} 将没有射线目标，后端检查不通过、无法训练；'
+                             '之后添加的地面会自动成为它的目标，也可在检查器“射线目标”中选择')
         lines.append('可用 Ctrl-Z 撤回。')
         modal = self.server.gui.add_modal('删除实体')
         with modal:
@@ -1891,6 +2014,10 @@ class Editor:
             if entry is None:
                 payload['entities'].append(entry := {'path': other, 'frame': 'local', 'changes': {}})
             entry['changes']['reset'] = None
+        for entry in payload['entities']:
+            if entry['changes'].get('meshes'):  # Staged targets lose the removed entities too.
+                entry['changes']['meshes'] = [ref for ref in entry['changes']['meshes']
+                                              if _resolve(entry['path'], ref) not in plan['removed']] or None
         payload['remove_entities'] = [path, *plan['dropped']]
         self.selected = None
         self._apply(payload)
@@ -1935,15 +2062,96 @@ class Editor:
         name = self.asset_name.value.strip()
         entity = {'name': name, 'factory': factory, 'kind': category if category in ('robot', 'sensor') else 'entity',
                   'parameters': parameters}
-        if self.asset_placement.value == '指定位置':
+        if category == 'sensor' and self.asset_mount.value != FREE:
+            entity['mount'] = self._new_mount()
+            for key, field in entry.get('parameters', {}).items():
+                if field.get('mount_body') and key not in parameters:  # e.g. the frame a transformer reports.
+                    parameters[key] = self._root_body(entity['mount']['entity'])
+        elif self.asset_placement.value == '指定位置':
             entity['pose'] = {'position': list(self.asset_position.value), 'orientation': [1, 0, 0, 0]}
-        self._apply({'revision': self.snapshot['revision'], 'add_entities': [entity]})
+        retargeted = self._aim_rays(entity, 'height_scan' in entry.get('capabilities', []))
+        self._apply({'revision': self.snapshot['revision'], 'add_entities': [entity], 'entities': retargeted})
         added = next((item for item in self.snapshot['entities'] if item['name'] == name and item['factory'] == factory), None)
         if added:
             self.select(('entity', added['path']))
             if self.visual(added)[0] is None and added['category'] in ('robot', 'object', 'terrain'):
                 self.start_export()
         self.report(f'已添加 {name}')
+
+    def _offer_mounts(self):
+        """Robots and objects a new sensor can go on; the selected one, else the first robot.
+
+        Only a camera may also stand fixed in the world (some backends still require a body).
+        A static object (a table, a box without mass) has no body once its native export says so."""
+        def static(path):
+            return self.items[path].get('exported') and not self.initial_display(path).get('root_body')
+        self.mount_targets = {label: path for label, path in self._choices(None).items()
+                              if self.items[path]['category'] in ('robot', 'object') and not static(path)}
+        selected = self.selected[1] if self.selected and self.selected[0] == 'entity' else None
+        ranked = sorted(self.mount_targets, key=lambda label: (self.mount_targets[label] != selected,
+                                                               self.items[self.mount_targets[label]]['category'] != 'robot'))
+        choice = self.gallery_entries.get(self.asset_choice) or {}
+        options = [*ranked, FREE] if not _body_bound('sensor', choice.get('factory'), self.scene) else ranked or [NONE]
+        self.syncing += 1
+        try:
+            self.asset_mount.options = options
+            self.asset_mount.value = options[0]
+        finally:
+            self.syncing -= 1
+        self._offer_mount_bodies()
+
+    def _offer_mount_bodies(self):
+        target = self.mount_targets.get(self.asset_mount.value)
+        bodies = self.bodies(target) if target else []
+        choice = self.gallery_entries.get(self.asset_choice) or {}
+        # Contact sensors may cover every link sharing a name suffix (the four feet).
+        self.mount_groups = _body_groups(bodies) if 'contact_forces' in choice.get('entry', {}).get('capabilities', []) else {}
+        self.syncing += 1
+        try:
+            self.asset_mount_body.options = [ROOT_BODY, *bodies, *self.mount_groups]
+            self.asset_mount_body.value = ROOT_BODY
+        finally:
+            self.syncing -= 1
+        self.asset_mount_body.visible = target is not None
+        # Mounted: the pose is an offset on the body, set afterwards in the inspector.
+        self.asset_placement.visible = self.asset_position.visible = target is None
+
+    def _root_body(self, target):
+        body = self.initial_display(target).get('root_body', '')
+        if not body:
+            busy = self.export_thread and self.export_thread.is_alive()
+            raise ValueError(f'`{target}` 的连杆名尚未解析' +
+                             ('：原生网格正在导出，完成后再添加' if busy else '：请先“刷新原生网格”，再添加'))
+        return body
+
+    def _new_mount(self):
+        """The add panel's 安装到 / 安装连杆 choice for a sensor that only exists on a body."""
+        target = self.mount_targets.get(self.asset_mount.value)
+        if target is None:
+            raise ValueError('该传感器只能装在机器人或物体的连杆上；请先添加机器人或物体')
+        body = self.asset_mount_body.value
+        return {'entity': target, 'body': self._root_body(target) if body == ROOT_BODY else self.mount_groups.get(body, body)}
+
+    def _aim_rays(self, entity, casts):
+        """Ray targets that keep covering the ground once ``entity`` is added.
+
+        Ray sensors hit global entities with geometry (grounds, terrains): a new one aims at all of
+        them, and a sensor already aiming at all of them also aims at a new ground."""
+        def ground(snapshot):
+            return {entry['path'] for entry in snapshot['catalog']['entities'] if entry.get('scope') == 'global'
+                    and entry.get('category') not in ('sensor', 'light', 'abstract', 'group')}
+        before = ground(self.snapshot)
+        if casts:
+            entity['meshes'] = sorted(before)
+            return []
+        trial = SceneDocument(self.scene)
+        added = trial.add_entity(**entity)
+        if added not in ground(trial.snapshot()):
+            return []
+        rays = {entry['path'] for entry in self.snapshot['catalog']['entities'] if 'height_scan' in entry.get('capabilities', [])}
+        return [{'path': item['path'], 'changes': {'meshes': [*item.get('meshes', []), added]}}
+                for item in self.snapshot['entities'] if item['path'] in rays
+                and {_resolve(item['path'], ref) for ref in item.get('meshes', [])} == before]
 
     def _gallery(self):
         """Catalog assets of this scene plus user-library presets of shared factories."""
@@ -1960,6 +2168,8 @@ class Editor:
             if entry:
                 if item.get('note'):
                     entry = {**entry, 'description': item['note']}
+                if item.get('category') in CATEGORY_LABELS:  # e.g. a terrain tile spawned by usd_object
+                    entry = {**entry, 'category_label': CATEGORY_LABELS[item['category']]}
                 entries['library:' + item['id']] = {
                     'label': item.get('label') or item['id'], 'factory': item['factory'], 'library': item,
                     'parameters': item.get('parameters', {}), 'category': item.get('category') or entry.get('category', 'object'),
@@ -2021,7 +2231,12 @@ class Editor:
             self.asset_card.content = '无可用资产'
             return
         shape = choice.get('shape')
-        self.asset_parameters.visible = self.asset_placement.visible = shape is None
+        sensor = shape is None and choice['category'] == 'sensor'
+        self.asset_parameters.visible = shape is None
+        self.asset_placement.visible, self.asset_position.visible = shape is None, True
+        self.asset_mount.visible = self.asset_mount_body.visible = sensor
+        if sensor:
+            self._offer_mounts()
         self.asset_size.visible = shape in ('rectangle', 'box')
         if shape:
             self.asset_card.content = (f'**{choice["label"]}** · 抽象体 · `{shape}`  \n'
@@ -2032,15 +2247,17 @@ class Editor:
         factory, entry = choice['factory'], choice['entry']
         required = [name for name, field in entry.get('parameters', {}).items() if field.get('required')]
         fields = ', '.join(f'`{name}`' for name in entry.get('parameters', {}))
-        source = f'资产库 · `{factory}`' if choice.get('library') else f'`{factory}`'
+        library = choice.get('library')
+        source = (f'{"地形地块" if library.get("category") == "terrain" else "资产库"} · `{factory}`' if library
+                  else f'`{factory}`')
         self.asset_card.content = (f'**{choice["label"]}** · {entry.get("category_label", "")} · {source}  \n'
                                    f'{entry.get("description", "")}  \n'
                                    + (f'能力：{", ".join(entry.get("capabilities", []))}  \n' if entry.get('capabilities') else '')
                                    + (f'**必填参数**：{", ".join(required)}  \n' if required and not choice.get('library') else '')
                                    + (f'可选参数：{fields}' if fields else ''))
         parameters = choice['parameters'] if choice['parameters'] is not None else \
-            {name: field['default'] for name, field in entry.get('parameters', {}).items()
-             if field.get('required') and 'default' in field}
+            {name: field.get('default', field.get('example')) for name, field in entry.get('parameters', {}).items()
+             if field.get('required') and ('default' in field or 'example' in field)}
         self._suggest_name(re.sub(r'\W', '_', choice['library']['id'] if choice.get('library') else factory), parameters)
 
     def _suggest_name(self, base, parameters):
@@ -2184,7 +2401,7 @@ class Editor:
 
     @action
     def _refresh_native(self):
-        self.save(quiet=True)
+        self._save_first()  # exports the working copy; scene.yaml waits for save
         self.start_export(force=True)
 
     @action
@@ -2194,29 +2411,28 @@ class Editor:
             raise ValueError('名称请使用英文字母、数字和下划线，不能以数字开头')
         if (ROOT / 'projects' / name).exists():
             raise ValueError('项目目录已经存在，请换一个名称')
-        if self.dirty():
+        if self.unsaved():
             raise ValueError('请先保存当前编辑，再新建环境')
-        directory = Path(tempfile.mkdtemp(prefix='rlinf-environment-'))
-        scene = directory / 'scene.yaml'
-        from shared.assembly.starter import write_starter_scene
-        write_starter_scene(scene)
-        self.scene, self.draft, self.selected = scene, name, None
+        from shared.assembly.starter import create_draft
+        self._edit(create_draft(name, self.new_template.value))
+        self.draft, self.selected = name, None
         self.load()
-        self.report(f'未保存环境；保存后生成 projects/{name}')
+        self.report(f'未保存环境（模板 {self.new_template.value}）；保存后生成 projects/{name}')
 
     @action
     def _open_environment(self):
-        if self.dirty():
+        if self.unsaved():
             raise ValueError('请先保存当前编辑，再打开其他环境')
         path = Path(self.open_path.value).expanduser().resolve()
         if not path.is_file():
             raise ValueError('找不到 scene.yaml')
-        old = self.scene
+        old = self.target
         try:
-            self.scene, self.draft, self.selected = path, None, None
+            self._edit(path)
+            self.draft, self.selected = None, None
             self.load()
         except Exception:
-            self.scene = old
+            self._edit(old)
             self.load()
             raise
         if self._needs_native():
@@ -2302,8 +2518,8 @@ class Editor:
             mode_pick = gui.add_dropdown('方式', list(modes), initial_value=mode_label[current or 'physical'])
             body_pick = gui.add_dropdown('父连杆', [ROOT_BODY])
             place = gui.add_dropdown('位置', list(PLACEMENT))
-            offset = gui.add_vector3('偏移 (m)', (0.0, 0.0, 0.0), step=.02)
-            rotation = gui.add_vector3('角度 XYZ (°)', (0.0, 0.0, 0.0), step=1.0)
+            offset = gui.add_vector3('偏移 (m)', (0.0, 0.0, 0.0), step=.001)
+            rotation = gui.add_vector3('角度 XYZ (°)', (0.0, 0.0, 0.0), step=.1)
             align = gui.add_dropdown('朝向对齐', list(ALIGN))
             explain = gui.add_markdown('')
             apply = gui.add_button('应用', color='green', icon='check')
@@ -2365,7 +2581,7 @@ class Editor:
 
         def update_bodies():
             target = targets.get(target_pick.value)
-            bodies = (self.initial_display(target).get('body_names', []) or list(self.info[target]['bodies'])) if target else []
+            bodies = self.bodies(target) if target else []
             # Contact sensors may cover every link sharing a name suffix (the four feet).
             groups.clear()
             if 'contact_forces' in capabilities.get(path, []):
@@ -2497,8 +2713,8 @@ class Editor:
         rows = {}
         with self._section(title):
             restore = gui.add_checkbox('恢复资产默认初始状态', False)
-            linear = gui.add_vector3('机身线速度 (m/s)', tuple(authored.get('linear_velocity', initial.get('linear_velocity', (0, 0, 0)))), step=.01)
-            angular = gui.add_vector3('机身角速度 (rad/s)', tuple(authored.get('angular_velocity', initial.get('angular_velocity', (0, 0, 0)))), step=.01)
+            linear = gui.add_vector3('机身线速度 (m/s)', tuple(authored.get('linear_velocity', initial.get('linear_velocity', (0, 0, 0)))), step=.001)
+            angular = gui.add_vector3('机身角速度 (rad/s)', tuple(authored.get('angular_velocity', initial.get('angular_velocity', (0, 0, 0)))), step=.001)
             if initial.get('joint_positions'):
                 gui.add_markdown('<small>关节位置 rad / m；速度 rad/s / m/s。拖动滑块实时预览。</small>')
                 for name, value in initial['joint_positions'].items():
@@ -2508,9 +2724,9 @@ class Editor:
                         low, high = float(bounds[0]), float(bounds[1])
                         position = gui.add_slider(f'{name}', low, high, (high - low) / 500, min(max(value, low), high))
                     else:
-                        position = gui.add_number(f'{name}', value, step=.01)
+                        position = gui.add_number(f'{name}', value, step=.001)
                     velocity = gui.add_number(f'{name} 速度', float(authored.get('joint_velocities', {}).get(
-                        name, initial.get('joint_velocities', {}).get(name, 0.0))), step=.01)
+                        name, initial.get('joint_velocities', {}).get(name, 0.0))), step=.001)
                     rows[name] = (position, velocity)
             else:
                 gui.add_markdown('关节列表需原生网格导出完成后显示')
@@ -2562,7 +2778,8 @@ class Editor:
         # decides what else it means.
         areas = [item['path'] for item in self.snapshot['entities']
                  if item['category'] == 'abstract' and item['path'] != path and not item.get('mount')
-                 and not item.get('reset') and self.abstract_geometry(item['path'])[0] in ('rectangle', 'box')]
+                 and not item.get('reset')
+                 and self.abstract_geometry(item['path'])[0] in ('rectangle', 'box')]
         current = self.pending['resets'][path] if path in self.pending['resets'] else self.items[path].get('reset')
         current = current or {}
         with self._section(title):
@@ -2576,9 +2793,9 @@ class Editor:
             else:
                 region = gui.add_dropdown('随机放置于', areas, initial_value=current.get('region')
                                           if current.get('region') in areas else areas[0])
-                yaw = gui.add_vector2('偏航范围 (rad)', tuple(current.get('yaw_range', (0.0, 0.0))), step=.05)
+                yaw = gui.add_vector2('偏航范围 (rad)', tuple(current.get('yaw_range', (0.0, 0.0))), step=.001)
                 interval = gui.add_number('回合内重采样周期 (s，0 为不重采样)', float(current.get('interval') or 0.0),
-                                          min=0.0, step=.5) if abstract else None
+                                          min=0.0, step=.01) if abstract else None
                 stage = gui.add_button('暂存（保存时写入）', color='green', icon='check')
             clear = gui.add_button('取消随机复位', icon='x') if current else None
 
@@ -2604,6 +2821,29 @@ class Editor:
             stage.on_click(execute)
         if clear is not None:
             clear.on_click(remove)
+
+    def _meshes_section(self, path):
+        gui, title = self.server.gui, '射线目标'
+        item = self.items[path]
+        current = self.pending['meshes'].get(path, item.get('meshes', []))
+        resolved = {_resolve(path, ref): ref for ref in current}
+        candidates = [entry['path'] for entry in self.snapshot['entities']
+                      if entry['category'] not in ('abstract', 'sensor', 'light') and entry['path'] != path]
+        with self._section(title):
+            gui.add_markdown('射线命中的实体（地面、地形）。Isaac Lab 3 要求恰好列出全部有形状的全局实体。'
+                             + ('' if current else '  \n**当前没有目标，保存前需选择。**'))
+            boxes = {other: gui.add_checkbox(self.items[other]['label'], other in resolved, hint=other)
+                     for other in candidates}
+            stage = gui.add_button('暂存（保存时写入）', color='green', icon='check')
+
+        @self.guarded
+        def execute(_):
+            self.checkpoint()
+            self.pending['meshes'][path] = [resolved.get(other, other) for other, box in boxes.items() if box.value]
+            self.open_section = title
+            self._rebuild_inspector()
+            self.report(f'{path} 的射线目标已暂存；保存后写入 scene.yaml')
+        stage.on_click(execute)
 
     def _rebuild_group_choices(self):
         for box in self.group_boxes.values():
@@ -2649,6 +2889,7 @@ class Editor:
 
     # ------------------------------------------------------------ observations
     def _init_observations(self):
+        from shared.assembly.control import observation_order
         snapshot = self.snapshot
         catalog = {item['id']: item for item in snapshot['catalog'].get('observations', [])}
         self.observation_meta = catalog
@@ -2656,7 +2897,7 @@ class Editor:
         control = snapshot.get('control') or {}
         for role, component in control.get('components', {}).items():
             saved = list(component.get('observations', []))
-            self.observation_order[role] = saved + [key for key in catalog if key not in saved]
+            self.observation_order[role] = observation_order(saved, catalog)
             for key in saved:
                 self.observation_enabled[(role, key)] = True
         self.train_role = control.get('train')
@@ -2819,7 +3060,7 @@ class Editor:
                     kind.on_update(lambda _, name=name, kind=kind: None if self.syncing else self._set_target_type(name, kind.value))
                     available = measured.get(binding['asset_name'], [])
                     if not available:
-                        gui.add_markdown('尚无实测关节列表（等待原生网格导出或运行 run.py inspect）')
+                        gui.add_markdown('尚无实测关节列表（等待原生网格导出）')
                     for joint in [*available, *(j for j in joints if j not in available)]:
                         index = joints.index(joint) if joint in joints else None
                         box = gui.add_checkbox(joint, index is not None,
@@ -2892,15 +3133,21 @@ class Editor:
             raise ValueError('场景中没有可控制的机器人')
         if name in self.bindings():
             raise ValueError(f'控制目标 {name} 已存在')
+        from shared.assembly.control import default_target_joints
         controlled = {joint for binding in self.bindings().values() if binding['asset_name'] == asset
                       for joint in binding['joint_names']}
-        joints = [joint for joint in self.measured_joints().get(asset, []) if joint not in controlled]
+        path = next((item['path'] for item in self.snapshot['entities'] if item.get('native_key') == asset), None)
+        kinematics = (self.info.get(path) or {}).get('kinematics') or {}
+        joints = default_target_joints(self.measured_joints().get(asset, []), controlled, kinematics.get('joints', ()))
         if not joints:
             raise ValueError(f'{asset} 没有尚未控制的关节' if controlled else
-                             f'{asset} 的关节名尚未读出（等待原生网格导出或运行 run.py inspect）')
+                             f'{asset} 的关节名尚未读出（等待原生网格导出）')
         kind = next(key for key, value in CONTROL_TYPES.items() if value == self.target_type.value)
+        rest = len(self.measured_joints().get(asset, [])) - len(controlled) - len(joints)
         self._stage_targets({name: {'type': kind, 'asset_name': asset, 'joint_names': joints}},
-                            f'控制目标 {name} 已添加（{len(joints)} 维）；同步 policy.py 的 decode_action，保存后写入 scene.yaml')
+                            f'控制目标 {name} 已添加（{len(joints)} 维）'
+                            + (f'，另有 {rest} 个类型不同的关节未选，可勾选或另建目标' if rest > 0 else '')
+                            + '；同步 policy.py 的 decode_action，保存后写入 scene.yaml')
 
     @action
     def _remove_target(self, name):
@@ -2931,6 +3178,7 @@ def main(argv=None):
             time.sleep(3600)
     except KeyboardInterrupt:
         editor.server.stop()
+        editor.discard_copy()
     return 0
 
 

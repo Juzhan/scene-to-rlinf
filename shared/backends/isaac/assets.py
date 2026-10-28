@@ -3,8 +3,8 @@
 from pathlib import Path
 from typing import Literal
 
-from shared.assembly.assets import (CameraData, ball_parameters, box_parameters, camera_parameters,
-                                   checked, checked_gains, workspace_file)
+from shared.assembly.assets import (CameraData, Go2Actuators, ball_parameters, box_parameters, camera_parameters,
+                                   checked, checked_gains, go2_parameters, workspace_file)
 from shared.asset_formats import nucleus_copy
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
@@ -54,8 +54,13 @@ def m20(usd_path=None, fix_root_link=False):
     return _local_robot(DEEPROBOTICS_M20_CFG, usd_path, fix_root_link)
 
 
-def go2():
+@checked(go2_parameters)
+def go2(actuators: Go2Actuators = "native"):
     """Native UNITREE_GO2_CFG on the vendored copy of its Isaac 5.1 USD (assets/go2/source)."""
+    go2_parameters(actuators)
+    if actuators != "native":
+        raise NotImplementedError("go2.actuators: the isaac backend has no delayed DC motor; "
+                                  "use backend isaaclab3 or mjlab for 'supermimic'")
     from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
     config = UNITREE_GO2_CFG.copy()
@@ -351,6 +356,8 @@ def usd_object(usd_path, mass=None, scale=1.0):
     return RigidObjectCfg(prim_path="", spawn=spawn)
 
 
+# Sensors that may also stand fixed in the world, without a mount.
+FREE_SENSORS = ('camera',)
 FACTORIES = {factory.__name__: factory for factory in
              (go2, anymal_c, terrain, height_scanner, contact_sensor, clear_sky,
               franka_panda, ground_plane, dome_light, seattle_table, dex_cube, camera, frame_transformer,

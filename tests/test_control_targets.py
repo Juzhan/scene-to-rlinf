@@ -122,3 +122,29 @@ def test_conflicting_scene_edit_keeps_original_bindings():
     # Explicitly editing the existing target changes its mode without duplicating it.
     doc.set_action('legs', {**before['legs'], 'type': 'joint_velocity'})
     assert list(doc.data['control']['output']) == ['legs']
+
+
+def test_new_target_defaults_to_free_joints_of_the_first_kind():
+    from shared.assembly.control import default_target_joints
+    arm = [f'joint{i}' for i in range(1, 7)]
+    fingers = ['gripper_joint1', 'gripper_joint2']
+    records = [{'name': name, 'type': 'revolute', 'limits': [-2.0, 2.0]} for name in arm]
+    records += [{'name': name, 'type': 'prismatic', 'limits': [0.0, 0.05]} for name in fingers]
+    assert default_target_joints(arm + fingers, set(), records) == arm
+    assert default_target_joints(arm + fingers, set(arm), records) == fingers
+    # Unlimited wheels are a kind of their own; without kinematic records every free joint is chosen.
+    wheels = [{'name': 'wheel', 'type': 'revolute', 'limits': None}]
+    assert default_target_joints(['hip', 'wheel'], set(), [{'name': 'hip', 'type': 'revolute', 'limits': [-1, 1]}, *wheels]) == ['hip']
+    assert default_target_joints(arm + fingers, {'joint1'}) == arm[1:] + fingers
+
+
+def test_retick_observation_returns_to_its_catalog_slot():
+    from shared.assembly.control import observation_order
+    catalog = ['a', 'b', 'c', 'd', 'e']
+    # Saved order is kept as is (it is the model input order); unselected terms follow their catalog predecessor.
+    assert observation_order(['d', 'a'], catalog) == ['d', 'e', 'a', 'b', 'c']
+    assert observation_order(['c'], catalog) == ['a', 'b', 'c', 'd', 'e']
+    assert observation_order(['a', 'c'], catalog) == ['a', 'b', 'c', 'd', 'e']
+    selected = ['a', 'c']  # b was unticked and saved; ticking it again puts it between a and c.
+    assert [key for key in observation_order(selected, catalog) if key in {*selected, 'b'}] == ['a', 'b', 'c']
+    assert observation_order(['x', 'a'], catalog)[:2] == ['x', 'a']

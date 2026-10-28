@@ -11,7 +11,8 @@ planner_executor、assembly_lift、assembly_go2、assembly_go2_navigation 已改
 ``task.py``，不接受 scene.yaml 中的 task / variables，也不再使用下面的配置语言。
 
 新项目定义 ``evaluate(obs: SceneInfo)`` 或 ``Task.evaluate(obs: SceneInfo)``，
-直接用 Python / Torch 计算并返回 reward、success、failure、metrics。
+直接用 Python / Torch 计算并返回 reward、success、failure、metrics；可选 set 在本步移动抽象体
+（``{名: [B,3] 位置或 [B,7] xyz+wxyz}``，复位之后、观察之前生效）。
 ``observation.py`` 从场景生成完整 SceneInfo 及策略所选 Obs 类型；Task 按需读取基础信息，
 与策略选择分开。历史可用 TaskMemory；环境推进、奖励积分、终止、复位仍交给原生 manager。
 具体接口与示例见 ``projects/planner_executor/README.md`` 和 ``task.py``。
@@ -183,6 +184,7 @@ Isaac 内置信息源
   ``<name>.position`` / ``<name>.orientation``（另有 ``size`` 或 ``direction``），可选作模型输入。
   没有 goal 类型：随机目标就是带 ``reset: {region: world/<区域>, yaw_range, interval}`` 的抽象体，
   含义由 task.py / 模型决定。不再有 ``regions:`` 段和 visualization.goals。不包含规划或避障。
+  回合内运动的目标由新模板 task.py 返回 ``set`` 移动，未跟随且非区域的抽象体另提供 ``<name>.linear_velocity``。
   目标与机器人的相对位置、距离、朝向误差通过顶层 variables 声明，不自动注册派生字段。
 * 基础信息提供实体 linear_velocity/angular_velocity/orientation、关节当前/默认值、simulation.gravity，
   ray_hit_positions[ray,xyz]、frame_positions[frame,xyz]、contact_force[body,xyz]、contact_force_samples[sample,body,xyz]。

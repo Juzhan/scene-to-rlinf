@@ -1,0 +1,146 @@
+schema_version: 1
+name: world
+application:
+  headless: true
+  enable_cameras: false
+  fast_shutdown: false
+simulation:
+  dt: 0.005
+  render_interval: 4
+  physics_material:
+    friction_combine_mode: multiply
+    restitution_combine_mode: multiply
+    static_friction: 1.0
+    dynamic_friction: 1.0
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+world:
+  env_spacing: 8.0
+  contact_materials:
+    robot:
+      static_friction: 0.8
+      dynamic_friction: 0.6
+      restitution: 0.0
+entities:
+- name: ground
+  scope: global
+  factory: ground_plane
+  prim_name: GroundPlane
+- name: robot
+  factory: go2
+  prim_name: Robot
+  kind: robot
+  reset:
+    pose_range:
+      x:
+      - -0.5
+      - 0.5
+      y:
+      - -0.5
+      - 0.5
+      yaw:
+      - -3.14
+      - 3.14
+- name: height_scanner
+  factory: height_scanner
+  mount:
+    entity: world/robot
+    body: base
+  pose:
+    position:
+    - 0.0
+    - 0.0
+    - 20.0
+  meshes:
+  - world/ground
+  parameters:
+    update_period: 0.02
+    ray_alignment: yaw
+    pattern:
+      resolution: 0.1
+      size:
+      - 1.6
+      - 1.0
+    debug_vis: false
+  kind: sensor
+- name: contact_forces
+  factory: contact_sensor
+  mount:
+    entity: world/robot
+    body: base
+  parameters:
+    update_period: 0.005
+    history_length: 3
+    track_air_time: true
+  kind: sensor
+- name: sky_light
+  scope: global
+  factory: clear_sky
+  prim_name: skyLight
+- name: arena
+  kind: abstract
+  shape: rectangle
+  size:
+  - 6.0
+  - 6.0
+  pose:
+    position:
+    - 0.0
+    - 0.0
+    - 0.4
+- name: destination
+  kind: abstract
+  shape: point
+  reset:
+    region: world/arena
+    yaw_range:
+    - -3.141592653589793
+    - 3.141592653589793
+    interval: 8.0
+control:
+  train: executor
+  components:
+    planner:
+      model: .policy:build_planner
+      dimension: 4
+      period: 0.2
+      observations:
+      - destination.position
+      - destination.orientation
+    executor:
+      model: .policy:build_executor
+      dimension: auto
+      period: 0.02
+      observations:
+      - robot.linear_velocity
+      - robot.angular_velocity
+      - robot.orientation
+      - simulation.gravity
+      - robot.joint_position
+      - robot.default_joint_position
+      - robot.joint_velocity
+      - robot.default_joint_velocity
+      - planner.output
+      - robot.position
+      - executor.output
+      initial: .policy:initial_action
+      decode: .policy:decode_action
+  output:
+    legs:
+      type: joint_position
+      asset_name: robot
+      joint_names:
+      - FL_hip_joint
+      - FR_hip_joint
+      - RL_hip_joint
+      - RR_hip_joint
+      - FL_thigh_joint
+      - FR_thigh_joint
+      - RL_thigh_joint
+      - RR_thigh_joint
+      - FL_calf_joint
+      - FR_calf_joint
+      - RL_calf_joint
+      - RR_calf_joint

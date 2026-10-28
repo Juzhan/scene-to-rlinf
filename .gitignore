@@ -22,6 +22,13 @@ events.out.tfevents.*
 
 # Projects are added selectively later: un-ignore with `!/projects/<name>/` or `git add -f`.
 /projects/*
+!/projects/__init__.py
+!/projects/planner_executor/
+!/projects/piper_pick/
+!/projects/go2_chase/
+!/projects/go2_piper_wholebody/
+# The web editor's unsaved working copy (.scene.yaml.<pid>.editing).
+/projects/*/.*.editing
 
 # Blender editor/add-on are not tracked for now.
 /tools/blender_addon/
@@ -36,6 +43,8 @@ events.out.tfevents.*
 /migration/**/*.tar.zst
 *.pt
 *.pth
+# Small trained policy weights ship with their project (WEIGHTS.json records their source).
+!/projects/*/weights/*.pt
 *.ckpt
 *.safetensors
 *.distcp

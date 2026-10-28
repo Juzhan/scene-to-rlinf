@@ -3,6 +3,7 @@
 import argparse
 from importlib import import_module
 import os
+import subprocess
 from pathlib import Path
 import sys
 
@@ -69,6 +70,13 @@ def _configure_checkpoint_interval(cfg):
         raise ValueError("Final-only checkpoint saving requires a finite training budget")
     cadence = max(1, cfg.runner.val_check_interval)
     cfg.runner.save_interval = ((budget + cadence - 1) // cadence) * cadence
+
+
+def declares_backend(directory, overrides=()):
+    """Whether a project names its simulator backend rather than inheriting configs/state_ppo.yaml's."""
+    from omegaconf import OmegaConf
+    return any("init_params.backend=" in item for item in overrides) or any(
+        OmegaConf.select(OmegaConf.load(path), "env.train.init_params.backend") for path in recipe_paths(directory))
 
 
 def compose_project(name, config="train", overrides=(), *, register=True):
@@ -179,9 +187,6 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "assess":
         from tools.go2_evaluation import main as assess
         return assess(sys.argv[2:])
-    if len(sys.argv) > 1 and sys.argv[1] == "inspect":
-        from tools.inspect_scene import main as inspect_scene
-        return inspect_scene(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("edit", "catalog"):
         editor = argparse.ArgumentParser(description="Edit a project in the browser (--blender: Blender) or list its available components")
         editor.add_argument("project", nargs='?')
@@ -193,15 +198,30 @@ def main():
         options, remaining = editor.parse_known_args(sys.argv[2:])
         scene = options.scene or (ROOT / "projects" / options.project / "scene.yaml" if options.project else None)
         if sys.argv[1] == "edit":
-            from tools.blender_editor import main as open_editor
             if options.blender and options.web:
                 editor.error("Choose either --blender or the browser editor")
-            if not options.blender and scene is None:
-                editor.error("The browser editor needs a project or --scene; use --blender for an empty environment")
-            command = "open" if options.blender else "web"
             remaining += [value for name in ("host", "port") if getattr(options, name)
                           for value in (f"--{name}", getattr(options, name))]
-            raise SystemExit(open_editor([command, *(["--scene", str(scene)] if scene else []), *remaining]))
+            if options.blender:
+                from tools.blender_editor import main as open_editor
+                raise SystemExit(open_editor(["open", *(["--scene", str(scene)] if scene else []), *remaining]))
+            if scene is None:
+                editor.error("The browser editor needs a project or --scene; use --blender for an empty environment")
+            if not scene.is_file():
+                editor.error(f"No scene file: {scene}")
+            # The editor runs in the project's simulator environment, the one that also exports its meshes.
+            python = os.environ.get("RLINF_EDITOR_PYTHON")
+            if not python:
+                from shared.assembly.visuals import exporter_python, geometry_backend
+                python = exporter_python(geometry_backend(scene))
+            python = Path(python)
+            probe = "import importlib.util, sys; sys.exit(importlib.util.find_spec('viser') is None)"
+            if not python.exists() or subprocess.call([str(python), "-c", probe]) != 0:
+                editor.error(f"{python} has no viser (the web editor)\n"
+                             f"  uv pip install --python {python} viser==1.1.1\n"
+                             "or set RLINF_EDITOR_PYTHON to an interpreter with viser")
+            raise SystemExit(subprocess.call([str(python), str(ROOT / "tools/web_editor.py"),
+                                              "--scene", str(scene.resolve()), *remaining], cwd=ROOT))
         if scene is None:
             editor.error('catalog requires a project or --scene')
         if remaining:
@@ -216,7 +236,7 @@ def main():
         from tools.preview import parse_options
         return parse_options(["--help"], sys.argv[1])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("list", "check", "smoke", "probe", "view", "record", "train", "evaluate", "test", "new", "edit", "catalog", "inspect"))
+    parser.add_argument("operation", choices=("list", "check", "smoke", "probe", "view", "record", "train", "evaluate", "new", "edit", "catalog"))
     parser.add_argument("project", nargs="?")
     parser.add_argument("--config", default="train")
     parser.add_argument("--snapshot", type=Path, help="Use the frozen project and recipe from a saved run")
@@ -236,12 +256,6 @@ def main():
     if args.operation == "new":
         from tools.create import main as create
         return create(([args.project] if args.project else []) + overrides)
-    if args.operation == "test":
-        import pytest
-        directory = ROOT / "projects" / args.project if args.project else ROOT / "tests"
-        if args.project and (not args.project.isidentifier() or not directory.is_dir()):
-            parser.error("Unknown project test directory")
-        raise SystemExit(pytest.main([str(directory), "--import-mode=importlib", *overrides]))
     if not args.project:
         parser.error("A project is required")
     preview_options = None
@@ -332,6 +346,10 @@ def main():
         if check is not None:
             print(json.dumps(check(cfg), indent=2, ensure_ascii=False))
         print("PASS static project configuration and registration; no simulator or model instantiated")
+        if not declares_backend(ROOT / "projects" / args.project, overrides):
+            print(f"WARN the project recipes do not set env.train.init_params.backend; running on the shared default "
+                  f"{OmegaConf.select(environment, 'init_params.backend')!r} (configs/state_ppo.yaml); "
+                  "new projects name isaaclab3")
         return
     preflight = getattr(module, "preflight", None)
     from shared.integrations.rlinf.upstream import validate_runtime

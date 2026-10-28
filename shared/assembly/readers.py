@@ -16,7 +16,7 @@ def bind_common(env, settings, path, *, bind_physical, bind_sampled_target, robo
         return lambda: kinematics.frame_pose(name)[index]
     if path in targets:
         value = targets[path][0]
-        if isinstance(value, dict) and value['sampled']:
+        if isinstance(value, dict) and value['commanded']:
             return bind_sampled_target(value)
         if isinstance(value, dict):
             # A mounted abstract entity follows its entity's root; this is a

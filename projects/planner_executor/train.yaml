@@ -1,0 +1,38 @@
+defaults:
+  - model/mlp_policy@actor.model
+  - state_ppo
+  - _self_
+runner:
+  max_epochs: 1500
+  # Keep a recent recovery point without accumulating the whole history.
+  save_interval: 50
+  keep_last_checkpoints: 1
+  logger:
+    experiment_name: planner_executor
+algorithm:
+  update_epoch: 5
+env:
+  train:
+    total_num_envs: 64
+    max_steps_per_rollout_epoch: 16
+    max_episode_steps: 400
+    init_params:
+      id: Workspace-Planner-Executor-v0
+      # isaaclab3 | isaac | mjlab; physics (isaaclab3 only): newton | ovphysx.
+      # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
+      backend: isaaclab3
+      physics: newton
+  # evaluate: same environment, each round runs one whole episode.
+  eval:
+    max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+actor:
+  global_batch_size: 1024
+  micro_batch_size: 256
+  optim:
+    lr: 0.001
+    value_lr: 0.001
+  model:
+    model_type: planner_executor_policy
+    obs_dim: null
+    action_dim: auto
+    hidden_dims: [128, 128]

@@ -1,0 +1,250 @@
+schema_version: 1
+name: world
+application:
+  headless: true
+  enable_cameras: false
+  fast_shutdown: false
+simulation:
+  dt: 0.005
+  render_interval: 4
+  physics_material:
+    friction_combine_mode: multiply
+    restitution_combine_mode: multiply
+    static_friction: 1.0
+    dynamic_friction: 1.0
+  gravity:
+    - 0.0
+    - 0.0
+    - -9.81
+  mujoco:
+    cone: elliptic
+    impratio: 10.0
+world:
+  env_spacing: 40.0
+  contact_materials:
+    robot:
+      static_friction: 0.8
+      dynamic_friction: 0.6
+      restitution: 0.0
+entities:
+  - name: robot
+    factory: go2
+    prim_name: Robot
+    kind: robot
+    reset:
+      pose_range:
+        x:
+          - -0.5
+          - 0.5
+        'y':
+          - -0.5
+          - 0.5
+        yaw:
+          - -3.14
+          - 3.14
+  - name: sky_light
+    scope: global
+    factory: clear_sky
+    prim_name: skyLight
+  - name: piperx
+    factory: piper_x
+    kind: robot
+    parameters:
+      fix_root_link: false
+      # LeggedManip_Lab GO2_PIPER_CFG arm gains; the fixed-base 400/40 default oscillates on the moving dog.
+      gains:
+        joint1: [50.0, 3.0]
+        joint2: [50.0, 2.0]
+        joint3: [80.0, 3.0]
+        joint4: [30.0, 3.0]
+        joint5: [30.0, 2.5]
+        joint6: [20.0, 1.0]
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.5
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+  - name: base_contact
+    factory: contact_sensor
+    kind: sensor
+    parameters:
+      update_period: 0.005
+      history_length: 3
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.0
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    mount:
+      entity: world/robot
+      body: base
+  - name: feet_contact
+    factory: contact_sensor
+    kind: sensor
+    parameters:
+      update_period: 0.005
+      history_length: 3
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.0
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    mount:
+      entity: world/robot
+      body: .*_foot
+  - name: ee_workspace
+    kind: abstract
+    shape: box
+    size:
+      - 0.25
+      - 0.7
+      - 0.5
+    pose:
+      position:
+        - 0.57
+        - 0.0
+        - 0.25
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    mount:
+      entity: world/piperx
+  - name: dex_cube
+    factory: dex_cube
+    kind: entity
+    pose:
+      position:
+        - 0.7803924164791486
+        - 2.465190328815661e-32
+        - 0.433341291659187
+      orientation:
+        - 1.0
+        - -2.7369110631344083e-48
+        - 3.0385816786431355e-64
+        - 0.0
+  - name: camera
+    factory: camera
+    kind: sensor
+    camera_only: true
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.0
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    mount:
+      entity: world/piperx
+      body: gripper_base
+  - name: terrain_rough_40m
+    factory: usd_object
+    kind: entity
+    parameters:
+      usd_path: assets/terrains/rough_40m/usd/rough.usda
+control:
+  train: executor
+  components:
+    planner:
+      model: .policy:build_planner
+      dimension: 6
+      period: 10.0
+      observations:
+        - piperx.position
+        - ee_workspace.position
+        - ee_workspace.size
+        - ee_workspace.orientation
+    executor:
+      model: .policy:build_executor
+      parameters:
+        weights: weights/wholebody.pt
+      dimension: auto
+      period: 0.02
+      observations:
+        - robot.linear_velocity
+        - robot.angular_velocity
+        - robot.orientation
+        - simulation.gravity
+        - robot.joint_position
+        - robot.default_joint_position
+        - robot.joint_velocity
+        - planner.output
+        - executor.output
+        - piperx.orientation
+        - feet_contact.contact_force
+        - piperx.position
+        - piperx.joint_position
+        - piperx.joint_velocity
+        - piperx.tcp.position
+        - piperx.default_joint_position
+      initial: .policy:initial_action
+      decode: .policy:decode_action
+  output:
+    legs:
+      type: joint_position
+      asset_name: robot
+      joint_names:
+        - FL_hip_joint
+        - FR_hip_joint
+        - RL_hip_joint
+        - RR_hip_joint
+        - FL_thigh_joint
+        - FR_thigh_joint
+        - RL_thigh_joint
+        - RR_thigh_joint
+        - FL_calf_joint
+        - FR_calf_joint
+        - RL_calf_joint
+        - RR_calf_joint
+    arm:
+      type: joint_position
+      asset_name: piperx
+      joint_names:
+        - joint1
+        - joint2
+        - joint3
+        - joint4
+        - joint5
+        - joint6
+connections:
+  - name: piperx_attachment
+    parent:
+      entity: world/robot
+      body: base
+    child:
+      entity: world/piperx
+      body: world
+    parent_pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.06
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+authoring:
+  parents: {}
+visualization:
+  abstract:
+    - ee_workspace

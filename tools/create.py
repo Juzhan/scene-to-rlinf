@@ -12,10 +12,12 @@ import tokenize
 
 from omegaconf import OmegaConf, open_dict
 
-from run import project_directories
+from run import declares_backend, project_directories
 
 PROJECTS = Path(__file__).resolve().parents[1] / "projects"
-MAINTAINED_TEMPLATES = ("planner_executor", "assembly_go2", "assembly_go2_navigation", "assembly_lift")
+
+# A template must name its backend, so a new project never runs on an implicit default.
+MAINTAINED_TEMPLATES = ("planner_executor",)
 
 
 def _assembly_registration_names(source, name):
@@ -100,6 +102,11 @@ def create_project(name, template="planner_executor", policy=None, dry_run=False
         raise ValueError("Planner/executor projects define models in policy.py; --policy overrides are not supported")
     if policy is not None and template == "franka_stack_vla":
         raise ValueError("MLP policy options do not apply to the GR00T template")
+    # A scene project that inherits its backend from configs/state_ppo.yaml keeps running there,
+    # but the copy names it, so a new project never runs on an implicit default.
+    inherited = None
+    if (source / "scene.yaml").is_file() and not declares_backend(source):
+        inherited = OmegaConf.select(OmegaConf.load(PROJECTS.parent / "configs/state_ppo.yaml"), "env.train.init_params.backend")
     registration_names = _assembly_registration_names(source, name)
     files = {}
     for path in sorted(source.rglob("*")):
@@ -122,6 +129,8 @@ def create_project(name, template="planner_executor", policy=None, dry_run=False
                     if "model" not in cfg.actor:
                         cfg.actor.model = {}
                     cfg.actor.model.network = policy
+            if inherited and path.stem == "train":
+                OmegaConf.update(cfg, "env.train.init_params.backend", inherited, force_add=True)
             text = OmegaConf.to_yaml(cfg)
         if path.suffix == ".py":
             text = _rewrite_python_strings(text, registration_names)
@@ -131,6 +140,9 @@ def create_project(name, template="planner_executor", policy=None, dry_run=False
         files[Path("policy.py")] = (PROJECTS / "cartpole/policy.py").read_text()
     if dry_run:
         return target, tuple(map(str, files))
+    if inherited:
+        print(f"{template} inherits its backend; {name}/train.yaml now names it: "
+              f"env.train.init_params.backend: {inherited} (new projects use isaaclab3)")
     staging = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=target.parent))
     try:
         for relative, text in files.items():

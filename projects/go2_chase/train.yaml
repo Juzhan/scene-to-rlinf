@@ -1,0 +1,44 @@
+defaults:
+- model/mlp_policy@actor.model
+- state_ppo
+- _self_
+runner:
+  # 1024 envs x 32 steps = 32768 env steps per epoch. The reference SuperMimic run used 2048-4096
+  # envs and 40k model-based iterations; PPO is a different algorithm (see README).
+  max_epochs: 1000
+  save_interval: 50
+  keep_last_checkpoints: 1
+  logger:
+    experiment_name: go2_chase_flee
+algorithm:
+  update_epoch: 5
+  entropy_bonus: 0.005
+env:
+  train:
+    total_num_envs: 1024
+    max_steps_per_rollout_epoch: 32
+    max_episode_steps: 300
+    init_params:
+      id: go2_chase/Workspace-Planner-Executor-v0
+      # isaaclab3 | isaac | mjlab; physics (isaaclab3 only): newton | ovphysx.
+      # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
+      backend: isaaclab3
+      physics: newton
+  # evaluate: same environment, each round runs one whole episode.
+  eval:
+    total_num_envs: 32
+    max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+actor:
+  global_batch_size: 8192
+  micro_batch_size: 2048
+  optim:
+    lr: 0.0003
+    value_lr: 0.0003
+  model:
+    model_type: go2_chase__planner_executor_policy
+    obs_dim: null
+    action_dim: auto
+    hidden_dims:
+    - 512
+    - 256
+    - 128

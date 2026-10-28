@@ -1,0 +1,13 @@
+{
+  "files": {
+    "pick.pt": {
+      "sha256": "86d89896978c4412fe27a88f9f71d2ffbe75e1f6fa80ac4fe2f4eebcc53682d8",
+      "bytes": 703907,
+      "source": "this workspace, run outputs/piper_pick/runs/20261022_124529_30e82905256d, global_step_1500 actor/model_state_dict/full_weights.pt",
+      "trained_with": "RLinf PPO on the mjlab backend, 256 environments, 1500 epochs (2026-10-22)",
+      "contents": "executor state dict (keys model.*): state MLP 33-256-128, actor 128-256-128-7, value head, actor_logstd",
+      "interface": "33 inputs: piper joint_position - READY (8), 0.1 * joint_velocity (8), 0.01 * joint_effort (8), cube position (3), fingertip centre (3), 10 * (cube - fingertip) (3); 7 actions decoded by decode_action",
+      "loaded_by": "policy.py build_executor(weights=...)"
+    }
+  }
+}

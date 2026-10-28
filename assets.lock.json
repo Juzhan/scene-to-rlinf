@@ -1,0 +1,21 @@
+{
+  "version": "2026.10.28",
+  "archive": "rlinf-assets-2026.10.28.tar.gz",
+  "url": "https://drive.google.com/file/d/1si5m0jAV7jVzWx7WKgXpsRHjj2xKQW-j/view?usp=drive_link",
+  "sha256": "1839eb40dbf5d290c2d0b6f77041a5d5f4c09520e3fd80cb83358c89308ad6f8",
+  "size": 164979999,
+  "directories": [
+    "anymal_c",
+    "clear_sky",
+    "dex_cube",
+    "franka_panda",
+    "go2",
+    "ground_plane",
+    "m20",
+    "piper",
+    "piper_x",
+    "seattle_table",
+    "terrains",
+    "white_marble"
+  ]
+}

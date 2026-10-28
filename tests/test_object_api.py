@@ -158,3 +158,62 @@ def test_rlinf_transport_keeps_custom_fields_including_terminal_images():
         torch.testing.assert_close(packed['final_obs']['states'][key],value)
     parts=PolicyInput(obs=packed['obs']).split([1,2])
     assert parts[1].obs['states']['camera.rgb'].shape==(2,4,5,3)
+
+
+def test_nonfinite_task_result_names_item_environments_and_metrics(monkeypatch):
+    from shared.backends.isaac.python_task import Runtime
+    def evaluate(obs):
+        distance=torch.tensor([1.,float('nan'),2.])
+        return {'reward':1-distance,'metrics':{'distance':distance,'speed':torch.zeros(3)}}
+    modules={'example.task':SimpleNamespace(evaluate=evaluate),
+             'example.observation':SimpleNamespace(SceneInfo=ObjectView,SCENE_FIELDS=())}
+    monkeypatch.setattr('shared.backends.isaac.python_task.import_module',modules.__getitem__)
+    runtime=Runtime(SimpleNamespace(num_envs=3,device='cpu',common_step_counter=1,extras={}),{'module':'example'},{})
+    with pytest.raises(ValueError,match=r"reward is non-finite in 1 environments \(first \[1\].*non-finite metrics: \['distance'\]$"):
+        runtime.compute()
+
+
+def _set_runtime(monkeypatch, value):
+    from shared.backends.isaac.python_task import Runtime
+    modules={'example.task':SimpleNamespace(evaluate=lambda obs:{'set':value}),
+             'example.observation':SimpleNamespace(SceneInfo=ObjectView,SCENE_FIELDS=())}
+    monkeypatch.setattr('shared.backends.isaac.python_task.import_module',modules.__getitem__)
+    settings={'name':'world','entities':[
+        {'name':'robot','factory':'dex_cube'},
+        {'name':'area','kind':'abstract','shape':'rectangle','size':[1.,1.]},
+        {'name':'ball','kind':'abstract','shape':'point'},
+        {'name':'tip','kind':'abstract','shape':'point','mount':{'entity':'world/robot'}},
+        {'name':'goal','kind':'abstract','shape':'point','reset':{'region':'world/area'}}]}
+    env=SimpleNamespace(num_envs=2,device='cpu',common_step_counter=1,extras={})
+    return Runtime(env,{'module':'example'},settings), env
+
+
+def test_task_set_is_taken_once_in_the_step_it_was_returned(monkeypatch):
+    from shared.backends.isaac.python_task import task_set
+    position=torch.tensor([[1.,0.,.2],[2.,0.,.2]])
+    runtime,env=_set_runtime(monkeypatch,{'ball':position})
+    result=runtime.compute()
+    assert set(result)=={'reward','success','failure','metrics'}
+    position[:]=0.  # the Task's own tensor is not shared
+    env._assembly_python_task=runtime
+    torch.testing.assert_close(task_set(env,'ball'),torch.tensor([[1.,0.,.2],[2.,0.,.2]]))
+    assert task_set(env,'ball') is None and task_set(env,'goal') is None
+    runtime.compute(); env.common_step_counter=2
+    assert task_set(env,'ball') is None  # a stale step's set is never applied
+    assert task_set(SimpleNamespace(),'ball') is None  # no Task
+
+
+@pytest.mark.parametrize('value, match',[
+    ({'missing':torch.zeros(2,3)},"'missing'.*not an abstract entity"),
+    ({'tip':torch.zeros(2,3)},"'tip'.*mounted"),
+    ({'area':torch.zeros(2,3)},"'area'.*reset region"),
+    ({'ball':torch.zeros(2,4)},"'ball'.*shape"),
+    ({'ball':torch.zeros(2,3,dtype=torch.long)},"'ball'.*float"),
+    ({'ball':torch.full((2,3),float('nan'))},"'ball'.*non-finite"),
+    ({'ball':torch.zeros(2,7)},"'ball'.*zero quaternion"),
+    (['ball'],'map abstract entity names'),
+])
+def test_task_set_rejects_bad_entries_naming_the_entity(monkeypatch,value,match):
+    runtime,_=_set_runtime(monkeypatch,value)
+    with pytest.raises(ValueError,match=match):
+        runtime.compute()

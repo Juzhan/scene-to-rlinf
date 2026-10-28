@@ -1,0 +1,177 @@
+schema_version: 1
+name: world
+application:
+  headless: true
+  enable_cameras: false
+  fast_shutdown: false
+simulation:
+  dt: 0.005
+  render_interval: 4
+  physics_material:
+    friction_combine_mode: multiply
+    restitution_combine_mode: multiply
+    static_friction: 1.0
+    dynamic_friction: 1.0
+  gravity:
+    - 0.0
+    - 0.0
+    - -9.81
+world:
+  env_spacing: 8.0
+  contact_materials: {}
+entities:
+  - name: ground
+    scope: global
+    factory: ground_plane
+    prim_name: GroundPlane
+  - name: sky_light
+    scope: global
+    factory: clear_sky
+    prim_name: skyLight
+  - name: piper
+    factory: piper_x
+    kind: robot
+    initial_state:
+      linear_velocity:
+        - 0.0
+        - 0.0
+        - 0.0
+      angular_velocity:
+        - 0.0
+        - 0.0
+        - 0.0
+      joint_positions:
+        joint1: 0.0
+        joint2: 1.526
+        joint3: -1.295
+        joint4: 1.423
+        joint5: 0.0
+        joint6: 0.0
+        gripper_joint1: 0.05000000074505806
+        gripper_joint2: -0.05000000074505806
+      joint_velocities:
+        joint1: 0.0
+        joint2: 0.0
+        joint3: 0.0
+        joint4: 0.0
+        joint5: 0.0
+        joint6: 0.0
+        gripper_joint1: 0.0
+        gripper_joint2: 0.0
+  - name: cube_area
+    kind: abstract
+    shape: rectangle
+    size:
+      - 0.16
+      - 0.16
+    pose:
+      position:
+        - 0.32
+        - 0.0
+        - 0.025
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+  - name: cube
+    factory: dex_cube
+    kind: entity
+    pose:
+      position:
+        - 0.32
+        - 0.0
+        - 0.025
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    reset:
+      region: world/cube_area
+      yaw_range:
+        - 0.0
+        - 0.0
+  - name: wrist_camera
+    factory: camera
+    kind: sensor
+    camera_only: true
+    mount:
+      entity: world/piper
+      body: camera_link
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.0
+      orientation:
+        - 0.5
+        - 0.5
+        - -0.5
+        - -0.5
+  - name: tcp_frame
+    factory: frame_transformer
+    kind: sensor
+    parameters:
+      target_body: gripper_base
+      target_position:
+        - 0
+        - 0
+        - 0.13
+    mount:
+      entity: world/piper
+      body: gripper_base
+    pose:
+      position:
+        - 5.551115123125782e-17
+        - 1.1102230246251565e-16
+        - 0.1149955719690611
+      orientation:
+        - 1.0
+        - 1.553576199684428e-16
+        - 5.470437680172914e-16
+        - -3.100059202163687e-16
+control:
+  train: executor
+  components:
+    planner:
+      model: .policy:build_planner
+      dimension: 3
+      period: 0.2
+      observations:
+        - cube.position
+        - cube.orientation
+        - piper.joint_position
+        - piper.joint_velocity
+        - piper.joint_effort
+        - piper.tcp.position
+    executor:
+      model: .policy:build_executor
+      parameters:
+        weights: weights/pick.pt
+      dimension: 7
+      period: 0.02
+      observations:
+        - piper.joint_position
+        - piper.joint_velocity
+        - piper.joint_effort
+        - cube.position
+        - tcp_frame.frame_positions
+      initial: .policy:initial_action
+      decode: .policy:decode_action
+  output:
+    arm:
+      type: joint_position
+      asset_name: piper
+      joint_names:
+        - joint1
+        - joint2
+        - joint3
+        - joint4
+        - joint5
+        - joint6
+        - gripper_joint1
+        - gripper_joint2
+connections: []
+authoring:
+  parents: {}

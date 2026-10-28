@@ -36,6 +36,94 @@ def _hash(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+# Loaded by convention (Project, project_registry); further modules are found from these.
+_RUNTIME_MODULES = ("__init__", "policy", "task", "observation", "assets", "terms")
+# Changes here are policy semantics that --allow-scene-change cannot accept.
+_POLICY_CODE = ("policy.py", "terms.py")
+
+
+def _source_digest(path, package):
+    """Hash a module's syntax tree without docstrings: comment/docstring edits do not count.
+
+    The package name is neutralised so a frozen copy matches its source; unparsable text is hashed as is.
+    """
+    text = re.sub(r"\b" + re.escape(package) + r"\b", "__project__", Path(path).read_text())
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return hashlib.sha256(text.encode()).hexdigest()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body
+                and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:]
+    return hashlib.sha256(ast.dump(tree).encode()).hexdigest()
+
+
+def _project_sources(root, package, configurations=()):
+    """Digest the project modules a run imports, not tests, notebooks or tools beside them.
+
+    Starts from the conventional modules and modules named as ``.module:attr`` or
+    ``package.module`` in the recipe/scene, then follows project imports and string references.
+    """
+    root, found, pending = Path(root), set(), []
+
+    def add(path):
+        relative = path.relative_to(root)
+        if path not in found and not any(part in _SKIP or part.startswith(".venv") for part in relative.parts):
+            found.add(path)
+            pending.append(path)
+
+    def module(base, dotted):
+        for part in dotted.split("."):
+            if not part.isidentifier():
+                return
+            if (base / part / "__init__.py").is_file():
+                base = base / part
+                add(base / "__init__.py")
+            else:
+                if (base / f"{part}.py").is_file():
+                    add(base / f"{part}.py")
+                return
+
+    def reference(value):
+        if value.startswith(package + "."):
+            value = value[len(package):]
+        if value.startswith(".") and not value.startswith(".."):
+            module(root, value[1:].split(":")[0])
+
+    for name in _RUNTIME_MODULES:
+        if (root / f"{name}.py").is_file():
+            add(root / f"{name}.py")
+    for configuration in configurations:
+        _map_strings(configuration, reference)
+    while pending:
+        path = pending.pop()
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    reference(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                base, name = path.parent, node.module or ""
+                for _ in range(node.level - 1):
+                    base = base.parent
+                if not node.level:
+                    if name != package and not name.startswith(package + "."):
+                        continue
+                    base, name = root, name[len(package):].lstrip(".")
+                if base.is_relative_to(root):
+                    for alias in node.names:
+                        module(base, ".".join(filter(None, (name, alias.name))))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                reference(node.value)
+    return {str(path.relative_to(root)): _source_digest(path, package) for path in sorted(found)}
+
+
 def _digest(value):
     def ordered_actions(item):
         if isinstance(item, dict):
@@ -160,7 +248,8 @@ def project_signature(cfg, module):
                           "actions": documents[path].get("actions"),
                           "control": documents[path].get("control")}
                    for name, path in scenes.items()},
-        "code": {name: _hash(root / name) for name in ("policy.py", "terms.py") if (root / name).is_file()},
+        "code": {name: _source_digest(root / name, module.project.package)
+                 for name in _POLICY_CODE if (root / name).is_file()},
     }
     from shared.assembly.layout import load_world_spec
     from shared.assembly.project import project_registry
@@ -174,10 +263,9 @@ def project_signature(cfg, module):
     # File labels remain stable when the same project moves into its snapshot.
     scene_documents = {str(path.relative_to(root)) if path.is_relative_to(root) else str(path): value
                        for path, value in documents.items()}
-    sources = {str(path.relative_to(root)): _hash(path) for path in sorted(root.rglob("*.py"))
-               if not any(part in _SKIP for part in path.relative_to(root).parts)}
+    sources = _project_sources(root, module.project.package, [_plain(cfg), *documents.values()])
     return {"interface": interface, "interface_sha256": _digest(interface), "backends": backends,
-            "scene": scene_documents, "source_sha256": sources,
+            "scene": scene_documents, "runtime_sources": sources,
             "resolved_interface": getattr(module, "interface_metadata", None)}
 
 
@@ -269,6 +357,8 @@ def create_snapshot(cfg, module, run_directory=None):
         if any(part in _SKIP or part.startswith(".venv") for part in relative.parts):
             continue
         if not path.is_file() or path.suffix in {".pyc", ".pyo"} or _derived_cache(relative):
+            continue
+        if path.suffix == ".editing":  # an open editor's unsaved working copy, not the project
             continue
         output = frozen_root / relative
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -368,8 +458,9 @@ def verify_snapshot(path, *, allow_shared_change=False):
 
 
 def _policy_interface(signature):
-    # Snapshots before 2026-10-22 kept the backend inside the interface.
-    return {key: value for key, value in signature["interface"].items() if key != "backends"}
+    # Snapshots before 2026-10-22 kept the backend inside the interface. Policy code is
+    # compared through _project_sources, since older snapshots hashed its raw bytes.
+    return {key: value for key, value in signature["interface"].items() if key not in ("backends", "code")}
 
 
 def _backends(signature):
@@ -379,12 +470,20 @@ def _backends(signature):
 def compare_project(path, cfg, module, *, allow_scene_change=False, allow_shared_change=False):
     """Reject changed policy semantics; scene changes require an explicit opt-in."""
     manifest = verify_snapshot(path, allow_shared_change=allow_shared_change)
+    snapshot = find_snapshot(path)
     current = project_signature(cfg, module)
     old = manifest["signature"]
-    if _digest(_policy_interface(current)) != _digest(_policy_interface(old)):
-        changed = ", ".join(item["path"] for item in _differences(_policy_interface(old), _policy_interface(current))[:8])
+    # Both sides are digested now, from the frozen copy and the selected project, so snapshots
+    # whose manifests hashed every *.py byte for byte compare under the same rule.
+    before = _project_sources(snapshot / "source" / manifest["package"], manifest["package"],
+                              [_plain(OmegaConf.load(snapshot / "train.yaml")), *old["scene"].values()])
+    after = _project_sources(_project_root(module), module.project.package, [_plain(cfg), *current["scene"].values()])
+    sources = [name for name in dict.fromkeys([*before, *after]) if before.get(name) != after.get(name)]
+    code = [name for name in sources if name in _POLICY_CODE]
+    if code or _digest(_policy_interface(current)) != _digest(_policy_interface(old)):
+        changed = ", ".join([item["path"] for item in _differences(_policy_interface(old), _policy_interface(current))[:8]] + code)
         raise ValueError("Observation/action semantics or policy code changed, even if dimensions match: " + changed + ". "
-                         "Use --snapshot to replay the frozen project; --allow-scene-change does not change policy semantics.")
+                         f"Use --snapshot {snapshot} to replay the frozen project; --allow-scene-change does not change policy semantics.")
     bodies = _same_backend(old.get("resolved_interface"), current.get("resolved_interface"))
     resolved_before = _resolved_interface(old.get("resolved_interface"), bodies=bodies)
     resolved_after = _resolved_interface(current.get("resolved_interface"), bodies=bodies)
@@ -392,20 +491,19 @@ def compare_project(path, cfg, module, *, allow_scene_change=False, allow_shared
     if resolved_checked and resolved_before != resolved_after:
         changed = ", ".join(item["path"] for item in _differences(resolved_before, resolved_after)[:8])
         raise ValueError("Resolved observation/action or robot joint order changed: " + changed)
-    differences = []
-    for key, label in (("scene", "scene configuration"), ("source_sha256", "project source")):
-        if current[key] != old[key]:
-            differences.append(label)
+    scenes = [name for name in dict.fromkeys([*old["scene"], *current["scene"]])
+              if old["scene"].get(name) != current["scene"].get(name)]
+    differences = [label for label, changed in (("scene configuration", scenes), ("project source", sources)) if changed]
     if differences and not allow_scene_change:
-        raise ValueError("Project differs from the checkpoint: " + ", ".join(differences) +
-                         ". Use --snapshot for the saved project or --allow-scene-change to evaluate this scene.")
+        raise ValueError("Project differs from the checkpoint in " + ", ".join(scenes + sources) +
+                         f". Use --snapshot {snapshot} for the saved project or --allow-scene-change to evaluate this scene.")
     frozen_module = module.__name__.startswith("_experiment_")
     measured_now = resolved_checked and (not frozen_module or getattr(module, "interface_metadata_verified", False))
     backends = {"checkpoint": _backends(old), "current": _backends(current)}
-    return {"snapshot": str(find_snapshot(path)), "changed": differences, "backends": backends,
+    return {"snapshot": str(snapshot), "changed": differences, "backends": backends,
             "backend_changed": backends["checkpoint"] != backends["current"],
             "differences": _differences(old["scene"], current["scene"], "scene") +
-                           _differences(old["source_sha256"], current["source_sha256"], "source"),
+                           _differences(before, after, "source"),
             "policy_interface_matches": True, "uses_current_scene": bool(allow_scene_change),
             "shared_changes": manifest["shared_changes"], "resolved_interface_verified": measured_now,
             "limitations": [] if measured_now else ["Live manager/joint order has not been checked against the saved run; declarations and any available recorded metadata were compared."]}
@@ -480,9 +578,10 @@ def load_snapshot(path, overrides=(), *, register=True, allow_shared_change=Fals
         if model(cfg) != model(changed):
             raise ValueError("A frozen replay cannot change policy/model semantics")
         for name in ("train", "eval"):
-            # device and simulator backend choose where the frozen policy runs.
-            before = {key: value for key, value in _plain(cfg.env[name].init_params).items() if key not in {"device", "backend"}}
-            after = {key: value for key, value in _plain(changed.env[name].init_params).items() if key not in {"device", "backend"}}
+            # device, simulator backend, its physics engine and renderer choose where the frozen policy runs.
+            where = {"device", "backend", "physics", "renderer"}
+            before = {key: value for key, value in _plain(cfg.env[name].init_params).items() if key not in where}
+            after = {key: value for key, value in _plain(changed.env[name].init_params).items() if key not in where}
             if before != after:
                 raise ValueError("A frozen replay cannot change its scene or policy interface")
         from shared.assembly.project import follow_train_backend

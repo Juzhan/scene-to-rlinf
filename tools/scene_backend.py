@@ -1,4 +1,4 @@
-"""Backend-selectable project check and scene-only native inspection/view."""
+"""Backend-selectable project check and scene-only native view."""
 import argparse
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ from shared.assembly.assets import BACKENDS, backend_module
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('check', 'inspect', 'view'))
+    parser.add_argument('operation', choices=('check', 'view'))
     parser.add_argument('project')
     parser.add_argument('--backend', required=True, choices=BACKENDS)
     args = parser.parse_args(argv)
@@ -33,6 +33,6 @@ def main(argv):
         inspect = getattr(backend_module(args.backend, 'project'), 'inspect_scene', None)
         if inspect is None:
             parser.error(f'Explicit --backend {args.backend} supports static check only; '
-                         'use run.py inspect/view <project> for the runtime')
+                         'use run.py view <project> for the runtime')
         inspect(description, settings, factories, report, view=args.operation == 'view')
     print(json.dumps(report, indent=2, ensure_ascii=False))

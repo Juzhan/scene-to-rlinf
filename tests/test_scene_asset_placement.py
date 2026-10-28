@@ -35,3 +35,17 @@ def test_partial_reset_of_added_assets_uses_current_terrain_origin():
     reset_authored_assets(env,torch.tensor([1]),asset_names=['arm','box'])
     torch.testing.assert_close(arm.pose[1,:3],torch.tensor([-12.5,5.,-.269]))
     torch.testing.assert_close(arm.data.default_root_state[1,:3],torch.tensor([-.5,1.,0.]))
+
+
+def test_static_pose_reads_env0_view_for_every_environment():
+    from shared.backends.isaac.preview_world import IsaacAssemblyWorld
+    origins=torch.tensor([[0.,0.,0.],[0.,4.,0.],[4.,0.,0.]])
+    class View:  # Lab builds static views before cloning: env_0 or the single global prim.
+        def __init__(self,path,position):self.prim_paths=[path];self.position=torch.tensor([position])
+        def get_world_poses(self):return self.position,torch.tensor([[1.,0,0,0]])
+    world=SimpleNamespace(num_envs=3,scene=SimpleNamespace(env_origins=origins,env_prim_paths=[f'/World/envs/env_{i}' for i in range(3)]))
+    world._local_pose=lambda pose:IsaacAssemblyWorld._local_pose(world,pose)
+    local=IsaacAssemblyWorld._static_pose(world,View('/World/envs/env_0/steps',[1.,2.,.1]))
+    torch.testing.assert_close(local[:,:3],torch.tensor([[1.,2.,.1]]*3))
+    shared=IsaacAssemblyWorld._static_pose(world,View('/World/floor',[1.,2.,.1]))
+    torch.testing.assert_close(shared[:,:3],torch.tensor([1.,2.,.1])-origins)

@@ -1,6 +1,6 @@
 """Shared scene -> native mjlab SceneCfg. No policy or training loop."""
 from math import isfinite
-from shared.assembly.spec import Abstract, Pose
+from shared.assembly.spec import Abstract, Mount, Pose, Sensor
 
 INITIAL_STATE = {'joint_positions', 'joint_velocities', 'linear_velocity', 'angular_velocity'}
 # PhysX friction of a material against the default friction-1 material, per combine mode.
@@ -8,9 +8,10 @@ COMBINE = {'average': lambda value: (value + 1) / 2, 'min': lambda value: min(va
            'multiply': lambda value: value, 'max': lambda value: max(value, 1.)}
 
 
-def validate(description, settings):
+def validate(description, settings, *, step_dt=None):
     # Fail before starting the simulator rather than silently ignoring features.
-    from .assets import SENSORS
+    # ``step_dt`` (decimation * dt) is known only for full projects; it bounds sensor update periods.
+    from .assets import RAY_SENSORS, SENSORS
     allowed = {'schema_version', 'name', 'entities', 'connections', 'simulation',
                'world', 'authoring', 'control', 'targets', 'application', 'observations', 'visualization'}
     extra = settings.keys() - allowed
@@ -50,17 +51,16 @@ def validate(description, settings):
         raise NotImplementedError(f'mjlab physics_material.friction_combine_mode must be one of {sorted(COMBINE)}')
     for path, (node, _) in description.index().items():
         if isinstance(node, Abstract):
-            # Static and mounted abstract entities are read through shared readers.
-            if node.reset is not None:
-                raise NotImplementedError(f'{path}: mjlab randomized abstract entities (reset) are not connected yet; '
-                                          'static and mounted abstract entities are readable')
+            # Abstract entities have no model; randomized and moving ones are command terms.
             continue
         # prim_name only renames the Isaac prim; mjlab keys follow the logical path.
         # Robot body frames are read through the shared robot interface; nothing is compiled for them.
         if node.frames and node.kind != 'robot':
             raise NotImplementedError(f'{path}: mjlab body frames are read on robot entities only')
-        if node.meshes:
-            raise NotImplementedError(f'{path}: mjlab ray meshes are not implemented yet')
+        if node.meshes and node.factory not in RAY_SENSORS:
+            raise NotImplementedError(f'{path}: mjlab casts rays at meshes only from {list(RAY_SENSORS)}')
+        if node.factory in RAY_SENSORS:
+            ray_layout(description, path, node, step_dt)
         if node.mount and node.factory not in SENSORS:
             raise NotImplementedError(f'{path}: mjlab mounts only sensors {list(SENSORS)}; physical attachment is not implemented')
         if node.reset is not None and node.factory in SENSORS:
@@ -69,10 +69,63 @@ def validate(description, settings):
             raise NotImplementedError(f'{path}: mjlab initial_state supports only {sorted(INITIAL_STATE)}')
 
 
+def ray_layout(description, path, node, step_dt=None):
+    """Mount, mount body name and ray target path of a height scanner, limited to what mjlab
+    reproduces of Isaac's RayCaster (one static target, rays following one body)."""
+    index = description.index()
+    if not node.mount or not node.mount.body:
+        raise ValueError(f'{path}: height_scanner needs a mount entity and body; its rays follow that body')
+    mount = description.resolve_mount(path, node.mount)
+    body = mount.body.rsplit('/', 1)[-1]
+    if any(character in body for character in '.*?[]()|+\\^$'):
+        raise NotImplementedError(f'{path}: mjlab height_scanner mounts on one plain body name, not {mount.body!r}')
+    if len(node.meshes) != 1:
+        raise NotImplementedError(f'{path}: height_scanner needs exactly one meshes entry '
+                                  '(Isaac RayCaster casts against a single mesh)')
+    target = description.resolve_mount(path, Mount(node.meshes[0])).entity
+    if target not in index or not index[target][0].factory or isinstance(index[target][0], (Sensor, Abstract)):
+        raise ValueError(f'{path}: meshes must reference a physical entity, not {node.meshes[0]!r}')
+    target_node, target_pose = index[target]
+    if target_node.reset is not None:
+        raise NotImplementedError(f'{path}: Isaac reads the ray mesh once at start; a randomly reset target '
+                                  f'{target} has no faithful counterpart')
+    w, x, y, z = target_pose.orientation
+    if target_node.factory == 'ground_plane' and (abs(target_pose.position[2]) > 1e-9 or abs(x) > 1e-9 or abs(y) > 1e-9):
+        raise NotImplementedError(f'{path}: Isaac casts at a ground plane as the infinite plane z = 0 whatever '
+                                  f'its pose; keep {target} level at height 0')
+    parameters = node.parameters
+    alignment = parameters.get('ray_alignment', 'base')
+    if parameters.get('attach_yaw_only') is not None:
+        alignment = 'yaw' if parameters['attach_yaw_only'] else 'base'
+    if alignment == 'yaw':
+        # Isaac turns yaw-aligned ray starts by the body yaw but keeps the directions in the world;
+        # mjlab turns both, which agrees only for vertical rays.
+        pattern = parameters.get('pattern')
+        direction = pattern.get('direction', (0., 0., -1.)) if isinstance(pattern, dict) else (0., 0., -1.)
+        dx, dy, dz = rotate(node.pose.orientation, direction)
+        if abs(dx) > 1e-6 * abs(dz) or abs(dy) > 1e-6 * abs(dz):
+            raise NotImplementedError(f'{path}: mjlab yaw-aligned rays also turn with the yaw; '
+                                      'only vertical ray directions match Isaac')
+    period = parameters.get('update_period', 0.)
+    if step_dt is not None and isinstance(period, (int, float)) and period > step_dt + 1e-6:
+        raise NotImplementedError(f'{path}: mjlab ray sensors refresh every environment step ({step_dt:g} s); '
+                                  'update_period must not exceed it')
+    return mount, body, target
+
+
+def rotate(orientation, vector):
+    """wxyz quaternion applied to a vector, as isaaclab quat_apply."""
+    w, x, y, z = orientation
+    tx, ty, tz = (2 * (y * vector[2] - z * vector[1]), 2 * (z * vector[0] - x * vector[2]),
+                  2 * (x * vector[1] - y * vector[0]))
+    return (vector[0] + w * tx + y * tz - z * ty, vector[1] + w * ty + z * tx - x * tz,
+            vector[2] + w * tz + x * ty - y * tx)
+
+
 def build_scene_config(description, settings, factories):
     from dataclasses import replace
     import mujoco
-    from mjlab.sensor import CameraSensorCfg, ContactMatch, ContactSensorCfg, SensorCfg
+    from mjlab.sensor import CameraSensorCfg, ContactMatch, ContactSensorCfg, ObjRef, RayCastSensorCfg, SensorCfg
     from mjlab.scene import SceneCfg
     from shared.backends.isaac.initial_state import apply_initial_state  # SDK-free value checks
     validate(description, settings)
@@ -97,7 +150,7 @@ def build_scene_config(description, settings, factories):
         if node.reset is not None and not any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in cfg.spec_fn().joints):
             raise ValueError(f'{path}: reset cannot move a fixed-base entity')
         entities[key] = cfg
-    native_sensors = []
+    native_sensors, ray_targets = [], set()
     for key, (path, node, pose, cfg) in sensors.items():
         mount = description.resolve_mount(path, node.mount) if node.mount else None
         if mount is not None and mount.entity not in keys:
@@ -122,6 +175,26 @@ def build_scene_config(description, settings, factories):
             if not entities[keys[mount.entity]].build().find_bodies(pattern)[0]:
                 raise ValueError(f'{path}: mount body {mount.body!r} matches no body of {mount.entity}')
             cfg = replace(cfg, name=key, primary=ContactMatch(mode='body', pattern=pattern, entity=keys[mount.entity]))
+        elif isinstance(cfg, RayCastSensorCfg):
+            mount, name, target = ray_layout(description, path, node)
+            if keys[mount.entity] not in entities or entities[keys[mount.entity]].spec_fn().body(name) is None:
+                raise ValueError(f'{path}: mount body {mount.body!r} is not a body of {mount.entity}')
+            if keys[target] not in entities:
+                raise ValueError(f'{path}: ray target {target} is not a physical entity')
+            if any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in entities[keys[target]].spec_fn().joints):
+                raise NotImplementedError(f'{path}: Isaac reads the ray mesh once at start; a free-moving target '
+                                          f'{target} has no faithful counterpart')
+            # Isaac: the sensor pose is RayCasterCfg.offset in the mount body frame; pos_w stays the body
+            # origin. Hits are limited to the target's copies in RAY_TARGET_GROUP (see add_ray_targets),
+            # so the robot's own links never block the scan, as with Isaac's single-mesh ray cast.
+            cfg = replace(cfg, name=key, frame=ObjRef(type='body', name=name, entity=keys[mount.entity]),
+                          pattern=replace(cfg.pattern, position=node.pose.position, orientation=node.pose.orientation),
+                          include_geom_groups=(RAY_TARGET_GROUP,), exclude_parent_body=False, target=keys[target])
+            ray_targets.add(keys[target])
+            if len(ray_targets) > 1:
+                # One geom group holds the copies, so scanners cannot be told apart by target.
+                raise NotImplementedError(f'{path}: mjlab height scanners of a scene must share one meshes target, '
+                                          f'found {sorted(ray_targets)}')
         elif hasattr(cfg, 'target_body'):
             if mount is None:
                 raise ValueError(f'{path}: frame targets are relative to a mount entity')
@@ -140,6 +213,8 @@ def build_scene_config(description, settings, factories):
         apply_friction(spec, materials)
         if mounted:
             hide_camera_housings(spec, mounted)
+        if ray_targets:
+            add_ray_targets(spec, ray_targets)
     return SceneCfg(num_envs=1, env_spacing=settings.get('world', {}).get('env_spacing', 4.),
                     entities=entities, sensors=tuple(native_sensors), spec_fn=configure), keys
 
@@ -262,6 +337,32 @@ def hide_camera_housings(spec, cameras):
                 spec.body(model.body(body).name).geoms[offset].group = HIDDEN_GEOM_GROUP
                 hidden.append((name, model.body(body).name, offset))
     return hidden
+
+
+RAY_TARGET_GROUP = 5  # holds only the ray targets' copies; contacts and the default viewer ignore it
+
+
+def add_ray_targets(spec, targets):
+    """Copy the visible geoms (groups 0-2) of each ray target entity into RAY_TARGET_GROUP.
+
+    mujoco_warp filters rays by geom group and one excluded body only, while Isaac's RayCaster
+    sees nothing but its target mesh. The copies have the same shape, frame and appearance, no
+    contacts and no mass; a scanner includes only this group. Returns the number of copies."""
+    copies = 0
+    for key in targets:
+        geoms = [geom for geom in spec.geoms if geom.parent.name.startswith(key + '/') and geom.group <= 2]
+        if not geoms:
+            raise ValueError(f'Ray target {key} has no visible geometry (groups 0-2)')
+        for geom in geoms:
+            copy = geom.parent.add_geom(
+                name=f'{geom.name}__rays' if geom.name else '', type=geom.type, size=geom.size, pos=geom.pos,
+                quat=geom.quat, fromto=geom.fromto, meshname=geom.meshname, hfieldname=geom.hfieldname,
+                material=geom.material, rgba=geom.rgba, group=RAY_TARGET_GROUP, contype=0, conaffinity=0, mass=0.)
+            copy.alt = geom.alt
+            if geom.frame is not None:
+                copy.set_frame(geom.frame)
+            copies += 1
+    return copies
 
 
 def event_configuration(description, keys, entities):

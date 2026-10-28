@@ -20,6 +20,22 @@ class EditConflict(ValueError):
     """An input changed since the editor loaded it; reload before saving."""
 
 
+def editing_copy(scene):
+    """The editor's working copy of ``scene``: beside it, so project-relative files resolve.
+
+    Every edit, native export and backend check reads this copy; scene.yaml changes only on save.
+    """
+    scene = Path(scene).resolve()
+    return scene.with_name(f".{scene.name}.{os.getpid()}.editing")
+
+
+def edited_source(path):
+    """The scene file a working copy edits; any other path is returned unchanged."""
+    path = Path(path)
+    match = re.fullmatch(r"\.(.+)\.\d+\.editing", path.name)
+    return path.with_name(match.group(1)) if match else path
+
+
 def _plain(value):
     if isinstance(value, dict):
         return {str(key): _plain(item) for key, item in value.items()}
@@ -190,7 +206,7 @@ class SceneDocument:
             raise ValueError("Entity edits require parent-local poses; mounted sensors require body-local poses")
         if path not in self.targets:
             raise ValueError(f"Unknown entity: {path}")
-        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount"}
+        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes"}
         if self.entities[path].get("kind") == "abstract":
             allowed = {"pose", "tags", "reset", "mount", "shape", "size"}
         if changes.keys() - allowed:
@@ -207,8 +223,13 @@ class SceneDocument:
                 raw["size"] = size
             changes.pop("shape", None)
             changes.pop("size", None)
-        for key in ("reset", "mount"):
-            # None clears an optional rule (static, unmounted entity).
+        if "meshes" in changes:
+            meshes = changes["meshes"] or None
+            if meshes is not None and (not isinstance(meshes, list) or not all(isinstance(m, str) for m in meshes)):
+                raise ValueError("Sensor mesh targets must be a list of entity paths")
+            changes["meshes"] = meshes
+        for key in ("reset", "mount", "meshes"):
+            # None clears an optional rule (static, unmounted entity, no ray targets).
             if key in changes and changes[key] is None and self.targets[path][1] is None:
                 self.targets[path][0].pop(key, None)
                 del changes[key]
@@ -241,6 +262,28 @@ class SceneDocument:
             joints.append({"name": name, **deepcopy(value)})
         self._index()
 
+    def _removal_filter(self, removed):
+        """Entity keys and abstract names in ``removed``, and whether an observation term reads one."""
+        from shared.backends.isaac.entity_observations import parse_signal
+        keys = {path.split('/', 1)[1].replace('/', '__') for path in removed}
+        abstract = {self.entities[path]['name'] for path in removed
+                    if path in self.entities and self.entities[path].get('kind') == 'abstract'}
+
+        def dropped(term):
+            return bool(parse_signal(term) and parse_signal(term)[0] in keys) or term.split('.', 1)[0] in abstract
+        return keys, abstract, dropped
+
+    def removal_effects(self, removed):
+        """Control targets and observations that removing the ``removed`` paths takes with it."""
+        keys, _, dropped = self._removal_filter(removed)
+        control = self.data.get('control', {})
+        terms = [term for component in control.get('components', {}).values() for term in component['observations']]
+        for value in self.data.get('observations', {}).values():
+            terms += value.get('terms', []) if isinstance(value, dict) else value
+        return {'outputs': sorted(name for name, binding in control.get('output', {}).items()
+                                  if binding['asset_name'] in keys),
+                'observations': sorted({term for term in terms if dropped(term)})}
+
     def remove_entities(self, paths):
         """Remove scene-owned entities, cleaning generated bindings.
 
@@ -250,7 +293,6 @@ class SceneDocument:
         detached by the caller first, since only it knows their live world pose.
         """
         from posixpath import normpath, join, dirname
-        from shared.backends.isaac.entity_observations import parse_signal
         from .spec import Pose
         requested = set(paths)
         roots = {path for path in requested if not any(path.startswith(other + '/') for other in requested if other != path)}
@@ -271,7 +313,7 @@ class SceneDocument:
         for old, new in promoted.items():
             if new in self.entities and new not in removed or list(promoted.values()).count(new) > 1:
                 raise ValueError(f"{old} 上移后与已有实体 {new} 重名；请先删除或改名其中之一")
-        keys = {path.split('/', 1)[1].replace('/', '__') for path in removed}
+        keys, abstract, dropped = self._removal_filter(removed)
         def prune(nodes):
             for node in list(nodes):
                 if any(self.targets[path][0] is node for path in roots):
@@ -287,6 +329,17 @@ class SceneDocument:
                 ref = normpath(join(path, ref)) if ref.startswith('.') else ref
                 if ref in removed:
                     raise ValueError(f"{path} 挂载在被删除的实体上；请先解除挂载（网页编辑器删除时会自动保留其位置）")
+        retargeted = {}
+        for path, node in self.entities.items():
+            # Ray targets that go away are dropped; a sensor left without any needs new targets.
+            meshes = node.get('meshes')
+            if path in removed or not meshes:
+                continue
+            kept = [ref for ref in meshes if (normpath(join(path, ref)) if ref.startswith('.') else ref) not in removed]
+            if len(kept) != len(meshes):
+                if self.targets[path][1] is not None:
+                    raise ValueError(f"{path} 由模板定义，以被删除的实体为射线目标；请在模板中修改")
+                retargeted[path] = kept
         for path, node in self.entities.items():
             region = (node.get('reset') or {}).get('region')
             if path not in removed and region in removed:
@@ -295,9 +348,6 @@ class SceneDocument:
             if (joint.get('parent') or {}).get('entity') in removed and joint['child']['entity'] not in removed:
                 raise ValueError(f"{joint['child']['entity']} 固定在被删除的实体上；请先解除连接"
                                  "（网页编辑器删除时会自动保留其位置）")
-        abstract = {self.entities[path]['name'] for path in removed if self.entities[path].get('kind') == 'abstract'}
-        def dropped(term):
-            return bool(parse_signal(term) and parse_signal(term)[0] in keys) or term.split('.', 1)[0] in abstract
         for role, component in self.data.get('control', {}).get('components', {}).items():
             if component['observations'] and all(dropped(term) for term in component['observations']):
                 raise ValueError(f"删除后 {role} 没有任何观察输入；请先在观察页为 {role} 选择其他输入，再删除")
@@ -327,6 +377,11 @@ class SceneDocument:
                     for end, path in ends.items():
                         moved[end]['entity'] = path
                     self.data.setdefault('connections', []).append(moved)
+        for path, kept in retargeted.items():
+            if kept:
+                self.targets[path][0]['meshes'] = kept
+            else:
+                self.targets[path][0].pop('meshes', None)
         prune(self.data['entities'])
         shown = self.data.get('visualization', {}).get('abstract')
         if shown is not None:
@@ -357,6 +412,10 @@ class SceneDocument:
         control = self.data.get('control', {})
         for component in control.get('components', {}).values():
             component['observations'] = [term for term in component['observations'] if not dropped(term)]
+            if isinstance(component.get('history'), dict):
+                component['history'] = {k: v for k, v in component['history'].items() if not dropped(k)}
+                if not component['history']:
+                    component.pop('history')
         for name, binding in list(control.get('output', {}).items()):
             if binding['asset_name'] in keys:
                 del control['output'][name]
@@ -452,6 +511,11 @@ class SceneDocument:
                 raise ValueError('Choose a nonempty ordered list of unique observations')
             component = control['components'][role]
             component['observations'] = list(terms)
+            if isinstance(component.get('history'), dict):
+                # A deselected observation takes its window with it; kept ones keep their length.
+                component['history'] = {k: v for k, v in component['history'].items() if k in terms}
+                if not component['history']:
+                    component.pop('history')
             from shared.backends.isaac.entity_observations import signal_profile
             if any(signal_profile(term).startswith('camera__') for term in terms):
                 self.data.setdefault('application', {})['enable_cameras'] = True
@@ -556,7 +620,8 @@ class SceneDocument:
             if "visualization" in self.data and not self.data["visualization"]:
                 del self.data["visualization"]
 
-    def add_entity(self, name, factory=None, *, parameters=None, pose=None, kind="entity", shape=None, size=None):
+    def add_entity(self, name, factory=None, *, parameters=None, pose=None, kind="entity", shape=None, size=None,
+                   mount=None, meshes=None):
         _check_name(name)
         if any(node["name"] == name for node in self.data["entities"]):
             raise ValueError(f"Entity already exists: {name}")
@@ -583,6 +648,10 @@ class SceneDocument:
             node["parameters"] = deepcopy(parameters)
         if pose is not None:
             node["pose"] = _pose(pose)
+        if mount:  # A sensor that only exists on a body is added already mounted.
+            node["mount"] = {"entity": mount["entity"], "body": mount["body"]}
+        if meshes:
+            node["meshes"] = list(meshes)
         self.data["entities"].append(node)
         self._index()
         return self.data.get("name", "world") + "/" + name
@@ -644,12 +713,13 @@ class SceneDocument:
                              "category_label": meta.get("category_label", "组合"),
                              "native_key": meta.get("native_key"),
                              "initial_display": visual.get("initial_state", {}),
+                             "exported": bool(visual),  # a current native record, with or without meshes
                              "initial_state": _plain(node.get("initial_state", {})),
                              "reset": _plain(node.get("reset", {})),
                              "camera_only": node.get("camera_only", False),
                              "display_pose": display_pose,
                              "pose_authored": "pose" in node, "parameters": node.get("parameters", {}),
-                             "tags": node.get("tags", []), "mount": mount,
+                             "tags": node.get("tags", []), "mount": mount, "meshes": list(node.get("meshes", [])),
                              "shape": node.get("shape"), "size": node.get("size", []),
                              "connections": node.get("connections", []),
                              "instance_component": relative, "preview": (visual if visual.get("path") else

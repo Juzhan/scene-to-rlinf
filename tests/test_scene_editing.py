@@ -196,7 +196,8 @@ def test_abstract_entity_reset_and_display_are_entity_edits(tmp_path):
     assert destination['reset'] == {'region': 'world/arena', 'yaw_range': [-1., 1.], 'interval': 4.}
     assert saved['visualization'] == {'abstract': ['destination']}
     assert set(abstract_catalog(saved)) == {'arena.position', 'arena.orientation', 'arena.size',
-                                            'destination.position', 'destination.orientation'}
+                                            'destination.position', 'destination.orientation',
+                            'destination.linear_velocity'}
     # Resizing the area keeps the sampled entity; null makes it static again.
     apply_edits(scene, {'revision': SceneDocument(scene).revision,
                         'entities': [{'path': 'world/arena', 'changes': {'size': [4., 5.]}},
@@ -206,6 +207,17 @@ def test_abstract_entity_reset_and_display_are_entity_edits(tmp_path):
     assert 'reset' not in next(item for item in saved['entities'] if item['name'] == 'destination')
     with pytest.raises(ValueError, match='Only abstract entities'):
         apply_edits(scene, {'revision': SceneDocument(scene).revision, 'visualization': {'abstract': ['missing']}})
+
+
+def test_abstract_motion_is_not_a_scene_edit(tmp_path):
+    # Moving an abstract entity is a Task event (evaluate returns set), not scene configuration.
+    scene = tmp_path / 'scene.yaml'
+    scene.write_text('schema_version: 1\nname: world\nentities: []\n')
+    apply_edits(scene, {'revision': SceneDocument(scene).revision, 'add_entities': [
+        {'name': 'ball', 'kind': 'abstract', 'shape': 'point'}]})
+    with pytest.raises(ValueError, match='motion'):
+        apply_edits(scene, {'revision': SceneDocument(scene).revision, 'entities': [
+            {'path': 'world/ball', 'changes': {'motion': '.task:move_ball'}}]})
 
 
 def test_positions_and_spaces_are_deleted_with_the_scene_edit(tmp_path):
@@ -254,6 +266,21 @@ print("ABSTRACT_DELETE_OK")
         "--python-exit-code", "1", "--python", str(script)], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "ABSTRACT_DELETE_OK" in result.stdout
+
+
+def test_deleting_the_controlled_robot_reports_what_goes_and_check_names_it(tmp_path):
+    project = tmp_path / "navigation"
+    shutil.copytree(ROOT / "projects/planner_executor", project, ignore=shutil.ignore_patterns("__pycache__", ".cache"))
+    document = SceneDocument(project / "scene.yaml")
+    removed = ["world/robot", "world/height_scanner", "world/contact_forces"]
+    effects = document.removal_effects(set(removed))
+    assert effects["outputs"] == ["legs"] and "robot.joint_position" in effects["observations"]
+    document.remove_entities(removed)
+    document.save()
+    from shared.assembly.control import validate_outputs
+    from shared.assembly.layout import load_scene_config
+    with pytest.raises(ValueError, match="control.output is empty"):
+        validate_outputs(load_scene_config(project / "scene.yaml")["control"]["output"])
 
 
 def test_invalid_edit_does_not_write(project):

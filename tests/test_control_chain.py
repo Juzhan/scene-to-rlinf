@@ -52,13 +52,18 @@ def fake_chain(monkeypatch, selected):
             self.env, self.links = env, links
             self.dimension = 3
             self.last = {'feedback': torch.zeros(2, 3)}
-        def __call__(self):
+        def __call__(self, rows=None):
             calls.append(self.name)
             value = self.env.feedback if self.name == 'planner' else self.links['planner.output']() + self.env.feedback
             self.last['feedback'].copy_(value)
             return self.last['feedback']
         def read(self, source):
             return self()
+        observe = read
+        def mark(self, ids=None): pass
+        def state(self): return {k: v.clone() for k, v in self.last.items()}
+        def restore(self, state):
+            for k, v in state.items(): self.last[k].copy_(v)
         def reset(self, ids):
             self.last['feedback'][slice(None) if ids is None else ids] = 0
     monkeypatch.setattr(module, 'ComponentInput', Input)

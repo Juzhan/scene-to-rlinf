@@ -6,12 +6,11 @@ def read_target(env, value):
     import torch
     if isinstance(value, dict):
         from shared.assembly.abstract import mounted_pose, tensor_field
-        if value['sampled']:
+        if value['commanded']:
             from .abstract_terms import term_name
-            pose = env.command_manager.get_term(term_name(value['abstract'])).command
-        else:
-            data = env.scene[value['mount']].data
-            pose = mounted_pose(data.root_pos_w - env.scene.env_origins, data.root_quat_w, value['pose'])
+            return env.command_manager.get_term(term_name(value['abstract'])).state.read(value['field'])
+        data = env.scene[value['mount']].data
+        pose = mounted_pose(data.root_pos_w - env.scene.env_origins, data.root_quat_w, value['pose'])
         return tensor_field(pose, value['field'])
     return torch.tensor(value, device=env.device, dtype=torch.float32).expand(env.num_envs, -1)
 

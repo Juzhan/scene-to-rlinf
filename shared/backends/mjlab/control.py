@@ -11,6 +11,14 @@ def component_input(config, env, links, settings):
                           bind_reader=lambda path: bind_reader(env, settings, path), robots=robots(env, settings))
 
 
+def _actuator_types(module, *names):
+    """Actuator classes present in this mjlab version (names changed after 1.1)."""
+    found = tuple(getattr(module, name) for name in names if hasattr(module, name))
+    if not found:
+        raise ValueError(f'mjlab.actuator has none of {names}')
+    return found
+
+
 class Endpoint:
     def __init__(self, binding, env):
         from mjlab import actuator
@@ -20,12 +28,17 @@ class Endpoint:
             raise ValueError(f'Control target selected no joints: {binding}')
         mode = binding['type']
         supported = {
-            'joint_position': (actuator.BuiltinPositionActuator, actuator.XmlPositionActuator,
-                               actuator.DcMotorActuator, actuator.IdealPdActuator),
-            'joint_velocity': (actuator.BuiltinVelocityActuator, actuator.XmlVelocityActuator, actuator.IdealPdActuator),
-            'joint_effort': (actuator.BuiltinMotorActuator, actuator.XmlMotorActuator, actuator.IdealPdActuator),
+            'joint_position': _actuator_types(
+                actuator, 'BuiltinPositionActuator', 'XmlPositionActuator',
+                'DcMotorActuator', 'IdealPdActuator'),
+            'joint_velocity': _actuator_types(
+                actuator, 'BuiltinVelocityActuator', 'XmlVelocityActuator', 'IdealPdActuator'),
+            'joint_effort': _actuator_types(
+                actuator, 'BuiltinMotorActuator', 'XmlMotorActuator', 'IdealPdActuator'),
         }
-        covered = {name for act in self.entity.actuators if isinstance(act, supported[mode])
+        # A DelayedActuator (mjlab's delay wrapper) controls what its base actuator does.
+        covered = {name for act in self.entity.actuators
+                   if isinstance(getattr(act, 'base_actuator', act), supported[mode])
                    and act.cfg.transmission_type == 'joint' for name in act.target_names}
         if not set(names) <= covered:
             raise ValueError(f'{binding["asset_name"]}: native actuators do not support {mode} for {sorted(set(names)-covered)}')
@@ -37,8 +50,10 @@ class Endpoint:
         self.clamp = mode == 'joint_position'
         # Isaac PD actuators under effort control add the effort to a PD hold of the default pose
         # (reset writes it as their position target); mjlab reset clears the targets to zero.
-        self.hold = mode == 'joint_effort' and any(isinstance(act, actuator.IdealPdActuator)
-                                                   and set(act.target_names) & set(names) for act in self.entity.actuators)
+        ideal_pd = getattr(actuator, 'IdealPdActuator', ())
+        self.hold = mode == 'joint_effort' and bool(ideal_pd) and any(
+            isinstance(getattr(act, 'base_actuator', act), ideal_pd) and set(act.target_names) & set(names)
+            for act in self.entity.actuators)
 
     def apply(self, value):
         if self.clamp:

@@ -3,6 +3,7 @@ import math
 from shared.backends.environment import Environment
 from shared.integrations.rlinf.terminal import snapshot
 from shared.backends.mjlab.scene import HIDDEN_GEOM_GROUP
+from shared.backends.mjlab.abstract_terms import guarded_visualizer
 
 # Constraint rows per world. mujoco_warp's guess (64 for a small arm) overflows once two
 # finger pads grip a box (about 115 rows), and it then drops rows silently: fingers pass
@@ -45,7 +46,8 @@ class TerminalObservationMixin:
         return super()._reset_idx(env_ids)
 
 
-def build_config(prepared, *, num_envs, seed, horizon):
+def build_config(prepared, *, num_envs, seed, horizon, visualize=False):
+    """Native config; ``visualize`` adds markers for ``visualization.abstract`` (preview window/video only)."""
     from mjlab.envs import ManagerBasedRlEnvCfg
     from mjlab.envs import mdp
     from mjlab.managers import ObservationGroupCfg, TerminationTermCfg
@@ -73,6 +75,8 @@ def build_config(prepared, *, num_envs, seed, horizon):
     output = {'rewards':cfg.rewards, 'terminations':cfg.terminations, 'events':cfg.events}
     attach_task(output, prepared.terms['object_api'], settings)
     cfg.terminations['workspace_time_limit'] = TerminationTermCfg(func=mdp.time_out, time_out=True)
+    from .abstract_terms import attach_abstract
+    attach_abstract(cfg.commands, settings, visualize=visualize)
     return cfg
 
 
@@ -83,11 +87,18 @@ class Owner:
 
 
 
+def camera_origin(native, viewer):
+    """Frame of the preview eye/lookat: the followed robot's root in environment 0, else its origin."""
+    if viewer.get('follow') is not None:
+        return native.scene[viewer['follow']].data.root_link_pos_w[0].cpu().numpy()
+    return native.scene.env_origins[0].cpu().numpy()
+
+
 def aim_camera(camera, native, viewer):
-    """Free camera at the preview eye/lookat, relative to environment 0."""
+    """Free camera at the preview eye/lookat, relative to ``camera_origin``."""
     import mujoco
     import numpy as np
-    origin = native.scene.env_origins[0].cpu().numpy()
+    origin = camera_origin(native, viewer)
     eye = origin + np.asarray(viewer.get('eye', (7.5, 7.5, 7.5)), dtype=float)
     lookat = origin + np.asarray(viewer.get('lookat', (0., 0., 0.)), dtype=float)
     direction = lookat - eye
@@ -120,6 +131,7 @@ class Window:
     def __init__(self, viewer):
         self.viewer = viewer
         self.handle = None
+        self.origin = None
         self.closed = False
 
     def show(self, native):
@@ -134,11 +146,21 @@ class Window:
             with self.handle.lock():
                 aim_camera(self.handle.cam, native, self.viewer)
                 self.handle.opt.geomgroup[HIDDEN_GEOM_GROUP] = 1
+            self.visualizer = guarded_visualizer(self.handle.user_scn, model)
         if not self.handle.is_running():
             self.closed = True
             return
         with self.handle.lock():
             copy_environment_zero(native, self.data)
+            # Debug markers (abstract entities, sensor rays) through mjlab's own drawing hooks.
+            self.handle.user_scn.ngeom = 0
+            native.update_visualizers(self.visualizer)
+            if self.viewer.get('follow') is not None:
+                # Carry the camera with the robot; a user's orbit and zoom stay as they are.
+                origin = camera_origin(native, self.viewer)
+                if self.origin is not None:
+                    self.handle.cam.lookat[:] += origin - self.origin
+                self.origin = origin
         self.handle.sync()
 
     def close(self):
@@ -179,10 +201,14 @@ class Video:
             self.data = mujoco.MjData(model)
             self.camera = mujoco.MjvCamera()
             aim_camera(self.camera, native, self.viewer)
+            self.visualizer = guarded_visualizer(self.scene, model)
+        elif self.viewer.get('follow') is not None:
+            aim_camera(self.camera, native, self.viewer)
         copy_environment_zero(native, self.data)
         self.context.make_current()
         mujoco.mjv_updateScene(model, self.data, self.option, None, self.camera,
                                mujoco.mjtCatBit.mjCAT_ALL, self.scene)
+        native.update_visualizers(self.visualizer)
         mujoco.mjr_render(self.viewport, self.scene, self.renderer)
         mujoco.mjr_readPixels(self.pixels, None, self.viewport, self.renderer)
         return np.flipud(self.pixels).copy()
@@ -204,6 +230,8 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
         enable_cameras = None
     prepared = prepare_scene(parameters, scene_config=scene_config, project_package=project_package,
                              headless=True, enable_cameras=enable_cameras, **registries)
+    from shared.assembly.framing import complete_viewer
+    viewer = complete_viewer(viewer, prepared.description)
     # headless=False (view) opens MuJoCo's window; otherwise frames are rendered offscreen (record).
     video = Video(viewer) if viewer is not None and headless is not False else None
     window = Window(viewer or {}) if headless is False else None
@@ -232,7 +260,8 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
             if window is not None:
                 window.close()
             super().close()
-    cfg = build_config(prepared, num_envs=num_envs, seed=seed, horizon=horizon)
+    cfg = build_config(prepared, num_envs=num_envs, seed=seed, horizon=horizon,
+                       visualize=video is not None or window is not None)
     native = NativeEnv(cfg, device=parameters.get('device', 'cuda:0'))
     if native.max_episode_length != horizon:
         native.close()

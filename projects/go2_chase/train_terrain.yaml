@@ -1,0 +1,13 @@
+defaults:
+- train
+- _self_
+runner:
+  logger:
+    experiment_name: go2_chase_flee_terrain
+env:
+  train:
+    init_params:
+      scene_config: projects/go2_chase/scene_terrain.yaml
+  eval:
+    init_params:
+      scene_config: projects/go2_chase/scene_terrain.yaml

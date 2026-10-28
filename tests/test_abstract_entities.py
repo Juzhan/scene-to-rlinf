@@ -8,8 +8,8 @@ import sys
 import pytest
 import torch
 
-from shared.assembly.abstract import (abstract_catalog, mounted_pose, reset_areas, sample_poses,
-                                      sample_positions, tensor_field)
+from shared.assembly.abstract import (AbstractState, abstract_catalog, abstract_entities, commanded, commanded_entity,
+                                      mounted_pose, reset_areas, sample_poses, sample_positions, tensor_field)
 from shared.assembly.layout import world_spec_from_config
 from shared.assembly.readers import bind_common
 from shared.assembly.spec import Abstract, RootReset, Scene, WorldSpec
@@ -81,6 +81,69 @@ def test_abstract_mount_follows_an_entity_root_and_cannot_be_randomized(tmp_path
         world(area(reset={"region": "world/area"}), tmp_path=tmp_path)
 
 
+def test_scene_has_no_motion_field_the_task_moves_entities(tmp_path):
+    robot = {"name": "robot", "factory": "dex_cube"}
+    ball = {"name": "ball", "kind": "abstract", "shape": "point"}
+    world(robot, ball, tmp_path=tmp_path)
+    with pytest.raises(ValueError, match="motion"):
+        world(robot, {**ball, "motion": ".task:move_ball"}, tmp_path=tmp_path)
+
+
+def test_unmounted_non_region_entities_are_commanded_with_linear_velocity():
+    settings = scene(area(), {"name": "ball", "kind": "abstract", "shape": "point"},
+                     {"name": "robot", "factory": "dex_cube"},
+                     {"name": "tip", "kind": "abstract", "shape": "point", "mount": {"entity": "world/robot"}},
+                     {"name": "goal", "kind": "abstract", "shape": "point", "reset": {"region": "world/area"}})
+    assert set(commanded(settings)) == {"ball", "goal"}
+    catalog = abstract_catalog(settings)
+    value, information = catalog["ball.linear_velocity"]
+    assert value["commanded"] and value["field"] == "linear_velocity"
+    assert information.unit == "m/s" and information.frame == "environment"
+    assert catalog["goal.linear_velocity"][0]["commanded"]
+    # Regions stay static constants; mounted entities follow their entity.
+    assert "area.linear_velocity" not in catalog and catalog["area.position"][0] == [0., 0., 0.]
+    assert "tip.linear_velocity" not in catalog and not catalog["tip.position"][0]["commanded"]
+    entity = commanded_entity(settings, abstract_entities(settings)["ball"])
+    assert entity["name"] == "ball" and entity["reset"] is None and entity["mount"] is None
+
+
+def _state(reset=None, envs=3):
+    entity = {"name": "ball", "shape": "point", "size": [], "mount": None, "reset": reset,
+              "pose": {"position": [1., 0., .2], "orientation": [1., 0., 0., 0.]}}
+    areas = {"world/area": {"shape": "rectangle", "size": [1., 1.],
+                            "pose": {"position": [5., 5., 0.], "orientation": [1., 0., 0., 0.]}}}
+    return AbstractState(entity, areas, envs, "cpu")
+
+
+def test_abstract_state_resamples_selected_rows_and_clears_their_velocity():
+    state = _state(reset={"region": "world/area", "yaw_range": [0., 0.]})
+    state.velocity[:] = 1.
+    state.fresh[:] = False
+    state.resample(torch.tensor([1]))
+    assert state.velocity[1].abs().sum() == 0 and state.velocity[[0, 2]].eq(1.).all()
+    assert state.fresh.tolist() == [False, True, False]
+    assert (state.pose[1, :2] - 5.).abs().max() <= .5 and state.pose[[0, 2], 0].eq(1.).all()
+
+
+def test_abstract_state_applies_task_sets_to_rows_not_freshly_reset():
+    state = _state()
+    state.resample(torch.tensor([0, 1, 2]))
+    state.advance(.5, torch.tensor([[2., 0., .2]] * 3))
+    torch.testing.assert_close(state.pose[:, 0], torch.ones(3))  # first update after reset keeps the pose
+    assert state.velocity.abs().sum() == 0
+    state.advance(.5, torch.tensor([[2., 0., .2]] * 3))
+    state.resample(torch.tensor([2]))
+    pose = torch.tensor([[3., 0., .2, 0., 0., 0., 2.]] * 3)  # xyz + unnormalized wxyz
+    state.advance(.5, pose)
+    torch.testing.assert_close(state.pose[:, 0], torch.tensor([3., 3., 1.]))
+    torch.testing.assert_close(state.read("linear_velocity"), torch.tensor([[2., 0., 0.]] * 2 + [[0., 0., 0.]]))
+    torch.testing.assert_close(state.read("orientation"), torch.tensor([[0., 0., 0., 1.]] * 2 + [[1., 0., 0., 0.]]))
+    state.advance(.5)  # not set this step: stays, velocity drops to 0
+    assert state.velocity.abs().sum() == 0 and state.pose[0, 0] == 3.
+    state.read("position")[:] = 0.  # readers get copies
+    assert state.pose[0, 0] == 3.
+
+
 def test_catalog_exposes_constant_mounted_and_sampled_fields():
     settings = scene(
         area(pose={"position": [1, 2, 3]}),
@@ -94,8 +157,8 @@ def test_catalog_exposes_constant_mounted_and_sampled_fields():
     assert catalog["area.size"][0] == [1., 2.]
     assert "area.direction" not in catalog and "goal.size" not in catalog
     axis = catalog["axis.direction"][0]
-    assert axis["mount"] == "robot" and not axis["sampled"]
-    assert catalog["goal.position"][0]["sampled"]
+    assert axis["mount"] == "robot" and not axis["commanded"]
+    assert catalog["goal.position"][0]["commanded"]
     assert catalog["axis.orientation"][1].frame == "environment"
     assert reset_areas(settings) == {"world/area": {
         "shape": "rectangle", "size": [1., 2.],
@@ -209,7 +272,7 @@ def test_area_reset_compiles_to_one_serializable_native_event(tmp_path, monkeypa
     assert event_configuration(world(table, goal, tmp_path=tmp_path)) == {}
 
 
-def test_command_terms_cover_randomized_and_shown_entities_only(monkeypatch):
+def test_command_terms_cover_commanded_and_shown_entities_only(monkeypatch):
     monkeypatch.setattr(abstract_terms, "_config_type", lambda: SimpleNamespace)
     settings = scene(area(), {"name": "goal", "kind": "abstract", "shape": "point",
                               "reset": {"region": "world/area", "interval": 4}},
@@ -218,7 +281,9 @@ def test_command_terms_cover_randomized_and_shown_entities_only(monkeypatch):
     output = {"commands": SimpleNamespace()}
     abstract_terms.attach_abstract(output, settings)
     terms = vars(output["commands"])
-    assert set(terms) == {"assembly_abstract_area", "assembly_abstract_goal"}
+    # "still" is static but the Task may move it; the region stays a constant (term only to draw it).
+    assert set(terms) == {"assembly_abstract_area", "assembly_abstract_goal", "assembly_abstract_still"}
+    assert terms["assembly_abstract_still"].resampling_time_range == (1e9, 1e9)
     goal, shown = terms["assembly_abstract_goal"], terms["assembly_abstract_area"]
     assert goal.resampling_time_range == (4., 4.) and not goal.debug_vis
     assert goal.entity["reset"]["region"] == "world/area" and "world/area" in goal.areas

@@ -1,9 +1,11 @@
 """Abstract entity poses in Isaac's native CommandManager and EventManager.
 
-A randomized abstract entity is one command term: the manager resamples it on
-episode reset and, with ``reset.interval``, every interval seconds. Shown
-abstract entities use the same term's native debug visualization. Physical
-assets placed in an abstract rectangle/box use one native reset event.
+Every abstract entity that is neither mounted nor a reset region is one command
+term holding a shared ``AbstractState``: the manager resamples it on episode reset
+and, with ``reset.interval``, every interval seconds; the native command update
+applies the pose the Task set this step (``set``). Shown abstract entities use the
+same term's native debug visualization. Physical assets placed in an abstract
+rectangle/box use one native reset event.
 No separate stepping or reset loop exists.
 """
 from functools import lru_cache
@@ -14,31 +16,31 @@ def _config_type():
     import torch
     from isaaclab.managers import CommandTerm, CommandTermCfg
     from isaaclab.utils import configclass
-    from shared.assembly.abstract import mounted_pose, sample_poses
+    from shared.assembly.abstract import AbstractState, mounted_pose
 
     class AbstractPose(CommandTerm):
         """(N, 7) environment-local xyz + wxyz pose of one abstract entity."""
 
         def __init__(self, cfg, env):
             super().__init__(cfg, env)
-            base = cfg.entity['pose']
-            self._command = torch.tensor([*base['position'], *base['orientation']],
-                                         device=self.device).repeat(self.num_envs, 1)
+            self.state = AbstractState(cfg.entity, cfg.areas, self.num_envs, self.device)
 
         @property
         def command(self):
-            return self._command
+            return self.state.pose
 
         def _resample_command(self, env_ids):
-            if self.cfg.entity['reset'] is not None:
-                self._command[env_ids] = sample_poses(self.cfg.entity['reset'], self.cfg.entity['pose'],
-                                                      self.cfg.areas, len(env_ids), device=self.device)
+            if self.cfg.entity['mount'] is None:
+                self.state.resample(env_ids)
 
         def _update_command(self):
             if self.cfg.entity['mount'] is not None:
                 data = self._env.scene[self.cfg.entity['mount']].data
-                self._command[:] = mounted_pose(data.root_pos_w - self._env.scene.env_origins,
-                                                data.root_quat_w, self.cfg.entity['pose'])
+                self.state.pose[:] = mounted_pose(data.root_pos_w - self._env.scene.env_origins,
+                                                  data.root_quat_w, self.cfg.entity['pose'])
+                return
+            from .python_task import task_set
+            self.state.advance(self._env.step_dt, task_set(self._env, self.cfg.entity['name']))
 
         def _update_metrics(self):
             pass
@@ -51,17 +53,11 @@ def _config_type():
                 self._marker.set_visibility(debug_vis)
 
         def _debug_vis_callback(self, event):
-            position = self.command[:, :3] + self._env.scene.env_origins
-            orientation = self.command[:, 3:7]
-            edges = marker_edges(self.cfg.entity)
-            if edges is None:
-                self._marker.visualize(translations=position, orientations=orientation)
-                return
             from isaaclab.utils.math import quat_apply
-            offsets, indices = (torch.tensor(value, device=self.device) for value in edges)
+            offsets, indices = (torch.tensor(value, device=self.device) for value in marker_parts(self.cfg.entity))
             count = len(indices)
-            orientation = orientation.repeat_interleave(count, 0)
-            translations = position.repeat_interleave(count, 0) + quat_apply(
+            orientation = self.command[:, 3:7].repeat_interleave(count, 0)
+            translations = (self.command[:, :3] + self._env.scene.env_origins).repeat_interleave(count, 0) + quat_apply(
                 orientation, offsets.repeat(self.num_envs, 1))
             self._marker.visualize(translations=translations, orientations=orientation,
                                    marker_indices=indices.repeat(self.num_envs))
@@ -75,77 +71,72 @@ def _config_type():
     return AbstractPoseCfg
 
 
-EDGE_WIDTH = 0.008
+def marker_parts(entity):
+    """Prototype instances of one marker: (centre offsets in the entity frame, prototype indices).
 
-
-def marker_edges(entity):
-    """Edge centres in the entity frame and their axis prototype, or None for solid markers.
-
-    Rectangles and boxes are drawn as wireframes: RTX real-time rendering
-    ignores surface opacity, so a solid volume would hide the robot inside it.
+    Shapes and sizes come from ``shared.assembly.abstract`` so the mjlab preview draws the same.
     """
-    if entity['shape'] not in ('rectangle', 'box'):
-        return None
-    size = list(entity['size']) + [0.] * (3 - len(entity['size']))
-    offsets, indices = [], []
-    for axis in range(3):
-        if not size[axis]:
-            continue
-        others = [other for other in range(3) if other != axis]
-        corners = [(a, b) for a in ((-.5, .5) if size[others[0]] else (0.,))
-                   for b in ((-.5, .5) if size[others[1]] else (0.,))]
-        for a, b in corners:
-            offset = [0.] * 3
-            offset[others[0]], offset[others[1]] = a * size[others[0]], b * size[others[1]]
-            offsets.append(offset)
-            indices.append(axis)
-    return offsets, indices
+    from shared.assembly.abstract import ARROW_HEAD_LENGTH, ARROW_LENGTH, marker_edges
+    edges = marker_edges(entity)
+    if edges is not None:
+        return edges
+    if entity['shape'] == 'direction':
+        # Shaft, then head, along local +X.
+        shaft = (1 - ARROW_HEAD_LENGTH) * ARROW_LENGTH
+        return [[shaft / 2, 0., 0.], [shaft + ARROW_HEAD_LENGTH * ARROW_LENGTH / 2, 0., 0.]], [0, 1]
+    return [[0., 0., 0.]], [0]
 
 
 def marker_config(entity, path):
-    """Sphere point, arrow direction, wireframe rectangle/box."""
+    """Sphere point, cylinder + cone arrow direction, cylinder edges of a rectangle/box (x, y, z prototypes)."""
     import isaaclab.sim as sim_utils
     from isaaclab.markers import VisualizationMarkersCfg
-    from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
+    from shared.assembly.abstract import (ARROW_COLOR, ARROW_HEAD_LENGTH, ARROW_HEAD_RADIUS, ARROW_LENGTH,
+                                          ARROW_WIDTH, EDGE_WIDTH, MARKER_COLOR, POINT_RADIUS)
     if entity['shape'] == 'direction':
-        return GREEN_ARROW_X_MARKER_CFG.replace(prim_path=path)
-    material = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.6, 1.0))
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=ARROW_COLOR)
+        return VisualizationMarkersCfg(prim_path=path, markers={
+            'shaft': sim_utils.CylinderCfg(radius=ARROW_WIDTH, height=(1 - ARROW_HEAD_LENGTH) * ARROW_LENGTH,
+                                           axis='X', visual_material=material),
+            # A USD cone's apex is at +height/2 along its axis.
+            'head': sim_utils.ConeCfg(radius=ARROW_HEAD_RADIUS * ARROW_WIDTH, height=ARROW_HEAD_LENGTH * ARROW_LENGTH,
+                                      axis='X', visual_material=material)})
+    material = sim_utils.PreviewSurfaceCfg(diffuse_color=MARKER_COLOR)
     if entity['shape'] == 'point':
         return VisualizationMarkersCfg(prim_path=path, markers={
-            'abstract': sim_utils.SphereCfg(radius=0.04, visual_material=material)})
+            'abstract': sim_utils.SphereCfg(radius=POINT_RADIUS, visual_material=material)})
     size = list(entity['size']) + [0.] * (3 - len(entity['size']))
-    markers = {}
-    for axis in range(3):
-        edge = [EDGE_WIDTH] * 3
-        edge[axis] = size[axis] + EDGE_WIDTH
-        # Prototype order is the marker index: x, y, z edges.
-        markers['edge_' + 'xyz'[axis]] = sim_utils.CuboidCfg(size=tuple(edge), visual_material=material)
-    return VisualizationMarkersCfg(prim_path=path, markers=markers)
+    # Prototype order is the marker index: x, y, z edges.
+    return VisualizationMarkersCfg(prim_path=path, markers={
+        'edge_' + name: sim_utils.CylinderCfg(radius=EDGE_WIDTH / 2, height=size[axis] + EDGE_WIDTH,
+                                              axis=name.upper(), visual_material=material)
+        for axis, name in enumerate('xyz')})
 
 
 def term_name(name):
     return 'assembly_abstract_' + name
 
 
-def attach_abstract(output, settings):
-    """Command terms for randomized or shown abstract entities."""
-    from dataclasses import asdict
-    from shared.assembly.abstract import abstract_entities, entity_key, reset_areas
+def attach_abstract(output, settings, *, visualize=True):
+    """Command terms for commanded abstract entities and, with ``visualize``, shown ones.
+
+    Markers exist only when a preview window/video is rendered (``visualize``), as in mjlab:
+    Isaac hides them from secondary rays only, so training cameras could otherwise see them.
+    """
+    from shared.assembly.abstract import abstract_entities, commanded, commanded_entity, reset_areas
     from shared.assembly.targets import visualization
-    shown, areas = set(visualization(settings)), reset_areas(settings)
+    shown, areas = set(visualization(settings)) if visualize else set(), reset_areas(settings)
+    held = commanded(settings)
     for node in abstract_entities(settings).values():
-        if node.reset is None and node.name not in shown:
+        if node.name not in held and node.name not in shown:
             continue
         key = term_name(node.name)
         if hasattr(output['commands'], key):
             raise ValueError('Reserved abstract command name: ' + key)
         seconds = node.reset.interval if node.reset is not None and node.reset.interval else 1e9
-        entity = {'shape': node.shape, 'size': list(node.size), 'pose': asdict(node.pose),
-                  'reset': None if node.reset is None else asdict(node.reset),
-                  'mount': None if node.mount is None else entity_key(settings, node.mount.entity)}
         setattr(output['commands'], key, _config_type()(
-            entity=entity, areas=areas, resampling_time_range=(seconds, seconds),
-            debug_vis=node.name in shown, marker_path='/Visuals/' + key))
+            entity=commanded_entity(settings, node), areas=areas,
+            resampling_time_range=(seconds, seconds), debug_vis=node.name in shown, marker_path='/Visuals/' + key))
 
 
 def reset_root_in_regions(env, env_ids, *, rules, areas):

@@ -391,7 +391,14 @@ class IsaacAssemblyWorld(RuntimeWorld):
     def _static_pose(self, asset):
         import torch
         position, orientation = asset.get_world_poses()
-        return self._local_pose(torch.cat((position, orientation), dim=-1))
+        pose = torch.cat((position, orientation), dim=-1)
+        if asset.prim_paths[0].startswith(self.scene.env_prim_paths[0] + "/"):
+            # Lab builds static views before cloning, so they hold env_0 only; the
+            # clones share its local pose because static meshes never move.
+            pose = pose[:1].clone()
+            pose[:, :3] -= self.scene.env_origins[:1]
+            return pose.expand(self.num_envs, 7).clone()
+        return self._local_pose(pose.expand(self.num_envs, 7))
 
     def body_pose(self, mount):
         from isaaclab.assets import Articulation, RigidObject

@@ -4,9 +4,16 @@ from .control import load_factory, component_observations
 
 
 class ComponentInput:
-    """Read named native tensors without flattening, encoding or adding noise."""
+    """Read named native tensors without flattening, encoding or adding noise.
+
+    Observations listed in ``history`` are kept as per-environment windows [B, T, ...]
+    (oldest -> newest, see shared/assembly/history.py). A window advances once per decision
+    of this component; reads in between (decode, initial, terminal snapshots restored
+    afterwards) return the stored window.
+    """
     def __init__(self, config, env, links, settings, *, bind_reader, robots=None):
         from shared.assembly.signals import Signals, Signal, Observation
+        from shared.assembly.history import HistoryWindow, validate_history
         # Generated <Role>Obs of the project, so fixed components and decode get the same typed
         # view (and robot methods) as written in policy.py; plain views without a project.
         self.view_type, self.robots = config.get('_view'), robots
@@ -18,22 +25,63 @@ class ComponentInput:
             else:
                 reader = bind_reader(source)
             self.signals.register(source, Signal(reader))
-        self.last = {key: torch.zeros_like(value) for key, value in self.selection.read(self.signals).items()}
+        current = self.selection.read(self.signals)
+        history = validate_history(config.get('history'), self.selection.fields)
+        self.windows = {source: HistoryWindow(current[source], length) for source, length in history.items()}
+        self.pending = {source: torch.ones_like(window.count, dtype=torch.bool) for source, window in self.windows.items()}
+        self.last = {key: self.windows[key].buffer if key in self.windows else torch.zeros_like(value)
+                     for key, value in current.items()}
 
-    def read(self, source):
+    def read(self, source, rows=None):
+        """Current value; for a windowed source push it into ``rows`` (None: only show the window)."""
         value = self.signals.read(source)
-        self.last[source].copy_(value)
+        window = self.windows.get(source)
+        if window is None:
+            self.last[source].copy_(value)
+        elif rows is None:
+            window.peek(value)
+        else:
+            window.push(value, rows)
         return self.last[source]
 
-    def __call__(self):
+    def observe(self, source):
+        """Native observation term read: windows advance once per decision, however often the
+        manager computes (repeated or partial-reset computes push only rows still pending)."""
+        if source not in self.windows:
+            return self.read(source)
+        rows = self.pending[source].clone()
+        self.pending[source].zero_()
+        return self.read(source, rows)
+
+    def mark(self, env_ids=None):
+        for pending in self.pending.values():
+            pending[slice(None) if env_ids is None else env_ids] = True
+
+    def __call__(self, rows=None):
         if not isinstance(self.view_type, type):
             from shared.assembly.objects import ObjectView
             self.view_type = load_factory(self.view_type) if self.view_type else ObjectView
-        return self.view_type({source: self.read(source) for source in self.selection.fields}, robots=self.robots)
+        return self.view_type({source: self.read(source, rows) for source in self.selection.fields}, robots=self.robots)
 
     def reset(self, env_ids):
-        for value in self.last.values():
-            value[slice(None) if env_ids is None else env_ids] = 0
+        for key, value in self.last.items():
+            if key in self.windows:
+                self.windows[key].reset(env_ids)
+            else:
+                value[slice(None) if env_ids is None else env_ids] = 0
+        self.mark(env_ids)
+
+    def state(self):
+        return ({k: v.clone() for k, v in self.last.items()},
+                {k: (w.count.clone(), self.pending[k].clone()) for k, w in self.windows.items()})
+
+    def restore(self, state):
+        inputs, windows = state
+        for field, value in inputs.items():
+            self.last[field].copy_(value)
+        for field, (count, pending) in windows.items():
+            self.windows[field].count.copy_(count)
+            self.pending[field].copy_(pending)
 
 
 class FeedbackChain:
@@ -75,8 +123,9 @@ class FeedbackChain:
             self.previous['executor'].copy_(self.initial_output)
 
 
-    def _infer(self, name):
-        value = self.models[name](self.readers[name]())
+    def _infer(self, name, rows=None):
+        # A fixed component's decision advances its input windows for the deciding rows.
+        value = self.models[name](self.readers[name](True if rows is None else rows))
         if not isinstance(value, torch.Tensor) or value.shape != self.outputs[name].shape:
             raise ValueError(f'{name} returned an invalid output shape or non-finite values')
         torch._assert_async(torch.isfinite(value).all(), f'Non-finite {name} action')
@@ -89,13 +138,13 @@ class FeedbackChain:
                 update = self.planner_due <= step
                 if update.any():
                     previous_input = {k: v.clone() for k, v in self.readers['planner'].last.items()}
-                    value = self._infer('planner')
+                    value = self._infer('planner', update)
                     for key, cached_input in previous_input.items():
                         self.readers['planner'].last[key][~update] = cached_input[~update]
                     self.previous['planner'][update] = self.outputs['planner'][update]
                     self.outputs['planner'][update] = value[update]
                     self.planner_due[update] = step + self.periods['planner'] // self.periods['executor']
-            return self.readers[self.selected].read(source)
+            return self.readers[self.selected].observe(source)
 
     def process(self, action):
         if action.shape != self.outputs[self.selected].shape:
@@ -103,6 +152,8 @@ class FeedbackChain:
         torch._assert_async(torch.isfinite(action).all(), 'Non-finite control action')
         self.previous[self.selected].copy_(self.outputs[self.selected])
         self.outputs[self.selected].copy_(action)
+        # Decision boundary: the next native observation compute advances the trained role's windows.
+        self.readers[self.selected].mark()
 
     def advance(self):
         with torch.no_grad():
@@ -125,17 +176,17 @@ class FeedbackChain:
         self.planner_due[ids] = -1
 
     def snapshot_state(self):
+        # planner_due stays last; component inputs include window contents, counts and pending rows.
         return ({k: v.clone() for k, v in self.outputs.items()},
                 {k: v.clone() for k, v in self.previous.items()},
-                {k: {field: value.clone() for field, value in v.last.items()} for k, v in self.readers.items()}, self.planner_due.clone())
+                {k: v.state() for k, v in self.readers.items()}, self.planner_due.clone())
 
     def restore_state(self, state):
         outputs, previous, inputs, due = state
         for key in outputs:
             self.outputs[key].copy_(outputs[key])
             self.previous[key].copy_(previous[key])
-            for field, value in inputs[key].items():
-                self.readers[key].last[field].copy_(value)
+            self.readers[key].restore(inputs[key])
         self.planner_due.copy_(due)
 
     def read(self, role, field):

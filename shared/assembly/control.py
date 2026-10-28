@@ -25,8 +25,11 @@ def component_observations(selection):
 
 
 def validate_outputs(outputs):
-    if not isinstance(outputs, dict) or not outputs:
+    if not isinstance(outputs, dict):
         raise ValueError('control.output must map names to control bindings')
+    if not outputs:
+        raise ValueError('control.output is empty, so the executor drives no joints (deleting the controlled '
+                         'entity removes its targets); select control targets, then match decode_action in policy.py')
     for key, output in outputs.items():
         if not isinstance(key, str) or not key.isidentifier() or key.startswith('_'):
             raise ValueError('Control target names must be public Python identifiers')
@@ -96,6 +99,39 @@ def free_target_name(outputs, base):
     while f'{base}_{index}' in outputs:
         index += 1
     return f'{base}_{index}'
+
+
+def observation_order(selected, catalog):
+    """Editor list order: the selected terms keep their saved order (the model's input order); each
+    unselected catalog term follows the selected term that precedes it in the catalog. Ticking a term
+    again therefore puts it back where it was instead of at the end."""
+    selected, chosen = list(selected), set(selected)
+    order, placed = list(selected), set(selected)
+    anchor = None
+    for key in catalog:
+        if key in chosen:
+            anchor = key
+        elif key not in placed:
+            index = 0 if anchor is None else order.index(anchor) + 1
+            while index < len(order) and order[index] not in chosen:
+                index += 1  # After earlier unselected followers of the same anchor.
+            order.insert(index, key)
+            placed.add(key)
+    return order
+
+
+def default_target_joints(available, controlled, joints=()):
+    """Default joints for a new target: the uncontrolled joints of the first one's kind.
+
+    ``joints`` are kinematic joint records (``name``, ``type``, ``limits``). Arm and fingers differ in
+    type (revolute vs prismatic), legs and wheels in having limits, so a new ``arm`` target leaves the
+    gripper for a target of its own. Without records every uncontrolled joint is chosen.
+    """
+    free = [joint for joint in available if joint not in controlled]
+    kinds = {joint['name']: (joint.get('type'), bool(joint.get('limits'))) for joint in joints}
+    if not free or free[0] not in kinds:
+        return free
+    return [joint for joint in free if kinds.get(joint) == kinds[free[0]]]
 
 
 def toggle_target(outputs, entity, mode, joint, enabled, joints=()):
@@ -194,7 +230,7 @@ def component_config(control, project_package):
         raise ValueError('control.train must select planner or executor')
     control['components'] = {name: components[name] for name in ('planner', 'executor') if name in components}
     for name, cfg in control['components'].items():
-        if cfg.keys() - {'period', 'dimension', 'model', 'parameters', 'observations', 'decode', 'initial'}:
+        if cfg.keys() - {'period', 'dimension', 'model', 'parameters', 'observations', 'decode', 'initial', 'history'}:
             raise ValueError(f'{name}: unsupported component fields')
         if not isinstance(cfg.get('model'), str):
             raise ValueError(f'{name}.model must explicitly select a model factory')
@@ -224,6 +260,9 @@ def component_config(control, project_package):
         if not cfg.get('observations'):
             raise ValueError(f'{name} 尚未选择观察；至少选择一项')
         component_observations(cfg.get('observations'))
+        if 'history' in cfg:
+            from .history import validate_history
+            validate_history(cfg['history'], cfg['observations'], name)
     return control
 
 

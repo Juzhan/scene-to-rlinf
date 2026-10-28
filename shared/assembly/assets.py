@@ -5,7 +5,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Literal, get_args
 
-BACKENDS = ('isaac', 'mjlab')
+BACKENDS = ('isaac', 'mjlab', 'isaaclab3')
 DEFAULT_BACKEND = 'isaac'
 
 
@@ -87,6 +87,30 @@ def checked_gains(gains):
             raise ValueError(f'gains.{joint}: expected [stiffness, damping] with nonnegative numbers')
         result[joint] = (float(values[0]), float(values[1]))
     return result
+
+
+Go2Actuators = Literal['native', 'supermimic']
+# Go2 drive of Zhengtianjin/go2-supermimic (MIT), whose released actors expect it: explicit DC motors
+# per joint group (stiffness N·m/rad, damping N·m·s/rad, effort and saturation N·m, velocity rad/s,
+# reflected rotor armature kg·m²), its stance (rad) and a command lag of 0-2 physics steps drawn per
+# environment at reset. Every backend reads these numbers; 'native' keeps the backend's own preset.
+GO2_SUPERMIMIC = {
+    'stance': {'.*L_hip_joint': .1, '.*R_hip_joint': -.1, '.*_thigh_joint': .9, '.*_calf_joint': -1.8},
+    'groups': {
+        'hip_thigh': {'joints': ('.*_hip_joint', '.*_thigh_joint'), 'stiffness': 17.692, 'damping': 1.126,
+                      'effort_limit': 23.7, 'saturation_effort': 47.4, 'velocity_limit': 30.1,
+                      'armature': 0.000111842 * 6.33 ** 2},
+        'calf': {'joints': ('.*_calf_joint',), 'stiffness': 39.807, 'damping': 2.534,
+                 'effort_limit': 45.43, 'saturation_effort': 90.86, 'velocity_limit': 20.07,
+                 'armature': 0.000111842 * (6.33 * 1.5) ** 2},
+    },
+    'delay': (0, 2),
+}
+
+
+def go2_parameters(actuators='native'):
+    if actuators not in get_args(Go2Actuators):
+        raise ValueError(f'go2.actuators must be one of {get_args(Go2Actuators)}')
 
 
 def check_parameters(factory, parameters):

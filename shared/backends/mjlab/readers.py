@@ -11,7 +11,7 @@ FIELDS = {'orientation': 'root_link_quat_w', 'linear_velocity': 'root_com_lin_ve
           'joint_velocity': 'joint_vel', 'default_joint_position': 'default_joint_pos',
           'default_joint_velocity': 'default_joint_vel'}
 SENSOR_FIELDS = {'frame_positions', 'rgb', 'distance_to_image_plane', 'distance_to_camera',
-                 'contact_force', 'contact_force_samples'}
+                 'contact_force', 'contact_force_samples', 'ray_hit_positions'}
 SUPPORTED = {*FIELDS, *SENSOR_FIELDS, 'position', 'joint_effort'}
 
 
@@ -39,6 +39,18 @@ def bind_reader(env, settings, path):
     def sensor(key, field, source):
         native = env.scene[key]
         cfg = native.cfg if hasattr(native, 'cfg') else None
+        if field == 'ray_hit_positions':
+            if not hasattr(cfg, 'pattern'):
+                raise ValueError(f'{source}: {key} is not a ray sensor')
+            # (N, rays, 3) relative to each environment origin, like Isaac's ray_hits_w minus env origins.
+            # The rays come from assets.isaac_grid in Isaac's grid order, so no reordering is needed.
+            # mjlab reports a miss as distance -1 with hit_pos_w at the ray start; Isaac reports inf.
+            def hits():
+                import torch
+                data = native.data
+                return torch.where((data.distances < 0)[..., None], torch.inf,
+                                   data.hit_pos_w - env.scene.env_origins[:, None, :])
+            return hits
         if field == 'frame_positions':
             if not hasattr(native, 'frame'):
                 raise ValueError(f'{source}: {key} is not a frame_transformer')
@@ -87,6 +99,10 @@ def bind_reader(env, settings, path):
         if field in SENSOR_FIELDS:
             return sensor(key, field, source)
         entity = env.scene[key]
+        if field == 'position' and hasattr(getattr(entity, 'cfg', None), 'pattern'):
+            # Ray sensor: Isaac's RayCasterData.pos_w is the mount body origin (the sensor pose only
+            # offsets the ray starts); mjlab's pos_w is the same frame body position.
+            return lambda: entity.data.pos_w - env.scene.env_origins
         data = entity.data
         if field == 'position':
             return lambda: data.root_link_pos_w - env.scene.env_origins
@@ -101,7 +117,9 @@ def bind_reader(env, settings, path):
             raise ValueError(f'{source}: native entity has no {attribute}')
         return lambda: getattr(data, attribute)
     def sampled(value):
-        raise NotImplementedError('mjlab randomized abstract entities are not connected yet')
+        from .abstract_terms import term_name
+        key = term_name(value['abstract'])
+        return lambda: env.command_manager.get_term(key).state.read(value['field'])
     from .robot import joint_index, robots
     return bind_common(env, settings, path, bind_physical=physical, bind_sampled_target=sampled,
                        robots=robots(env, settings))

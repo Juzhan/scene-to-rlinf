@@ -57,25 +57,37 @@ def test_editor_save_refreshes_observation_types(tmp_path):
     assert not (project / 'PROJECT_CONTEXT.md').exists()
 
 
-def test_starter_scene_uses_shared_factories(tmp_path):
-    from shared.assembly.assets import factories_for
-    from shared.assembly.layout import load_world_spec
-    from shared.assembly.starter import write_starter_scene
-    scene = write_starter_scene(tmp_path / 'scene.yaml')
-    entries = yaml.safe_load(scene.read_text())['entities']
-    assert [entry['factory'] for entry in entries] == ['ground_plane', 'dome_light', 'franka_panda', 'dex_cube']
-    factories = factories_for('isaac')
-    paths = load_world_spec(scene, factories=factories).index()
-    assert {'world/ground', 'world/robot', 'world/cube'} <= set(paths)
+def test_new_environment_is_a_trainable_template_copy(tmp_path, monkeypatch):
+    from shared.assembly import starter
+    monkeypatch.setattr(starter, 'PROJECTS', tmp_path)
+    scene = starter.create_draft('fresh_env')
+    try:
+        text = scene.read_text()
+        assert not text.lstrip().startswith('{')  # Block YAML, as written by run.py new.
+        data = yaml.safe_load(text)
+        assert data['control']['output'] and set(data['control']['components']) == {'planner', 'executor'}
+        assert {'policy.py', 'task.py', 'train.yaml', 'observation.py'} <= {path.name for path in scene.parent.iterdir()}
+        published = starter.publish_draft(scene, 'fresh_env')
+        assert published == tmp_path / 'fresh_env/scene.yaml' and published.read_text() == text
+        assert not scene.parent.parent.exists()
+        with pytest.raises(FileExistsError):
+            starter.create_draft('fresh_env')
+    finally:
+        shutil.rmtree(scene.parent.parent, ignore_errors=True)
 
 
-def test_edit_opens_browser_by_default(monkeypatch):
+def test_edit_opens_browser_by_default(monkeypatch, tmp_path):
     import run
-    import tools.blender_editor
+    python = tmp_path / 'python'
+    python.touch()
+    monkeypatch.setenv('RLINF_EDITOR_PYTHON', str(python))
     launched = []
-    monkeypatch.setattr(tools.blender_editor, 'main', lambda argv: launched.append(argv) or 0)
-    for extra, command in (([], 'web'), (['--web'], 'web'), (['--blender'], 'open')):
-        monkeypatch.setattr(sys, 'argv', ['run.py', 'edit', 'assembly_lift', *extra])
+    monkeypatch.setattr(run.subprocess, 'call', lambda command, **kwargs: launched.append(command) or 0)
+    for extra in ([], ['--web'], ['--port', '8091']):
+        monkeypatch.setattr(sys, 'argv', ['run.py', 'edit', 'piper_pick', *extra])
         with pytest.raises(SystemExit):
             run.main()
-        assert launched.pop()[0] == command
+        command = launched.pop()
+        assert command[:2] == [str(python), str(run.ROOT / 'tools/web_editor.py')]
+        assert command[2:4] == ['--scene', str(run.ROOT / 'projects/piper_pick/scene.yaml')]
+        assert command[4:] == (['--port', '8091'] if '--port' in extra else [])

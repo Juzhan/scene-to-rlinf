@@ -39,6 +39,35 @@
 当前只保证维护模板走干净依赖。SFT、MuJoCo/VLA、历史 SAC 的能力继续以项目说明为准；
 本轮没有宣称整个工作区的所有历史实验都已摆脱补丁。
 
+## 观察历史窗口
+
+可选配置 `control.components.<角色>.history: {观察路径: T}`（整数 ≥2，键须是该组件已选观察）。
+未配置时行为与之前完全相同。
+
+- **位置**：窗口保存在共享 `ComponentInput`（`shared/assembly/history.py` 的 `HistoryWindow`），
+  它就是该字段的 `last` 张量 `[B, T, ...]`。被训练角色的原生观察项直接返回这个窗口，所以窗口随
+  `states`/`forward_inputs` 存进 RLinf 轨迹，PPO 重算 logprob 时看到的输入相同，模型里没有隐藏状态。
+  固定组件、`decode`/`initial` 和 `<角色>.input.*` 读的是同一份窗口。Isaac 与 mjlab 都经同一个共享
+  运行时，不需要后端钩子。
+- **顺序与补齐**：轴 1 为旧→新。回合内的第一帧会填满所有槽位（与 Isaac/mjlab `CircularBuffer`
+  相同，测试中与 Isaac 实现逐步比对过）。`HistoryWindow.valid` 标出真实观察过的槽位。在线不另加
+  有效位字段：被训练角色的真实帧数是 `min(回合步数+1, T)`，回合步数可由已有的 `simulation.time`
+  和 `simulation.step_dt` 算出。
+- **复位**：按环境清零并重新计数，不跨环境、不跨回合。被训练角色的窗口在一个决策步内只推进一次，
+  重复计算观察不会多推。显式的部分复位只推进被复位的环境。终态快照会显示终止帧，但之后会恢复，
+  不推进在线窗口。
+- **频率**：每个组件按自己的周期推进窗口。planner 窗口里的帧间隔是 planner 周期，executor 窗口里的
+  帧间隔是 executor 周期。决策之间的读取（如 `decode`）返回已存的窗口。
+- **离线数据**：`history_windows(frames, T, episode=, step=)` 复用同一个类。帧必须按该组件的决策
+  频率记录，函数不做重采样。回合变化或步号不连续时重新开窗，绝不跨缺失步拼接。
+- **接口标识**：`history` 在场景 `control` 内，`project_signature` 会把它算进 `interface_sha256`。
+  改变窗口长度、增减字段都会让旧检查点被拒绝，新训练必须写到独立目录。
+- **未选原生 history_length 的原因**：原生窗口只存在于被训练角色的观察组，固定组件和 `decode`
+  看不到。mjlab 终态快照用 `update_history=False`，会漏掉终止帧，与 Isaac 不一致。显式部分复位
+  会给未复位环境多推一帧。原生窗口也没有有效位，离线数据还要另写一套。
+- **尚未提供**：编辑器和 Blender 中没有窗口长度控件（取消选择观察时会同步删除对应条目）。
+  也没有在线有效位字段。
+
 ## 维护约束
 
 扩展优先顺序：原生配置与注册入口 → 共享环境/模型 adapter → 原生支持的子类或钩子。
@@ -65,7 +94,16 @@ mjlab 环境通过现有环境注册入口构建，底层使用 mjlab 原生 man
 
 ## SuperMimic 类世界模型方法
 
-结论先说：**当前 RLinf 不能通过配置或替换项目模型直接复刻 SuperMimic。**
+> **方法版本说明（2026-10-26）**：本节只针对公开
+> [`Zhengtianjin/go2-supermimic`](https://github.com/Zhengtianjin/go2-supermimic)
+> 与 arXiv 2610.28480 摘要所述的 **world model + imagined BPTT** 实现。用户指出
+> 另有 `super-priv-humanoid` 的 **privileged teacher + LiDAR estimator** 路线；
+> 该链接当前返回 404，未核对代码。若目标是后者，训练循环是“特权信息策略 → 监督
+> estimator → student 蒸馏/PPO”，不是世界模型 BPTT，本节“不能直接复刻”的结论
+> 不适用；接入评估需在拿到仓库后补写。
+
+结论先说：**按公开 go2-supermimic 的 world-model 实现**，当前 RLinf 不能通过配置或
+替换项目模型直接复刻 SuperMimic。
 它不是一个 PPO 变体，需要“采集 → 拟合确定性世界模型 → 在想象轨迹上做 BPTT → 更新
 actor/critic”的独立训练循环，而现有 RLinf 具身路径没有这个循环。
 
@@ -108,9 +146,9 @@ actor/critic”的独立训练循环，而现有 RLinf 具身路径没有这个�
 - **可微任务**：chase/dodge 的奖励与终止要在想象中可微。参考仓库也保留两份定义（env 奖励
   用于日志，`imagine.py` 用于训练），需要一致性测试；不能把只读 Task 当作训练目标。
 - **历史与复位**：actor 需要 5 帧历史，世界模型需要回合边界。collector 能看到 reset，
-  应在采集端维护历史；共享观察目前不向模型提供回合边界。
+  应在采集端维护历史；PPO 路径可用 `history` 窗口（见“观察历史窗口”），但世界模型的回合边界仍需另接。
 - **地形查询**：参考的 height scan 由解析地形场生成；我们的地形是烘焙的 USD/MJCF 网格，
-  需要射线或高度场查询。mjlab 后端目前没有 height scan / LiDAR 观察。
+  需要射线或高度场查询。两后端都已有 `height_scanner`（`ray_hit_positions`），mjlab 尚无 LiDAR。
 - **稀有事件与探索**：OU 探索、driver/expert 策略、rare-event archive、RunningNorm 都是
   采集/训练循环的一部分，不属于现有 PPO 配方。
 - **权重与实验目录**：SuperMimic actor 输入是 350/430/735 维，当前 `go2_chase` PPO 是

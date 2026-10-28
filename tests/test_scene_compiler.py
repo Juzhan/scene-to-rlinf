@@ -363,3 +363,46 @@ def test_authored_physical_initial_state_reaches_native_config(native):
     assert cfg.arm.init_state.lin_vel == (1,0,0)
     assert cfg.arm.init_state.ang_vel == (0,0,.5)
     assert preset.init_state.joint_pos == {'.*': 0}
+
+
+class StaticConfig(Config):
+    pass
+
+
+class TerrainConfig(Config):
+    pass
+
+
+@pytest.fixture
+def placement(native, monkeypatch):
+    # Lab's physical configs subclass AssetBaseCfg; sensors and terrains do not.
+    class Rigid(RigidConfig, StaticConfig):
+        pass
+    class Articulated(ArticulationConfig, StaticConfig):
+        pass
+    monkeypatch.setattr(sys.modules["isaaclab.assets"], "AssetBaseCfg", StaticConfig, raising=False)
+    monkeypatch.setattr(sys.modules["isaaclab.assets"], "RigidObjectCfg", Rigid)
+    monkeypatch.setattr(sys.modules["isaaclab.assets"], "ArticulationCfg", Articulated)
+    monkeypatch.setattr(sys.modules["isaaclab.assets"], "DeformableObjectCfg", type("Deformable", (StaticConfig,), {}),
+                        raising=False)
+    terrains = ModuleType("isaaclab.terrains")
+    terrains.TerrainImporterCfg = TerrainConfig
+    monkeypatch.setitem(sys.modules, terrains.__name__, terrains)
+    return Rigid, Articulated
+
+
+def test_static_meshes_keep_cloned_placement_and_reject_terrain_origins(placement):
+    from shared.backends.isaac.scene import authored_reset_assets
+    Rigid, Articulated = placement
+    world = WorldSpec(Scene("world", children=(
+        Robot("robot", factory="robot"), Entity("box", factory="box"), Entity("steps", factory="steps"),
+        Entity("floor", factory="floor", scope="global"), Sensor("scanner", factory="scanner"))))
+    scene = SimpleNamespace(robot=Articulated(), box=Rigid(), steps=StaticConfig(), floor=StaticConfig(),
+                            scanner=SensorConfig())
+    # Lab's static views hold env_0 only; writing every environment through them is out of bounds.
+    assert authored_reset_assets(scene, world) == ["robot", "box"]
+    scene.terrain = TerrainConfig()
+    with pytest.raises(NotImplementedError, match=r"\['steps'\].*scope: global"):
+        authored_reset_assets(scene, world)
+    scene.steps = Rigid()
+    assert authored_reset_assets(scene, world) == ["robot", "box", "steps"]

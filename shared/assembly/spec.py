@@ -99,8 +99,8 @@ class Sensor(Entity):
 class Abstract(Entity):
     """Spatial scene content without a model or physics: point, direction, rectangle or box.
 
-    Its pose is environment-local, or relative to a mounted entity's root.
-    Task and model code decide what it means; see ``abstract.py``.
+    Its pose is environment-local, or relative to a mounted entity's root. Task and
+    model code decide what it means; the Task may move it (``set``), see ``abstract.py``.
     """
     shape: str = "point"
     size: tuple[float, ...] = ()
@@ -324,7 +324,7 @@ class WorldSpec:
             raise ValueError(f"Entity {path}: reset region must be an abstract rectangle or box: {node.reset.region}")
         if area.mount is not None or area.reset is not None:
             raise ValueError(f"Entity {path}: reset region {node.reset.region} must be static "
-                             "(not mounted and not randomized itself)")
+                             "(not mounted or randomized itself)")
         if 2 * node.reset.inset >= min(area.size):
             raise ValueError(f"Entity {path}: reset inset consumes the whole region")
 

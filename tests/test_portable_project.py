@@ -124,6 +124,16 @@ def test_command_line_train_backend_also_moves_evaluation():
     # An evaluation backend that already differed from training stays where it was.
     separate = follow_train_backend(recipe(), ['env.train.init_params.backend=mjlab'], previous='mjlab')
     assert separate.env.eval.init_params.backend == 'isaac'
+    # The isaaclab3 physics engine follows the same way (overrides are already applied to train).
+    engine = lambda: OmegaConf.create({'env': {'train': {'init_params': {'backend': 'isaaclab3', 'physics': 'ovphysx'}},
+                                               'eval': {'init_params': {'backend': 'isaaclab3'}}}})
+    chosen = ['+env.train.init_params.physics=ovphysx']
+    assert follow_train_backend(engine(), chosen).env.eval.init_params.physics == 'ovphysx'
+    assert 'physics' not in follow_train_backend(engine(), chosen + ['+env.eval.init_params.physics=newton']).env.eval.init_params
+    # So does its renderer.
+    rendered = OmegaConf.create({'env': {'train': {'init_params': {'backend': 'isaaclab3', 'renderer': 'ovrtx'}},
+                                         'eval': {'init_params': {'backend': 'isaaclab3'}}}})
+    assert follow_train_backend(rendered, ['+env.train.init_params.renderer=ovrtx']).env.eval.init_params.renderer == 'ovrtx'
 
 
 def test_mjlab_backend_selects_its_own_interpreter(monkeypatch, tmp_path):

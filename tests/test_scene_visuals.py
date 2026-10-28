@@ -2,6 +2,7 @@
 import json
 import shutil
 from pathlib import Path
+import pytest
 from shared.assembly.editing import SceneDocument
 from shared.assembly.visuals import cache_path,geometry_keys,load_visuals
 
@@ -45,7 +46,7 @@ def test_mount_keeps_mesh_cache_but_joint_pose_invalidates(tmp_path):
 
 
 def test_editor_opens_before_native_export(tmp_path, monkeypatch):
-    from tools import blender_editor
+    blender_editor = pytest.importorskip('tools.blender_editor')  # local Blender add-on, not distributed
     scene = tmp_path / 'scene.yaml'
     scene.write_text('schema_version: 1\nname: world\nentities: []\n')
     launched = []
@@ -75,3 +76,37 @@ def test_shared_preview_reused_for_new_instance(tmp_path, monkeypatch):
     assert set(load_visuals(scene)) == {'world/first', 'world/second'}
     monkeypatch.setattr(visuals.subprocess, 'run', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('Must reuse cache')))
     assert visuals.ensure_visuals(scene)['cached']
+
+
+def test_incremental_export_drops_entities_without_native_geometry():
+    """Only uncached assets are spawned; abstract entities following a cached one are not."""
+    from tools.export_scene_visuals import _prepare, geometry_only
+    _, prepared, _ = _prepare(Path(__file__).resolve().parents[1] / 'projects/go2_piper_wholebody/scene.yaml')
+    index = prepared.description.index()
+    assert index['world/ee_workspace'][0].mount.entity == 'world/piperx'
+    cached = {path for path, (node, _) in index.items() if node.factory and path != 'world/robot'}
+    reduced = geometry_only(prepared.description, cached).index()
+    spawned = sorted(path for path, (node, _) in reduced.items() if node.factory)
+    assert spawned == ['world/robot']
+
+
+IL3_PYTHON = Path(__file__).resolve().parents[1] / '.venv-il3/bin/python'
+
+
+@pytest.mark.skipif(not IL3_PYTHON.exists(), reason='isaaclab3 environment (.venv-il3) not installed')
+@pytest.mark.parametrize('entity, body', [('{name: box, factory: box}', None),  # static only: no physics joint
+                                          ('{name: ball, factory: ball}', 'ball')])  # a rigid body is mountable
+def test_isaaclab3_export_of_static_geometry_and_rigid_bodies(tmp_path, entity, body):
+    import json
+    import subprocess
+    (tmp_path / 'train.yaml').write_text('env: {train: {init_params: {backend: isaaclab3}}}\n')
+    (tmp_path / 'scene.yaml').write_text('schema_version: 1\nname: world\nentities:\n'
+                                         '- {name: ground, scope: global, factory: ground_plane}\n'
+                                         f'- {entity}\n')
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run([str(IL3_PYTHON), 'tools/export_scene_visuals.py', '--scene', str(tmp_path / 'scene.yaml'),
+                             '--force'], cwd=root, capture_output=True, text=True, timeout=900)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+    records = json.loads((tmp_path / '.cache/scene_visuals.json').read_text())['entities']
+    name = entity.split(',')[0].split(': ')[1]
+    assert (records[f'world/{name}'].get('initial_state') or {}).get('root_body') == body

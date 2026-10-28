@@ -10,6 +10,12 @@ class Runtime(TaskRuntime):
                          bind_reader=lambda path: bind_reader(env, settings, path), robots=robots(env, settings))
 
 
+def task_set(env, name):
+    """The pose the Task set for one abstract entity this step, or None (no Task, or not moved)."""
+    runtime = getattr(env, '_assembly_python_task', None)
+    return None if runtime is None else runtime.take(name)
+
+
 def evaluate(env, config, settings, field):
     runtime = getattr(env, '_assembly_python_task', None)
     if runtime is None:

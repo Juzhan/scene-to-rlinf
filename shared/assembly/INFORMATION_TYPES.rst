@@ -66,7 +66,8 @@ Signals.describe() 展示 information、entity、source，并附上候选操作�
 * Isaac 显式 targets：固定三维期望位置、线速度、角速度，继承对应属性的类型与环境坐标。
   原生命令描述只用于旧实验兼容，新模板不从原生任务注入目标。
 * 抽象体（``kind: abstract``）：position（m，环境坐标）、orientation（wxyz，环境坐标）、矩形/长方体的 size
-  （全长，m）、方向的 direction（本地 +X 的单位向量，环境坐标）。静态、随机复位、跟随实体根部的读数共用同一字段。
+  （全长，m）、方向的 direction（本地 +X 的单位向量，环境坐标）；未跟随且不作 reset 区域的另有 linear_velocity
+  （m/s，环境坐标，Task set 位移 / 决策步长，未移动或复位后为 0）。静态、随机复位、Task 移动、跟随实体根部的读数共用同一字段，两后端相同。
 * Isaac 独立场景预览：根位姿、速度、质量、关节状态、帧、相机与时钟的主要动态信息。
   任意参数字典、元数据或项目扩展未全部强制转换，允许 unknown。
 * MuJoCo/robosuite 信息目录：物体位姿速度、机器人 TCP/关节、相机。保留原有数组布局，

@@ -31,10 +31,18 @@ def observation_fields(scene, *, catalog_directory=None, settings=None, factorie
     for role, selection in selected_fields(settings).items():
         fields.pop(role + '.input', None)
         if role != 'policy':
+            history = history_lengths(settings).get(role, {})
             for path in selection:
                 if path in fields:
-                    fields[role + '.input.' + path] = fields[path]
+                    fields[role + '.input.' + path] = (dict(fields[path], history=history[path])
+                                                       if path in history else fields[path])
     return settings, fields
+
+
+def history_lengths(settings):
+    """role -> {observation: frames} from control.components.<role>.history (opt-in)."""
+    components = (settings.get('control') or {}).get('components') or {}
+    return {role: dict(cfg.get('history') or {}) for role, cfg in components.items() if isinstance(cfg, dict)}
 
 
 def _contracts(settings):
@@ -55,21 +63,28 @@ def _contracts(settings):
                 note += '；解码前动作，initial 返回同形状'
             lines.append(f'{name}Output = Tensor  # {shape}, {note}\n')
         outputs = control.get('output') or {}
-        if outputs:
-            lines.append('\n\nclass ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致\n')
-            for key, output in outputs.items():
-                if not key.isidentifier() or keyword.iskeyword(key):
-                    raise ValueError(f'Cannot expose control output {key!r} as a Python key; rename it in the scene')
-                joints = list(output.get('joint_names', []))
-                lines.append(f"    {key}: Tensor  # {['B', joint_count(output)]}, {output.get('type')}, "
-                             f"{output.get('asset_name')}: {', '.join(joints)}\n")
+        # Always present, so policy.py still imports and check reports the empty control.output itself.
+        lines.append('\n\nclass ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致\n')
+        if not outputs:
+            lines.append('    pass  # control.output 为空：没有控制目标，无法训练\n')
+        for key, output in outputs.items():
+            if not key.isidentifier() or keyword.iskeyword(key):
+                raise ValueError(f'Cannot expose control output {key!r} as a Python key; rename it in the scene')
+            joints = list(output.get('joint_names', []))
+            lines.append(f"    {key}: Tensor  # {['B', joint_count(output)]}, {output.get('type')}, "
+                         f"{output.get('asset_name')}: {', '.join(joints)}\n")
+    from .abstract import commanded
+    settable = ', '.join(commanded(settings))
     lines.append('\n\nclass TaskResult(TypedDict, total=False):  # evaluate(obs: SceneInfo) 返回；缺省 reward=0, success/failure=False\n'
                  '    # 每决策步评价一次：reward 乘 step_dt 计入回报；success 或 failure 为真即结束该环境的回合。\n'
                  '    # 计时等跨步状态：写 Task 类，在 __init__ 中建 shared.assembly.task_memory.TaskMemory（hold 计时、mean 平均），按环境随复位清零。\n'
                  "    reward: Tensor  # ['B']\n"
                  "    success: Tensor  # ['B'], bool\n"
                  "    failure: Tensor  # ['B'], bool\n"
-                 "    metrics: dict[str, Tensor]  # 名称 -> ['B']；回合最后一步的值记入训练/评估日志 env/task/名称\n")
+                 "    metrics: dict[str, Tensor]  # 名称 -> ['B']；回合最后一步的值记入训练/评估日志 env/task/名称\n"
+                 "    # set：本步把抽象体移到新位置（任务事件），在复位之后、观察之前生效；刚复位的环境保持采样位姿。\n"
+                 "    # 读数 <名>.linear_velocity = 位移 / step_dt。可设置（未跟随、非 reset 区域）：" + (settable or '无') + "\n"
+                 "    set: dict[str, Tensor]  # 抽象体名 -> ['B', 3] 位置或 ['B', 7] xyz + wxyz，环境坐标\n")
     return ''.join(lines)
 
 
@@ -80,11 +95,13 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
                                           factories=factories, terms=terms, extra_fields=extra_fields)
     groups = {'SceneInfo': list(fields)}
     selections = selected_fields(settings)
+    windows = {}
     for role, paths in selections.items():
         missing = set(paths) - fields.keys()
         if missing:
             raise ValueError(f'{role}: unavailable observation fields {sorted(missing)}')
         groups[role.capitalize() + 'Obs' if role != 'policy' else 'Obs'] = paths
+        windows[role.capitalize() + 'Obs'] = history_lengths(settings).get(role, {})
     from .layout import world_spec_from_config
     from .robot import RobotView, robot_frames
     robots = robot_frames(world_spec_from_config(settings, directory=catalog_directory or scene.parent,
@@ -130,8 +147,10 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
                 else:
                     entry = fields[child['_leaf']]
                     info = entry.get('information') or {}
-                    shape = ['B', *(info.get('shape') or [])]
-                    comment = ', '.join(str(v) for v in [shape, info.get('dtype'), info.get('unit'), info.get('frame'), info.get('encoding'), entry.get('label')] if v is not None)
+                    frames = windows.get(root, {}).get(child['_leaf']) or entry.get('history')
+                    shape = ['B', *([frames] if frames else []), *(info.get('shape') or [])]
+                    window = f'{frames} 帧历史 旧→新, 复位后以首帧补齐' if frames else None
+                    comment = ', '.join(str(v) for v in [shape, window, info.get('dtype'), info.get('unit'), info.get('frame'), info.get('encoding'), entry.get('label')] if v is not None)
                     lines.append(f'    {attr}: Tensor  # {comment}\n')
             lines.append('\n\n')
         emit(tree, root)

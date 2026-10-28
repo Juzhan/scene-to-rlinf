@@ -51,7 +51,8 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, viewer=None):
     config = ManagerBasedRLEnvCfg(
         sim=sim.SimulationCfg(**simulation), decimation=decimation, seed=seed,
         scene=build_scene_config(prepared.description, factories=prepared.factories, **world),
-        **build_task_config(settings, term_registry=prepared.terms, task_presets=prepared.tasks),
+        **build_task_config(settings, term_registry=prepared.terms, task_presets=prepared.tasks,
+                             visualize=viewer is not None),
     )
     # Scene assembly operations are regular SDK events after task reset events.
     from .contact_materials import events as material_events
@@ -66,13 +67,9 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, viewer=None):
     # Lab's velocity preset resets only its controlled robot. Every authored
     # physical asset must first share the selected terrain/environment origin;
     # task randomizers and assembly placement rules then run on that baseline.
-    from isaaclab.assets import AssetBaseCfg
     from isaaclab.managers import EventTermCfg
-    from .scene import scene_metadata, reset_authored_assets
-    metadata = scene_metadata(prepared.description)
-    asset_names = [key for path, key in metadata.keys.items()
-                   if metadata.scopes[path] == "environment"
-                   and isinstance(getattr(config.scene, key), AssetBaseCfg)]
+    from .scene import authored_reset_assets, reset_authored_assets
+    asset_names = authored_reset_assets(config.scene, prepared.description)
     if {"assembly_defaults", "assembly_initial_poses"} & config.events.keys():
         raise ValueError("Scene event name is reserved: assembly_defaults/assembly_initial_poses")
     if asset_names:
@@ -81,8 +78,13 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, viewer=None):
             "assembly_defaults": EventTermCfg(
             func=reset_authored_assets, mode="reset", params={"asset_names": asset_names}), **config.events}
     if viewer is not None:
+        from shared.assembly.framing import complete_viewer
+        viewer = dict(complete_viewer(viewer, prepared.description))
+        follow = viewer.pop("follow", None)
         config.scene.clone_in_fabric = False
         config.viewer.origin_type, config.viewer.env_index = "env", 0
+        if follow is not None:  # Eye/lookat move with the robot root of environment 0.
+            config.viewer.origin_type, config.viewer.asset_name = "asset_root", follow
         for name, value in viewer.items():
             setattr(config.viewer, name, value)
     return config

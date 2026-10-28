@@ -17,7 +17,10 @@ def validate_project(description, settings, terms, *, tasks=None, factories=None
     scene_fields = {'schema_version', 'name', 'entities', 'connections', 'simulation', 'world', 'authoring', 'visualization'}
     layout = {k: v for k, v in settings.items() if k in scene_fields}
     layout['world'] = {k: v for k, v in layout.get('world', {}).items() if k != 'decimation'}
-    validate(description, layout)
+    # Environment step length bounds sensor update periods (sensors refresh once per step).
+    decimation = settings.get('world', {}).get('decimation')
+    step_dt = decimation * settings.get('simulation', {}).get('dt', .005) if isinstance(decimation, int) else None
+    validate(description, layout, step_dt=step_dt)
     if 'object_api' not in terms:
         raise ValueError('mjlab projects use the shared Python task.py contract; native Isaac task presets are not portable')
     if require_training and 'control' not in settings:

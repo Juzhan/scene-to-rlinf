@@ -70,18 +70,21 @@ NAVIGATION = {'name': 'world', 'entities': [
 
 def test_dynamic_navigation_target_changes_are_visible_to_task_and_observation():
     targets = target_catalog(NAVIGATION)
-    command = SimpleNamespace(command=torch.tensor([[1., 2., 0., 1., 0., 0., 0.], [3., 4., 0., 0., 0., 0., 1.]]))
+    from shared.assembly.abstract import tensor_field
+    state = SimpleNamespace(pose=torch.tensor([[1., 2., 0., 1., 0., 0., 0.], [3., 4., 0., 0., 0., 0., 1.]]))
+    state.read = lambda field: tensor_field(state.pose, field)
+    command = SimpleNamespace(state=state)
     env = SimpleNamespace(num_envs=2, device='cpu', step_dt=.2, common_step_counter=1, extras={},
                           command_manager=SimpleNamespace(get_term=lambda name: command))
     path = 'destination.position'
     config = {'metrics': {'goal': {'expr': path}}}
     evaluate_term(env, config, 'success', targets=targets)
-    torch.testing.assert_close(env.extras['task_metrics']['goal']['value'], command.command[:, :3])
-    command.command = command.command * 2  # replacement, not merely in-place mutation
+    torch.testing.assert_close(env.extras['task_metrics']['goal']['value'], state.pose[:, :3])
+    state.pose = state.pose * 2  # replacement, not merely in-place mutation
     env.common_step_counter += 1
     evaluate_term(env, config, 'success', targets=targets)
     torch.testing.assert_close(env.extras['task_metrics']['goal']['value'], read_target(env, targets[path][0]))
-    torch.testing.assert_close(read_target(env, targets['destination.orientation'][0]), command.command[:, 3:])
+    torch.testing.assert_close(read_target(env, targets['destination.orientation'][0]), state.pose[:, 3:])
 
 
 def test_navigation_formula_preserves_original_reward_and_contact_failure():
@@ -123,7 +126,8 @@ def test_abstract_entities_publish_geometry_and_validate_visualization():
     settings = {**NAVIGATION, 'visualization': {'abstract': ['destination']}}
     catalog = target_catalog(settings)
     assert set(catalog) == {'arena.position', 'arena.orientation', 'arena.size',
-                            'destination.position', 'destination.orientation'}
+                            'destination.position', 'destination.orientation',
+                            'destination.linear_velocity'}
     assert catalog['arena.size'][0] == [6., 6.]
     with pytest.raises(ValueError, match='abstract entity name list'):
         target_catalog({**NAVIGATION, 'visualization': {'goals': ['destination']}})

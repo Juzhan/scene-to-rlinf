@@ -242,26 +242,41 @@ def event_configuration(description):
     return events
 
 
+def authored_reset_assets(scene, description):
+    """Per-environment physical assets that take the environment origin on reset.
+
+    Static meshes (plain AssetBaseCfg) are placed once by Lab's cloning: authored
+    pose plus the cloner grid origin, which is env_origins unless a terrain
+    defines its own. They are never moved afterwards: Lab builds their
+    XformPrimView before cloning (env_0 only) and PhysX keeps static colliders
+    where it parsed them.
+    """
+    from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg
+    from isaaclab.terrains import TerrainImporterCfg
+    metadata = scene_metadata(description)
+    local = [key for path, key in metadata.keys.items()
+             if metadata.scopes[path] == "environment" and isinstance(getattr(scene, key), AssetBaseCfg)]
+    physical = (ArticulationCfg, RigidObjectCfg, DeformableObjectCfg)
+    static = [key for key in local if not isinstance(getattr(scene, key), physical)]
+    if static and any(isinstance(value, TerrainImporterCfg) for value in vars(scene).values()):
+        raise NotImplementedError(
+            f"Per-environment static objects {static} stay at the cloned grid origins, but the terrain defines "
+            "its own environment origins; make them scope: global (one copy in world coordinates) or physical "
+            "(e.g. box/usd_object with a mass)")
+    return [key for key in local if key not in static]
+
+
 def reset_authored_assets(env, env_ids, *, asset_names):
     """Default local layout before task randomizers, using Lab's asset API.
 
-    Only per-environment assets are selected by the compiler. Global
-    assets are never translated by an environment origin or partially reset.
+    Only per-environment physical assets are selected (authored_reset_assets).
+    Global assets are never translated by an environment origin or partially reset.
     """
     import torch
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
     for name in asset_names:
         asset = env.scene[name]
-        if not hasattr(asset, 'data'):
-            # Static meshes (e.g. a table) are native XForm views. They need
-            # the same terrain-local placement as physical robots and objects.
-            initial = getattr(env.cfg.scene, name).init_state
-            position = torch.tensor(initial.pos, device=env.device).repeat(len(env_ids), 1)
-            orientation = torch.tensor(initial.rot, device=env.device).repeat(len(env_ids), 1)
-            asset.set_world_poses(positions=position + env.scene.env_origins[env_ids],
-                                  orientations=orientation, indices=env_ids)
-            continue
         state = asset.data.default_root_state[env_ids].clone()
         state[:, :3] += env.scene.env_origins[env_ids]
         asset.write_root_pose_to_sim(state[:, :7], env_ids=env_ids)

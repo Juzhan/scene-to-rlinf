@@ -79,7 +79,8 @@
 - 场景配置只承担实体、目标、观察选择和基础控制。项目 task.py 自动发现，无需 YAML 注册
   evaluate、parameters 或公式；阈值和计算直接写 Python/Torch。
 - task.py 提供 evaluate(obs: SceneInfo)，有状态时提供 Task.evaluate(self, obs: SceneInfo)。
-  返回 reward/success/failure/metrics 字典，每项按环境输出；缺省 reward=0、success/failure=False。
+  返回 reward/success/failure/metrics 字典，每项按环境输出；缺省 reward=0、success/failure=False；
+  可选 set（抽象体名 -> 位置/位姿）是 Task 发起的每步事件。
   不负责模型加载、窗口、仿真 step/reset 或训练循环。
 - 共享接入层将 Task 接到 Isaac 原生奖励/终止项，同一决策步只评价一次；原生奖励仍乘 step_dt。
   需要跨步统计可用 TaskMemory，按环境复位；复杂项目状态可提供 reset(env_ids)。
@@ -92,7 +93,12 @@
   只是没有模型和物理。没有 goal/随机区域类型，含义由 Task 或模型代码决定；不再有 `regions:` 段。
   抽象体可用 `reset`（region/yaw_range/interval）随机放置；任何实体的 `reset.region` 引用静态矩形/长方体
   抽象体的场景路径 `world/<名>`。`mount` 只让抽象体读数跟随实体根部，不是物理约束，且不能再随机复位。
-  相对量在模型或 Task 代码计算；仿真显示开关为 `visualization.abstract: [名称]`。mjlab 仅支持静态和跟随读数。
+  相对量在模型或 Task 代码计算；仿真显示开关为 `visualization.abstract: [名称]`，两后端形状尺寸共用一份规格，仅在项目预览 view/record 画出（显式 --backend 的物理查看器不画）。
+  回合内移动抽象体是任务设定，不写进 scene.yaml：evaluate 返回 `set: {名: [B,3] 位置或 [B,7] xyz+wxyz}`，
+  由后端原生 command 项在复位之后、观察之前生效；刚复位的环境保持采样位姿，Task 看到的是策略上一步观察到的位置。
+  可移动的是未跟随、且不被任何 `reset.region` 引用的抽象体，它们另有 `<名>.linear_velocity`（位移/step_dt，复位后为 0）；
+  区域保持静态常量，非法 set 运行时报错并写明实体名。决策步长用 obs.simulation.step_dt。物理实体的 Task 事件尚未接入。
+  两后端同样支持静态、随机复位、Task 移动和跟随读数。
 - 统一入口负责评估/录像/汇总。MuJoCo/VLA 专用项目尚未自动迁移到这套 Python Task 运行接入。
 
 ## 7. 历史、数据与权重兼容
@@ -135,6 +141,8 @@
 ## 10. Planner / Executor 与 RLinf 接入
 
 - 默认模板 planner_executor 生成 scene.yaml、policy.py、task.py、observation.py、train.yaml 和入口。
+  场景项目的 train.yaml 必须写明 `env.train.init_params.backend`（新项目为 isaaclab3）；未写明的旧项目沿用
+  configs/state_ppo.yaml 的 isaac，check 给出 WARN，复制这类项目时把 isaac 显式写进新 train.yaml。
   两个模型工厂显式配置，control.train 选择训练角色。固定模型 forward(obs) 返回动作 Tensor。
   默认 planner 将目标位置和朝向拼为输出；简单任务也保留 planner，可仅透传。
 - Policy 的对象输入统一，当前 PPO 示例 forward(obs) 返回动作均值和值预测，actor_logstd 是
@@ -157,7 +165,7 @@
 
 ## 命名多终点控制
 
-- 四个维护模板均保留 planner / executor。control.output 为命名终点映射，每项仅 type/asset_name/joint_names。
+- 维护模板 planner_executor 及 IL3 维护项目（piper_pick、go2_chase、go2_piper_wholebody）均保留 planner / executor。control.output 为命名终点映射，每项仅 type/asset_name/joint_names。
   joint_names 逐个列出关节名，不用正则；列出顺序即动作维度顺序（check、编辑器与 Blender 拒绝正则，旧快照仍可读取）。
 - executor.decode 显式引用 policy.py 中的 decode_action(action, obs)，返回同名 Tensor 字典，供固定和训练执行器共用。
 - 训练动作与控制目标分离：RLinf 记录采样动作的概率，解码后的目标直接下发各原生控制项，不重新采样或按目标计算概率。
@@ -171,7 +179,7 @@
 ## 原生 RLinf 依赖边界
 
 - 默认 `run.py` 使用 `third_party/RLinf-upstream` 的干净固定提交；不修改第三方源码，也不以全局 monkey patch 代替源码补丁。
-- 维护中的四个模板使用原生 PPO 学习率设置和 sampling_params；`do_sample` 在共享模型适配器内转换为采样/确定性推理。
+- 维护模板及 IL3 维护项目使用原生 PPO 学习率设置和 sampling_params；`do_sample` 在共享模型适配器内转换为采样/确定性推理。
 - `third_party/RLinf` 暂存历史实验的补丁，不是新项目运行依赖。依赖 adaptive_kl_target、SAC 样本预算等扩展的旧配方须显式选择历史 RLINF_ROOT，不能静默忽略配置。
 - 历史 YAML 公式实现收于 `shared/assembly/legacy`；Python Task 主路径不导入它。新项目不使用该包。
 - 依赖审计及当前验证边界见 `docs/RLINF_INTEGRATION.md`。不要把 CPU 协议测试或本地梯度更新描述为 RLinf 分布式训练验收。
@@ -180,7 +188,7 @@
 
 - `projects/dual_backend_scene` 已具备同一份 scene/policy/task/observation/train 定义；train 的 `env.train.init_params.backend` 选择后端，不复制配方。
 - 公共观察字段、双组件调度、动作结果校验和 Python Task runtime 位于 shared/assembly；两后端只绑定原生读数/控制项/managers。不得在 mjlab 复制策略或 Task 计算循环。
-- mjlab 已接通原生 GPU 环境及原生 RLinf PPO，支持 check/inspect/smoke/train/evaluate/view/record（view 用 MuJoCo 被动窗口显示 env 0）；已验证短 rollout、部分复位、终止观察和参数更新。显式 --backend mjlab 的 inspect/view 仍仅查看物理场景，不运行策略。
+- mjlab 已接通原生 GPU 环境及原生 RLinf PPO，支持 check/smoke/train/evaluate/view/record（view 用 MuJoCo 被动窗口显示 env 0）；已验证短 rollout、部分复位、终止观察和参数更新。显式 --backend mjlab 的 view 仍仅查看物理场景，不运行策略。
 - `.venv-mjlab` 为增量验证环境，不升级现有 Isaac 依赖；Go2 两后端共用 `assets/go2/`（USD 与其转换 MJCF，来源见 `source/SOURCE.json`）。
 - 新机器人/物体资产用 `run.py asset convert` 同时备好 USD 与 MJCF，记录 ASSET.json 并通过对齐检查；不手写转换器，不在转换文件里写执行器增益，对齐不通过时不静默修正。
 - 后续按 `docs/SCENE_BACKENDS.md` 扩展传感器和连接，不把短训练参数更新当作学会任务；关节顺序以 ASSET.json `joint_order`（= Isaac 顺序）为准，由各后端读数换序；同名资产仍不保证动力学/权重兼容。

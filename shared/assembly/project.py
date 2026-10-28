@@ -37,20 +37,20 @@ def backend_interpreter(backend):
 
 
 def follow_train_backend(cfg, overrides, previous=None):
-    """A backend chosen for training on the command line also moves evaluation.
+    """A backend (or a backend's physics engine or renderer) chosen for training on the command line also moves evaluation.
 
     Recipes resolve ``env.eval`` from ``env.train`` before command-line overrides apply, so
     without this a train override would silently leave evaluation on the old simulator.
-    An explicit eval backend, or an eval backend that already differed (``previous``), is kept.
+    An explicit eval choice, or an eval backend that already differed (``previous``), is kept.
     """
     keys = {item.lstrip('+').split('=', 1)[0] for item in overrides}
-    if 'env.train.init_params.backend' not in keys or 'env.eval.init_params.backend' in keys:
-        return cfg
     if previous is not None and selected_backend(cfg.env.eval.init_params) != previous:
         return cfg
     from omegaconf import open_dict
     with open_dict(cfg):
-        cfg.env.eval.init_params.backend = cfg.env.train.init_params.backend
+        for name in ('backend', 'physics', 'renderer'):
+            if f'env.train.init_params.{name}' in keys and f'env.eval.init_params.{name}' not in keys:
+                cfg.env.eval.init_params[name] = cfg.env.train.init_params[name]
     return cfg
 
 
@@ -124,7 +124,7 @@ def _check_factory(name, parameters, factories, location):
         raise ValueError(f"{location}: factory {name!r}: {error}") from error
 
 
-def prepare_geometry(scene_config, *, project_package=None):
+def prepare_geometry(scene_config, *, project_package=None, backend=DEFAULT_BACKEND):
     """Scene tree and asset factories only, for visual export of a scene still being edited.
 
     Control, observations and Task are not compiled: an unfinished control section
@@ -132,7 +132,7 @@ def prepare_geometry(scene_config, *, project_package=None):
     """
     from .layout import load_scene_config, load_world_spec
     path = Path(scene_config).expanduser().resolve()
-    assets, _, _ = project_registry(project_package)
+    assets, _, _ = project_registry(project_package, backend=backend)
     settings = load_scene_config(path)
     application = {"headless": True, "enable_cameras": False, **settings.get("application", {})}
     application.update(headless=True, enable_cameras=False)
@@ -239,7 +239,7 @@ def check_project(cfg, *, scene_config, project_package=None, **registries):
             "connections": len(joints), "observations": prepared.settings["observations"],
             "actions": list(prepared.settings["actions"]), "task": "task.py" if "object_api" in prepared.terms else prepared.settings.get("task", {}).get("preset", "custom"),
             "capabilities": {"backend": prepared.backend, "training": "RLinf PPO", "task": "Python" if "object_api" in prepared.terms else "legacy native terms",
-                             "commands": ["check", "inspect", "view", "record", "smoke", "train", "evaluate"],
+                             "commands": ["check", "view", "record", "smoke", "train", "evaluate"],
                              "validation": "static; runtime capabilities require smoke/evaluation"},
             "layout": layout, "physical_connections": [asdict(joint) for joint in joints],
             "layout_note": "Poses are authored relative to logical parents; sensor mounts use body-local poses. "

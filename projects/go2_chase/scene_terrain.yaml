@@ -1,0 +1,170 @@
+schema_version: 1
+name: world
+application:
+  headless: true
+  enable_cameras: false
+  fast_shutdown: false
+simulation:
+  dt: 0.005
+  render_interval: 4
+  physics_material:
+    friction_combine_mode: multiply
+    restitution_combine_mode: multiply
+    static_friction: 1.0
+    dynamic_friction: 1.0
+  gravity:
+    - 0.0
+    - 0.0
+    - -9.81
+world:
+  env_spacing: 6.0
+  contact_materials: {}
+entities:
+  - name: terrain
+    factory: usd_object
+    parameters:
+      usd_path: assets/terrains/rough/usd/rough.usda
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.0
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+  - name: sky_light
+    scope: global
+    factory: clear_sky
+    prim_name: skyLight
+  - name: robot
+    factory: go2
+    prim_name: Robot
+    kind: robot
+    parameters:
+      actuators: supermimic
+    pose:
+      position:
+        - 0.0
+        - 0.0
+        - 0.4
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+  - name: ball
+    kind: abstract
+    shape: point
+    pose:
+      position:
+        - 2.0
+        - 0.0
+        - 0.3
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+    reset:
+      region: world/ball_area
+      yaw_range:
+        - 0.0
+        - 0.0
+  - name: ball_area
+    kind: abstract
+    shape: rectangle
+    size:
+      - 2.0
+      - 3.0
+    pose:
+      position:
+        - 2.0
+        - 0.0
+        - 0.3
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+  - name: head
+    factory: frame_transformer
+    kind: sensor
+    parameters:
+      target_body: base
+      target_position:
+        - 0.32
+        - 0.0
+        - 0.1
+    mount:
+      entity: world/robot
+      body: base
+    pose:
+      position:
+        - 0.32
+        - 0.0
+        - 0.1
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+control:
+  train: executor
+  components:
+    planner:
+      model: .policy:build_planner
+      dimension: 3
+      period: 0.2
+      observations:
+        - ball.position
+    executor:
+      model: .policy:build_executor
+      parameters:
+        weights: weights/flat.pt
+      dimension: 12
+      period: 0.02
+      observations:
+        - robot.joint_position
+        - robot.joint_velocity
+        - robot.orientation
+        - robot.angular_velocity
+        - robot.position
+        - ball.position
+        - ball.linear_velocity
+        - executor.output
+      history:
+        robot.joint_position: 5
+        robot.joint_velocity: 5
+        robot.orientation: 5
+        robot.angular_velocity: 5
+        robot.position: 5
+        ball.position: 5
+        ball.linear_velocity: 5
+        executor.output: 5
+      initial: .policy:initial_action
+      decode: .policy:decode_action
+  output:
+    legs:
+      type: joint_position
+      asset_name: robot
+      joint_names:
+        - FL_hip_joint
+        - FL_thigh_joint
+        - FL_calf_joint
+        - FR_hip_joint
+        - FR_thigh_joint
+        - FR_calf_joint
+        - RL_hip_joint
+        - RL_thigh_joint
+        - RL_calf_joint
+        - RR_hip_joint
+        - RR_thigh_joint
+        - RR_calf_joint
+connections: []
+visualization:
+  abstract:
+    - ball
+authoring:
+  parents: {}

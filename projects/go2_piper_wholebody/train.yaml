@@ -1,0 +1,50 @@
+defaults:
+- model/mlp_policy@actor.model
+- state_ppo
+- _self_
+# PPO settings of LeggedManip_Lab go2_piper Flat (rsl_rl): 24 steps x 5 epochs x 4 minibatches, lr 5e-4,
+# entropy 0.005, clip 0.2, gamma 0.99, lambda 0.95. The reference uses 4096 envs and an adaptive-KL
+# learning rate (desired KL 0.01), which RLinf lacks; here 2048 envs fit a 16 GB GPU. A fixed 5e-4 ran at
+# KL ~0.05 and diverged after ~1430 epochs, so the rate is lower and decays with RLinf's native cosine schedule.
+runner:
+  max_epochs: 6000
+  save_interval: 250
+  keep_last_checkpoints: 2
+  logger:
+    experiment_name: go2_piper_wholebody
+algorithm:
+  update_epoch: 5
+  entropy_bonus: 0.005
+env:
+  train:
+    total_num_envs: 2048
+    max_steps_per_rollout_epoch: 24
+    # 20 s episodes at the 0.02 s decision step.
+    max_episode_steps: 1000
+    init_params:
+      id: go2_piper_wholebody/Workspace-Planner-Executor-v0
+      # isaaclab3 | isaac | mjlab; physics (isaaclab3 only): newton | ovphysx.
+      # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
+      backend: isaaclab3
+      physics: newton
+  eval:
+    total_num_envs: 16
+    max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+actor:
+  # One epoch of samples (envs x 24) split into 4 minibatches.
+  global_batch_size: 12288
+  micro_batch_size: 4096
+  optim:
+    lr: 0.00015
+    value_lr: 0.00015
+    lr_scheduler: cosine
+    total_training_steps: ${runner.max_epochs}
+    min_lr: 0.00003
+  model:
+    model_type: go2_piper_wholebody__planner_executor_policy
+    obs_dim: null
+    action_dim: auto
+    hidden_dims:
+    - 512
+    - 256
+    - 128
