@@ -124,6 +124,10 @@ bash run.sh evaluate my_task env.eval.total_num_envs=16
 ```
 
 - 物理引擎：命令后加 `env.train.init_params.physics=ovphysx`，评估、预览随之切换。
+- 域随机化：train.yaml `env.train.init_params.randomization` 按实体声明质量、摩擦、质心、推扰，评估默认跟随
+  （写法见 `shared/assembly/randomization.py` 开头）；IL3（Newton/OvPhysX）与 mjlab 支持，Isaac Lab 2 后端会报错。
+- 多条件评估：train.yaml 顶层 `evaluation.conditions` 列出条件（替换随机化或改场景实体），
+  `evaluate <项目> --conditions all` 每个条件单独评估并汇总成表和 `summary.json`（写法见 `tools/conditions.py`）。
 - 后端由项目 train.yaml 的 `env.train.init_params.backend` 决定；没写的旧项目（如 apple）沿用 `configs/state_ppo.yaml` 的 `isaac`（Isaac Lab 2），`check` 会打印 WARN。要在 IL3 上运行，先在其 train.yaml 写上 `backend: isaaclab3`。
 - 训练产物：`outputs/<项目>/runs/<时间>/`，含有效配置与项目源码快照；用
   `evaluate <项目> --snapshot <运行目录> runner.ckpt_path=<.../full_weights.pt>` 按当时的代码回放。
@@ -165,11 +169,12 @@ bash run.sh evaluate go2_chase --config train_terrain env.eval.total_num_envs=16
 ### go2_piper_wholebody：四足加机械臂全身控制
 
 Go2 背 Piper X，在粗糙地块上同时跟踪机身速度命令和末端目标（复刻 LeggedManip_Lab GO2-PIPER），
-`wholebody.pt` 在 mjlab 上训练。
+`wholebody.pt` 在 IL3 Newton 上带域随机化训练。
 
 ```bash
 bash run.sh view go2_piper_wholebody --actions policy
-bash run.sh evaluate go2_piper_wholebody env.eval.total_num_envs=16 env.train.init_params.physics=ovphysx
+bash run.sh evaluate go2_piper_wholebody --conditions all
+bash run.sh evaluate go2_piper_wholebody env.train.init_params.physics=ovphysx
 ```
 
 ### 新项目
@@ -196,11 +201,15 @@ bash run.sh evaluate go2_piper_wholebody env.eval.total_num_envs=16 env.train.in
 | 项目 | Newton | OvPhysX | 说明 |
 | --- | --- | --- | --- |
 | planner_executor | 接口跑通 | — | 4 环境 × 16 步 smoke 契约通过；示例策略未训练 |
-| piper_pick | 完整回合成功（150 回合 100%） | 完整回合成功（108 回合 100%） | 权重来自 mjlab；IL3 短训练只验证到权重更新 |
+| piper_pick | 完整回合成功（150 回合 100%）；Newton 从头训练（带随机化）7 个条件均 100% | 完整回合成功（108 回合 100%）；Newton 训练的随机化策略迁移失败（6–61%） | 发布权重来自 mjlab；IL3 从头训练与条件评估见项目 README |
 | go2_chase | 完整回合成功（平地 100%，粗糙地形 95.5%） | 完整回合成功（平地 100%） | 外部发布权重，未在 IL3 训练 |
-| go2_piper_wholebody | 部分回合完整（63% 轨迹翻倒） | 完整回合成功（0 失败，末端误差 5.6 cm） | Newton 接触与焊接较软，机身低约 4 cm |
+| go2_piper_wholebody | 发布权重（Newton 带随机化训练）5 个条件完整回合，仅强推扰 1/16 翻倒，末端误差 4–6 cm | 同一权重 5 个条件 0 失败 | 同一权重在 mjlab 上 5 个条件也 0 失败；旧的 mjlab 权重在 Newton 上 63% 翻倒，已替换 |
 
-没有项目达到“多条件可靠成功”：都只在各自的默认初始范围内评估，未系统改变物体尺寸、摩擦、质量或地形。
+piper_pick 在 Newton 上从头训练（带质量/摩擦随机化）后，在 7 个条件（原始、训练范围、重方块、低摩擦、
+大/小方块、扩大区域）下各约 100 条轨迹全部成功；只用了单一种子，且同一权重换到 OvPhysX 明显失败，
+因此只能说“Newton 上这些条件下成功”，不是跨引擎的多条件可靠成功。go2_piper_wholebody 在 Newton 上带随机化
+从头训练（现为发布权重）后，在 Newton、OvPhysX、mjlab 的 5 个条件（原始、训练范围、重机身、低摩擦、强推扰）下跑完完整回合
+（每条件 16 条轨迹，单一种子），同样只能称为这些条件下成功。go2_chase 仍只在默认初始范围内评估。
 各项目的详细数字见其 README，后端实现细节与差异见 [SCENE_BACKENDS.md](SCENE_BACKENDS.md)。
 
 ## 7. 设计思路
@@ -217,7 +226,8 @@ bash run.sh evaluate go2_piper_wholebody env.eval.total_num_envs=16 env.train.in
 
 ## 8. TODO
 
-- 完善 IL3 接入：Newton 上 wholebody 的接触/焊接参数，IL3 上的 PPO 训练验收，传感器与连接类型补全。
+- 完善 IL3 接入：传感器与连接类型补全；piper_pick 在 Newton 上训练的随机化策略迁移到 OvPhysX 失败，需要跨引擎训练或评估方案。
+- 多条件评估：多种子、更多轨迹、地形与物体尺寸等条件；目前每个结论都只有单一种子。
 - 界面交互：编辑器的选择、聚焦、拖动体验，模板选择与项目管理。
 - 动态场景扩展：Task 移动物理实体（目前只能移动抽象体），回合内增删物体。
 - 虚幻引擎接入：作为新后端按钩子清单分阶段接入，先渲染与场景读取，再控制与训练。

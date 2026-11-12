@@ -243,11 +243,26 @@ def main():
     parser.add_argument("--allow-scene-change", action="store_true", help="Evaluate an intentionally changed scene with the same policy interface")
     parser.add_argument("--allow-shared-change", action="store_true", help="Explicitly accept and record changed shared framework code")
     parser.add_argument("--allow-legacy-checkpoint", action="store_true", help="Explicitly accept weights without a saved project/interface")
+    parser.add_argument("--conditions", help="evaluate: run the recipe's evaluation.conditions (all, or a,b) and tabulate them")
+    parser.add_argument("--condition", help="evaluate: apply one declared evaluation condition")
+    parser.add_argument("--into", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--board", action="store_true", help="train: serve this experiment's TensorBoard records while training")
     parser.add_argument("--board-port", type=int, default=6006, help="first TensorBoard port to try (default 6006)")
     args, overrides = parser.parse_known_args()
     if args.board and args.operation != "train":
         parser.error("--board is only available for train")
+    if (args.conditions or args.condition) and args.operation != "evaluate":
+        parser.error("--conditions/--condition are only available for evaluate")
+    if args.conditions and args.condition:
+        parser.error("Use either --conditions or --condition")
+    conditions = None
+    if args.conditions or args.condition:
+        from tools.conditions import load_conditions, select
+        recipes = {path.stem: path for path in recipe_paths(ROOT / "projects" / (args.project or ""))}
+        if args.config not in recipes:
+            parser.error(f"Not a training recipe: {args.project}/{args.config}")
+        conditions = load_conditions(recipes[args.config])
+        condition_names = select(conditions, args.conditions or args.condition, recipes[args.config])
     if args.operation == "list":
         for directory in project_directories():
             recipes = ", ".join(item.stem for item in recipe_paths(directory)) or "no RLinf recipe"
@@ -325,7 +340,16 @@ def main():
             print(f"Frozen project: {path}", flush=True)
             cfg, module = load_snapshot(path, register=False)
         elif args.operation == "evaluate" and is_assembly_project(module):
-            evaluation_directory(cfg, replay_report or {"checkpoint": None, "untrained_policy": True})
+            destination = evaluation_directory(cfg, replay_report or {"checkpoint": None, "untrained_policy": True},
+                                               args.into)
+            if args.conditions:
+                from tools.conditions import run_all
+                arguments = [item for index, item in enumerate(sys.argv[1:]) if not (
+                    item.startswith("--conditions") or (index and sys.argv[index] == "--conditions"))]
+                raise SystemExit(run_all(condition_names, destination, arguments, sys.executable, ROOT))
+            if args.condition:
+                from tools.conditions import apply_condition
+                apply_condition(cfg, module.project.scene_config, args.condition, conditions[args.condition], destination)
         if replay_report:
             print(json.dumps(replay_report, indent=2, ensure_ascii=False), flush=True)
         if preview_options is not None:

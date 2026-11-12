@@ -25,7 +25,8 @@ def _connection(data):
 
 
 def _root_reset(data):
-    data = _fields(data, ("states", "pose_range", "region", "yaw_range", "inset", "interval"), "reset")
+    data = _fields(data, ("states", "pose_range", "region", "yaw_range", "inset", "interval", "joint_positions"),
+                   "reset")
     states = []
     for entry in data.get("states", ()):
         entry = _fields(entry, ("position", "orientation"), "reset state")
@@ -33,14 +34,16 @@ def _root_reset(data):
             raise ValueError("Reset state requires an environment-local position")
         states.append(Pose(**entry))
     return RootReset(tuple(states), data.get("pose_range", {}), data.get("region"),
-                     data.get("yaw_range", (0., 0.)), data.get("inset", 0.), data.get("interval"))
+                     data.get("yaw_range", (0., 0.)), data.get("inset", 0.), data.get("interval"),
+                     data.get("joint_positions", {}))
 
 
 def _expand_entity(data, directory, stack=()):
     """Expand source-relative files before filtering cameras or patching children."""
     data = _fields(data, ("name", "kind", "factory", "assembly", "pose", "parameters", "tags",
                           "initial_state", "children", "mount", "connections", "frames", "reset", "camera_only",
-                          "overrides", "connection_overrides", "scope", "meshes", "prim_name", "shape", "size"), "entity")
+                          "overrides", "connection_overrides", "scope", "meshes", "prim_name", "shape", "size",
+                          "kinematic"), "entity")
     if "assembly" in data:
         _fields(data, ("name", "assembly", "pose", "parameters", "camera_only", "overrides",
                        "connection_overrides", "scope", "prim_name"), "assembly instance")
@@ -84,7 +87,7 @@ def _instance_overrides(root, changes, *, connections=False):
 
     index(root, "")
     allowed = ("parent_pose", "child_pose", "parent", "child") if connections else (
-        "pose", "parameters", "tags", "initial_state", "mount", "scope", "meshes", "prim_name", "reset")
+        "pose", "parameters", "tags", "initial_state", "mount", "scope", "meshes", "prim_name", "reset", "kinematic")
     for path, values in changes.items():
         if not isinstance(path, str) or not (path == "." and not connections or
                 re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(/[A-Za-z_][A-Za-z_0-9]*)*", path)):
@@ -163,7 +166,7 @@ def _entity(data, cameras, factories):
                        connections=tuple(_connection(joint) for joint in data.get("connections", ())),
                        frames=tuple(frames), reset=_root_reset(data["reset"]) if "reset" in data else None,
                        scope=data.get("scope"), prim_name=data.get("prim_name"), meshes=tuple(data.get("meshes", ())),
-                       pose_authored="pose" in data)
+                       pose_authored="pose" in data, kinematic=data.get("kinematic", False))
 
 
 def _read_config(path, fields, label):

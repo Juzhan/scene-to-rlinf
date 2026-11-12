@@ -132,7 +132,7 @@ def test_scene_frames_from_composed_scene_and_cached_provider(tmp_path):
     made = []
     robots = provider(env, {'_robot_frames': frames}, lambda env, name, frames: made.append(name) or object())
     assert robots('piper') is robots('piper') and made == ['piper']
-    with pytest.raises(ValueError, match='not a robot'):
+    with pytest.raises(ValueError, match='neither a robot'):
         robots('cube')
     with pytest.raises(ValueError, match='prepare_scene'):
         provider(env, settings, object)('piper')

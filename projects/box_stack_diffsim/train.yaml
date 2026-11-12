@@ -1,0 +1,31 @@
+defaults:
+  - state_ppo
+  - _self_
+runner:
+  logger:
+    experiment_name: box_stack_diffsim
+  max_epochs: 2
+  save_interval: ${runner.max_epochs}
+  val_check_interval: -1
+env:
+  train:
+    total_num_envs: 4
+    max_episode_steps: 250
+    max_steps_per_rollout_epoch: 8
+    init_params:
+      backend: isaaclab3
+      id: Workspace-Box-Stack-Diffsim-v0
+  eval:
+    total_num_envs: 2
+    rollout_epoch: 3
+    max_steps_per_rollout_epoch: 100
+    is_eval: true
+actor:
+  micro_batch_size: 4
+  global_batch_size: 32
+  model:
+    model_type: box_stack_diffsim_policy
+    obs_dim: null
+    action_dim: auto
+    hidden_dims: [128, 64]
+    network: scratch

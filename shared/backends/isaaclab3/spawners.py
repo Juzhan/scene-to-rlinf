@@ -1,4 +1,5 @@
-"""Isaac Lab 3 USD spawning with colliders on the geometry Newton and OvPhysX read.
+"""Isaac Lab 3 USD spawning with colliders on the geometry Newton and OvPhysX read, and per-face
+materials Newton's renderers draw.
 
 Spawner configs name it (``func = SPAWN_FROM_USD``) in place of Isaac Lab 3's own USD spawner."""
 
@@ -41,10 +42,80 @@ def gprim_colliders(stage, root_path):
         prim.RemoveAPI(UsdPhysics.CollisionAPI)
 
 
+_PHYSICS_NAMESPACES = ('physics:', 'physx', 'newton:', 'mjc:')
+
+
+def _copy_properties(source, target):
+    """Authored non-physics attributes (with primvar metadata) and material bindings of ``source``."""
+    from pxr import UsdShade
+    for attribute in source.GetAuthoredAttributes():
+        name = attribute.GetName()
+        if name.startswith(_PHYSICS_NAMESPACES) or not attribute.HasAuthoredValue():
+            continue
+        copy = target.CreateAttribute(name, attribute.GetTypeName(), attribute.IsCustom())
+        copy.Set(attribute.Get())
+        for key in ('interpolation', 'elementSize'):
+            if attribute.HasMetadata(key):
+                copy.SetMetadata(key, attribute.GetMetadata(key))
+    bindings = [relation for relation in source.GetRelationships()
+                if relation.GetName().startswith('material:binding') and relation.GetTargets()]
+    if bindings:
+        UsdShade.MaterialBindingAPI.Apply(target)
+    for relation in bindings:
+        copy = target.CreateRelationship(relation.GetName(), relation.IsCustom())
+        copy.SetTargets(relation.GetTargets())
+        if relation.HasMetadata('bindMaterialAs'):
+            copy.SetMetadata('bindMaterialAs', relation.GetMetadata('bindMaterialAs'))
+
+
+def material_subset_visuals(stage, root_path):
+    """Give drawn collider meshes below ``root_path`` with per-face materials a Newton-only visual copy.
+
+    SimReady parts are one mesh that is both collider and visual, with materials bound to
+    GeomSubsets. Newton splits material subsets only on visual-only meshes and draws a visible
+    collider with a single material. Each such collider gets ``render`` purpose (still a collider,
+    still in RTX final renders, hidden from Newton's viewport semantics) and a physics-free sibling
+    copy with ``proxy`` purpose (drawn by Newton, which splits its subsets; not in RTX final
+    renders). Only the in-memory stage changes; instanceable ancestors are made editable."""
+    from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+
+    def drawn(prim):
+        image = UsdGeom.Imageable(prim)
+        return (image.ComputeVisibility() != UsdGeom.Tokens.invisible
+                and image.ComputePurpose() in (UsdGeom.Tokens.default_, UsdGeom.Tokens.proxy))
+
+    def bound(prim):
+        return any(relation.GetName().startswith('material:binding') and relation.GetTargets()
+                   for relation in prim.GetRelationships())
+
+    root = Sdf.Path(root_path)
+    found = [prim.GetPath() for prim in Usd.PrimRange(stage.GetPrimAtPath(root), Usd.TraverseInstanceProxies())
+             if prim.IsA(UsdGeom.Mesh) and prim.HasAPI(UsdPhysics.CollisionAPI) and drawn(prim)
+             and any(bound(subset.GetPrim()) for subset in UsdGeom.Subset.GetAllGeomSubsets(UsdGeom.Imageable(prim)))]
+    for path in found:
+        for prefix in path.GetPrefixes():
+            prim = stage.GetPrimAtPath(prefix)
+            if prefix.HasPrefix(root) and prim.IsInstanceable():
+                prim.SetInstanceable(False)
+    for path in found:
+        prim = stage.GetPrimAtPath(path)
+        name, index = f'{path.name}_visual', 1
+        while stage.GetPrimAtPath(path.GetParentPath().AppendChild(name)):
+            name, index = f'{path.name}_visual{index}', index + 1
+        visual = stage.DefinePrim(path.GetParentPath().AppendChild(name), 'Mesh')
+        _copy_properties(prim, visual)
+        for subset in UsdGeom.Subset.GetAllGeomSubsets(UsdGeom.Imageable(prim)):
+            _copy_properties(subset.GetPrim(), stage.DefinePrim(visual.GetPath().AppendChild(subset.GetPrim().GetName()),
+                                                                'GeomSubset'))
+        UsdGeom.Imageable(visual).CreatePurposeAttr(UsdGeom.Tokens.proxy)
+        UsdGeom.Imageable(prim).CreatePurposeAttr(UsdGeom.Tokens.render)
+
+
 def _spawn_from_usd(prim_path, cfg, *args, **kwargs):
     from isaaclab.sim.spawners.from_files import from_files
     prim = from_files.spawn_from_usd.__wrapped__(prim_path, cfg, *args, **kwargs)
     gprim_colliders(prim.GetStage(), prim_path)
+    material_subset_visuals(prim.GetStage(), prim_path)
     return prim
 
 

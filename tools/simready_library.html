@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SimReady 资产库</title>
+<style>
+:root { --card: 180px; --accent: #2e6edc; --line: #e3e6ea; --muted: #6b7280; --bg: #f6f7f9; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; color: #1f2328;
+       background: var(--bg); height: 100vh; display: grid; grid-template-rows: auto 1fr; overflow: hidden; }
+header { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 10px 16px; background: #fff; border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+#search { flex: 1; min-width: 160px; max-width: 640px; padding: 8px 12px; border: 1px solid #cfd4da; border-radius: 8px; font-size: 15px; }
+#search:focus { outline: 2px solid var(--accent); border-color: transparent; }
+header select, header label { font-size: 13px; color: var(--muted); }
+header label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+#size { width: 90px; }
+header select { padding: 5px; border-radius: 6px; border: 1px solid #cfd4da; color: #1f2328; background: #fff; }
+#job { margin-left: auto; font-size: 12px; color: var(--muted); max-width: min(520px, 40vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#job:empty { display: none; }
+#job.busy, #job.error { padding: 2px 10px; border-radius: 10px; background: #eef4fd; } #job.error { background: #fdecec; }
+#job.busy { color: var(--accent); } #job.error { color: #c62828; }
+main { display: grid; grid-template-columns: 220px 1fr auto; min-height: 0; }
+aside { overflow: auto; padding: 12px 10px 24px; border-right: 1px solid var(--line); background: #fff; }
+aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 6px 6px; }
+aside h2:first-child { margin-top: 0; }
+.facet { display: flex; justify-content: space-between; gap: 6px; width: 100%; padding: 4px 8px; border: 0; border-radius: 6px;
+         background: none; cursor: pointer; font: inherit; color: inherit; text-align: left; }
+.facet:hover { background: #f0f3f7; } .facet.on { background: #e5eefc; color: var(--accent); font-weight: 600; }
+.facet .n { color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 400; }
+.facet.empty { opacity: .4; }
+#catFilter { width: 100%; padding: 5px 8px; margin: 0 0 6px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+#results { overflow: auto; padding: 14px 18px 40px; min-width: 0; }
+#summary { color: var(--muted); font-size: 13px; margin: 0 2px 10px; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card), 1fr)); gap: 14px; }
+.card { background: #fff; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; cursor: pointer; position: relative;
+        transition: box-shadow .12s, border-color .12s; }
+.card:hover { box-shadow: 0 4px 14px rgba(0,0,0,.08); border-color: #c9d3e0; }
+.card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.card .img { aspect-ratio: 1; padding: 6px; background: #fff center/contain no-repeat; display: grid; place-items: center; }
+.card .img img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.card .img.none::after { content: "无预览"; color: #b0b6bf; font-size: 12px; }
+.card .text { padding: 7px 9px 9px; border-top: 1px solid #f0f1f3; }
+.card .name { font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; line-height: 1.3;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card .meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; display: flex; gap: 0 6px; flex-wrap: wrap; }
+.card .meta span + span::before { content: "·"; margin-right: 6px; }
+.badges { position: absolute; top: 6px; left: 6px; right: 6px; display: flex; gap: 4px; justify-content: space-between; align-items: flex-start; pointer-events: none; }
+.badges .tags { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.badge { flex: none; line-height: 1.5; white-space: nowrap; font-size: 11px; padding: 1px 6px; border-radius: 10px; background: rgba(255,255,255,.92); border: 1px solid var(--line); }
+.badge.local { color: #1a7f37; border-color: #b7dfc2; } .badge.cloud { color: #6b7280; }
+.badge.scene { color: #9a5b00; border-color: #f0d29b; } .badge.variants { color: var(--accent); border-color: #c6d7f5; }
+#more { height: 40px; }
+#detail { width: 0; overflow: hidden; background: #fff; border-left: 1px solid var(--line); transition: width .15s; }
+#detail.open { width: min(420px, 100vw); overflow: auto; }
+#detail .inner { padding: 0 16px 28px; width: min(420px, 100vw); }
+#detail .top { position: sticky; top: 0; z-index: 1; display: flex; gap: 8px; align-items: flex-start; margin: 0 -16px 10px;
+               padding: 12px 12px 10px 16px; background: #fff; border-bottom: 1px solid #f0f1f3; }
+#detail .close { flex: none; width: 28px; height: 28px; border: 0; border-radius: 6px; background: none; font-size: 20px; line-height: 1; cursor: pointer; color: var(--muted); }
+#detail .close:hover { background: #f0f3f7; color: #1f2328; }
+#detail .hero { width: 100%; aspect-ratio: 1; background: #fff; border: 1px solid var(--line); border-radius: 10px; object-fit: contain; }
+#detail h3 { flex: 1; margin: 3px 0 0; font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #f0f3f7; cursor: pointer; border: 0; font-family: inherit; }
+dl { display: grid; grid-template-columns: 76px 1fr; gap: 4px 8px; margin: 10px 0; font-size: 13px; }
+dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+code { font-size: 12px; background: #f3f4f6; padding: 0 4px; border-radius: 4px; }
+.variants { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 8px 0 4px; }
+.variants img { width: 100%; aspect-ratio: 1; object-fit: contain; background: #fff; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.variants img.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+form { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; display: grid; gap: 8px; }
+form label { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+form input { padding: 6px 8px; border: 1px solid #cfd4da; border-radius: 6px; font: inherit; width: 100%; }
+.xyz { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+button.add { padding: 9px; border: 0; border-radius: 8px; background: #1f883d; color: #fff; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+button.add:hover:not(:disabled) { background: #1a7f37; }
+button.add:disabled { background: #9db8a5; cursor: default; }
+.bar { height: 6px; background: #eef0f3; border-radius: 3px; overflow: hidden; display: none; }
+.bar.on { display: block; } .bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+#message { font-size: 12.5px; min-height: 1em; } #message.error { color: #c62828; } #message.ok { color: #1a7f37; }
+.hint { font-size: 12px; color: var(--muted); }
+a { color: var(--accent); }
+@media (max-width: 900px) { main { grid-template-columns: 1fr auto; } aside { display: none; }
+  #detail.open { position: fixed; right: 0; top: 0; bottom: 0; z-index: 2; box-shadow: -8px 0 24px rgba(0,0,0,.12); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>SimReady 资产库</h1>
+  <input id="search" type="search" placeholder="搜索名称或类别，如 apple、kitchenware mug（按 / 聚焦）" autocomplete="off">
+  <label>排序 <select id="sort">
+    <option value="relevance">相关度</option><option value="name">名称</option>
+    <option value="category">类别</option><option value="size">大小</option><option value="local">本地优先</option>
+  </select></label>
+  <label><input type="checkbox" id="group" checked> 合并变体</label>
+  <label>大小 <input type="range" id="size" min="120" max="300" step="20" value="180"></label>
+  <span id="job"></span>
+</header>
+<main>
+  <aside>
+    <h2>位置</h2><div id="whereFacets"></div>
+    <h2>来源</h2><div id="sourceFacets"></div>
+    <h2>类别</h2><input id="catFilter" placeholder="筛选类别"><div id="categoryFacets"></div>
+  </aside>
+  <section id="results">
+    <div id="summary">正在读取目录…</div>
+    <div id="grid"></div>
+    <div id="more"></div>
+  </section>
+  <section id="detail"><div class="inner" id="detailInner"></div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = text => String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const mb = bytes => bytes == null ? '' : bytes >= 1e9 ? (bytes / 1e9).toFixed(1) + ' GB' : bytes >= 1e6 ? (bytes / 1e6).toFixed(0) + ' MB' : (bytes / 1e3).toFixed(0) + ' kB';
+const wrapName = name => esc(name).replace(/_/g, '_<wbr>');
+const preview = (entry, size) => `preview/${size}/${encodeURIComponent(entry.publisher)}/${encodeURIComponent(entry.name)}.jpg`;
+const family = name => name.replace(/_[a-z]{0,2}\d{1,3}$/i, '');
+const CHUNK = 120;
+
+const state = {entries: [], byKey: {}, filters: {where: 'all', source: 'all', category: 'all'}, shown: [], rendered: 0, selected: null, variant: null};
+
+function readHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  $('search').value = params.get('q') || '';
+  for (const key of ['where', 'source', 'category']) state.filters[key] = params.get(key) || 'all';
+  if (params.get('sort')) $('sort').value = params.get('sort');
+  if (params.get('group')) $('group').checked = params.get('group') !== '0';
+  return params.get('sel');
+}
+function writeHash() {
+  const params = new URLSearchParams();
+  if ($('search').value) params.set('q', $('search').value);
+  for (const [key, value] of Object.entries(state.filters)) if (value !== 'all') params.set(key, value);
+  if ($('sort').value !== 'relevance') params.set('sort', $('sort').value);
+  if (!$('group').checked) params.set('group', '0');
+  if (state.variant) params.set('sel', state.variant);
+  history.replaceState(null, '', '#' + params.toString());
+}
+
+async function load() {
+  const response = await fetch('api/catalog');
+  const data = await response.json();
+  if (data.loading) { setTimeout(load, 500); return; }
+  state.sources = data.sources; state.license = data.license; state.problems = data.problems;
+  state.entries = data.entries.map(entry => ({...entry, key: entry.publisher + '/' + entry.name, family: entry.publisher + '/' + family(entry.name),
+                                               haystack: (entry.publisher + ' ' + entry.name + ' ' + entry.name.replace(/_/g, ' ')).toLowerCase()}));
+  state.byKey = Object.fromEntries(state.entries.map(entry => [entry.key, entry]));
+  const selected = readHash();
+  refresh();
+  if (selected && state.byKey[selected]) select(selected);
+}
+
+function matches(entry, words, skip) {
+  const f = state.filters;
+  return (skip === 'where' || f.where === 'all' || (f.where === 'local') === entry.local)
+      && (skip === 'source' || f.source === 'all' || entry.publisher === f.source)
+      && (skip === 'category' || f.category === 'all' || entry.category === f.category)
+      && words.every(word => entry.haystack.includes(word));
+}
+function score(entry, words) {  // smaller first: word at a name-part start, then shorter names
+  const parts = entry.name.toLowerCase().split('_');
+  return words.reduce((total, word) => total + (parts.includes(word) ? 0 : parts.some(part => part.startsWith(word)) ? 1 : 2), 0) * 1000 + entry.name.length;
+}
+
+function refresh() {
+  const words = $('search').value.toLowerCase().split(/\s+/).filter(Boolean);
+  let shown = state.entries.filter(entry => matches(entry, words));
+  const sort = $('sort').value, byName = (a, b) => a.name.localeCompare(b.name, undefined, {sensitivity: 'base', numeric: true});
+  const order = {relevance: (a, b) => words.length ? score(a, words) - score(b, words) || byName(a, b) : byName(a, b),
+                 name: byName, category: (a, b) => a.category.localeCompare(b.category, undefined, {sensitivity: 'base'}) || byName(a, b),
+                 size: (a, b) => (b.bytes || 0) - (a.bytes || 0), local: (a, b) => b.local - a.local || byName(a, b)}[sort];
+  shown.sort(order);
+  const total = shown.length;
+  if ($('group').checked) {  // one card per family, the best-ranked member in front
+    const groups = new Map();
+    for (const entry of shown) {
+      if (!groups.has(entry.family)) groups.set(entry.family, []);
+      groups.get(entry.family).push(entry);
+    }
+    shown = [...groups.values()].map(members => ({...members[0], members}));
+  } else shown = shown.map(entry => ({...entry, members: [entry]}));
+  state.shown = shown; state.rendered = 0;
+  $('grid').innerHTML = '';
+  facets(words);
+  const local = state.entries.filter(entry => matches(entry, words) && entry.local).length;
+  const problems = Object.entries(state.problems || {}).map(([source, text]) => `<br>⚠️ ${esc(source)} 未能在线列出，只显示本地：${esc(text.slice(0, 160))}`).join('');
+  $('summary').innerHTML = `${total} 个资产（本地 ${local}）` + ($('group').checked ? ` · ${shown.length} 组` : '') + problems;
+  more();
+  writeHash();
+}
+
+function facets(words) {
+  const count = (skip, field) => {
+    const counts = {};
+    for (const entry of state.entries) if (matches(entry, words, skip)) counts[field(entry)] = (counts[field(entry)] || 0) + 1;
+    return counts;
+  };
+  const button = (group, value, label, n) => `<button class="facet${state.filters[group] === value ? ' on' : ''}${n ? '' : ' empty'}" data-group="${group}" data-value="${esc(value)}"><span>${esc(label)}</span><span class="n">${n ?? ''}</span></button>`;
+  const where = count('where', entry => entry.local ? 'local' : 'online');
+  $('whereFacets').innerHTML = button('where', 'all', '全部', (where.local || 0) + (where.online || 0))
+    + button('where', 'local', '本地', where.local || 0) + button('where', 'online', '在线（添加时下载）', where.online || 0);
+  const sources = count('source', entry => entry.publisher);
+  $('sourceFacets').innerHTML = button('source', 'all', '全部', Object.values(sources).reduce((a, b) => a + b, 0))
+    + Object.keys(state.sources).map(source => button('source', source, source, sources[source] || 0)).join('');
+  const categories = count('category', entry => entry.category), filter = $('catFilter').value.toLowerCase();
+  const names = [...new Set(state.entries.map(entry => entry.category))]
+    .filter(name => state.filters.category === name || (categories[name] && (!filter || name.toLowerCase().includes(filter))))
+    .sort((a, b) => (categories[b] || 0) - (categories[a] || 0) || a.localeCompare(b, undefined, {sensitivity: 'base'}));
+  $('categoryFacets').innerHTML = button('category', 'all', '全部', Object.values(categories).reduce((a, b) => a + b, 0))
+    + names.map(name => button('category', name, name, categories[name] || 0)).join('');
+}
+
+function card(item) {
+  const scene = item.members.reduce((total, entry) => total + (entry.scene || []).length, 0);
+  const local = item.members.filter(entry => entry.local).length;
+  const div = document.createElement('div');
+  div.className = 'card' + (item.members.some(entry => entry.key === state.variant) ? ' sel' : '');
+  div.dataset.key = item.key;
+  const where = local === item.members.length ? '<span class="badge local">本地</span>'
+              : local ? `<span class="badge local">本地 ${local}/${item.members.length}</span>` : '<span class="badge cloud">☁ 在线</span>';
+  div.innerHTML = `<div class="badges">${where}<span class="tags">${item.members.length > 1 ? `<span class="badge variants">${item.members.length} 个变体</span>` : ''}${scene ? `<span class="badge scene">场景中 ${scene}</span>` : ''}</span></div>`
+    + `<div class="img"><img loading="lazy" alt="" src="${preview(item, 320)}"></div>`
+    + `<div class="text"><div class="name">${wrapName(item.members.length > 1 ? family(item.name) : item.name)}</div>`
+    + `<div class="meta"><span>${esc(item.category)}</span>${item.publisher !== 'nvidia' ? `<span>${esc(item.publisher)}</span>` : ''}${item.bytes ? `<span>${mb(item.bytes)}</span>` : ''}</div></div>`;
+  div.querySelector('img').onerror = event => { event.target.remove(); div.querySelector('.img').classList.add('none'); };
+  div.onclick = () => select(item.key, item.members);
+  return div;
+}
+function more() {
+  const fragment = document.createDocumentFragment();
+  for (const item of state.shown.slice(state.rendered, state.rendered + CHUNK)) fragment.appendChild(card(item));
+  state.rendered = Math.min(state.shown.length, state.rendered + CHUNK);
+  $('grid').appendChild(fragment);
+}
+new IntersectionObserver(entries => { if (entries[0].isIntersecting && state.rendered < state.shown.length) more(); },
+                         {root: $('results'), rootMargin: '600px'}).observe($('more'));
+
+async function select(key, members) {
+  const entry = state.byKey[key];
+  if (!entry) return;
+  members = members || state.entries.filter(other => other.family === entry.family);
+  state.selected = {key, members}; state.variant = key;
+  for (const div of document.querySelectorAll('.card')) div.classList.toggle('sel', members.some(member => member.key === div.dataset.key));
+  writeHash();
+  const source = state.sources[entry.publisher];
+  const tree = `https://huggingface.co/datasets/${source.repo}/tree/${source.revision}/${encodeURIComponent(entry.name)}`;
+  $('detail').classList.add('open');
+  $('detailInner').innerHTML = `<div class="top"><h3>${wrapName(entry.name)}</h3><button class="close" title="关闭 (Esc)">×</button></div>
+    <img class="hero" src="${preview(entry, 768)}" alt="">
+    ${members.length > 1 ? `<div class="hint">${members.length} 个变体（← → 切换）</div><div class="variants">${members.map(member =>
+        `<img loading="lazy" src="${preview(member, 320)}" title="${esc(member.name)}" data-key="${esc(member.key)}" class="${member.key === key ? 'sel' : ''}">`).join('')}</div>` : ''}
+    <div class="chips"><button class="chip" data-category="${esc(entry.category)}">类别：${esc(entry.category)}</button><button class="chip" data-source="${esc(entry.publisher)}">来源：${esc(entry.publisher)}</button></div>
+    <dl id="facts"><dt>状态</dt><dd>读取中…</dd></dl>
+    <div class="hint">${esc(state.license)} · <a href="${tree}" target="_blank" rel="noopener">${esc(source.repo)}@${source.revision.slice(0, 8)}</a></div>
+    <form id="addForm">
+      <label>实体名称<input id="entityName" required pattern="[A-Za-z_][A-Za-z0-9_]*" title="Python 标识符"></label>
+      <label>位置 (m)<div class="xyz"><input type="number" step="0.01" value="0" id="px"><input type="number" step="0.01" value="0" id="py"><input type="number" step="0.01" value="0" id="pz"></div></label>
+      <button class="add" id="addButton" type="submit">添加到场景</button>
+      <div class="bar" id="bar"><i></i></div><div id="message"></div>
+      <div class="hint">添加：缺少的文件按固定版本下载到 assets/simready/，包装为 assets/&lt;资产名&gt;（usd_object，按 USD 的刚体与关节动态），再加入编辑器里的场景；保存仍在编辑器中进行。</div>
+    </form>`;
+  $('detailInner').querySelector('.close').onclick = closeDetail;
+  $('detailInner').querySelector('.hero').onerror = event => { event.target.style.visibility = 'hidden'; };
+  for (const image of $('detailInner').querySelectorAll('.variants img')) image.onclick = () => select(image.dataset.key, members);
+  for (const chip of $('detailInner').querySelectorAll('.chip')) chip.onclick = () => {
+    if (chip.dataset.category) state.filters.category = chip.dataset.category; else state.filters.source = chip.dataset.source;
+    refresh();
+  };
+  $('addForm').onsubmit = event => { event.preventDefault(); add(key); };
+  updateJob(state.job);
+  const response = await fetch('api/asset?key=' + encodeURIComponent(key));
+  const info = await response.json();
+  if (state.variant !== key) return;
+  if (!response.ok) { $('facts').innerHTML = `<dt>状态</dt><dd>${esc(info.error)}</dd>`; return; }
+  Object.assign(entry, {local: info.local, scene: info.scene, bytes: info.bytes ?? entry.bytes});
+  const status = info.local ? (info.missing == null ? '本地' : info.missing.count ? `本地，缺 ${info.missing.count} 个文件（${mb(info.missing.bytes)}，添加时补齐）` : '本地，文件齐全')
+                            : '在线' + (info.bytes ? `，约 ${mb(info.bytes)}` : '') + '，添加时下载';
+  $('facts').innerHTML = `<dt>状态</dt><dd>${status}</dd>`
+    + (info.files ? `<dt>文件</dt><dd>${info.files} 个，共 ${mb(info.bytes)}</dd>` : '')
+    + `<dt>USD</dt><dd><code>${esc(info.root || '—')}</code></dd>`
+    + `<dt>包装</dt><dd>${info.wrapper ? `<code>${esc(info.wrapper)}</code>${info.wrapper_other ? '（另一个来源，添加会被拒绝）' : ''}` : `添加时生成 <code>assets/${esc(entry.name)}</code>`}</dd>`
+    + (info.joints != null ? `<dt>关节</dt><dd>${info.joints ? info.joints + ' 个被动关节' : '无关节（单刚体或多刚体）'}</dd>` : '')
+    + `<dt>场景中</dt><dd>${info.scene.length ? info.scene.map(name => `<code>${esc(name)}</code>`).join(' ') : '未使用'}</dd>`;
+  if (!$('entityName').value) $('entityName').value = info.suggested;
+}
+function closeDetail() {
+  $('detail').classList.remove('open'); state.selected = null; state.variant = null;
+  for (const div of document.querySelectorAll('.card.sel')) div.classList.remove('sel');
+  writeHash();
+}
+
+async function add(key) {
+  const position = ['px', 'py', 'pz'].map(id => parseFloat($(id).value) || 0);
+  $('addButton').disabled = true;
+  const response = await fetch('api/add', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                           body: JSON.stringify({key, name: $('entityName').value.trim(), position})});
+  const result = await response.json();
+  if (!response.ok) { $('addButton').disabled = false; message(result.error, 'error'); return; }
+  updateJob(result); poll();
+}
+function message(text, kind) { const node = $('message'); if (node) { node.textContent = text || ''; node.className = kind || ''; } }
+function updateJob(job) {
+  state.job = job;
+  const busy = job && job.running;
+  $('job').textContent = $('job').title = job ? job.message : ''; $('job').className = busy ? 'busy' : job && job.error ? 'error' : '';
+  if (!$('addButton')) return;
+  const mine = job && state.variant === job.key;
+  $('addButton').disabled = !!busy;
+  $('bar').classList.toggle('on', !!(mine && busy));
+  $('bar').firstElementChild.style.width = mine && job.total ? (100 * job.done / job.total).toFixed(0) + '%' : busy ? '15%' : '0';
+  if (mine) message(job.message, job.error ? 'error' : job.running ? '' : 'ok');
+}
+let polling = null;
+async function poll() {
+  clearTimeout(polling);
+  const job = await (await fetch('api/status')).json();
+  const was = state.job && state.job.running;
+  updateJob(job);
+  if (job && job.running) { polling = setTimeout(poll, 600); return; }
+  if (was && job && !job.error && state.byKey[job.key]) {  // added: refresh its badges and the suggested name
+    Object.assign(state.byKey[job.key], {local: true, scene: job.scene || state.byKey[job.key].scene});
+    const keep = state.variant;
+    refresh();
+    if (keep) select(keep, state.selected && state.selected.members);
+  }
+}
+
+$('search').addEventListener('input', () => { clearTimeout(state.typing); state.typing = setTimeout(refresh, 120); });
+for (const id of ['sort', 'group']) $(id).addEventListener('change', refresh);
+$('size').addEventListener('input', event => document.documentElement.style.setProperty('--card', event.target.value + 'px'));
+$('catFilter').addEventListener('input', () => facets($('search').value.toLowerCase().split(/\s+/).filter(Boolean)));
+document.querySelector('aside').addEventListener('click', event => {
+  const button = event.target.closest('.facet');
+  if (!button) return;
+  state.filters[button.dataset.group] = state.filters[button.dataset.group] === button.dataset.value ? 'all' : button.dataset.value;
+  refresh();
+});
+document.addEventListener('keydown', event => {
+  const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if (event.key === '/' && !typing) { event.preventDefault(); $('search').focus(); $('search').select(); }
+  else if (event.key === 'Escape') { if (typing) document.activeElement.blur(); else if (state.selected) closeDetail(); }
+  else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !typing && state.selected) {
+    const {members} = state.selected, index = members.findIndex(member => member.key === state.variant);
+    const step = event.key === 'ArrowRight' ? 1 : -1;
+    if (members.length > 1) select(members[(index + step + members.length) % members.length].key, members);
+    else {  // single variant: move through the result list
+      const at = state.shown.findIndex(item => item.key === state.variant);
+      const next = state.shown[at + step];
+      if (next) select(next.key, next.members);
+    }
+  }
+});
+load();
+poll();
+</script>
+</body>
+</html>

@@ -129,6 +129,10 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0,
             # Shared physical assets must remain visible to every clone's
             # collision group (including global floors and factory equipment).
             native.collision_group = -1
+        if node.reset and node.reset.joint_positions:
+            raise NotImplementedError(f"Entity {path}: joint reset (reset.joint_positions) is only bound on isaaclab3")
+        if node.kinematic:
+            raise NotImplementedError(f"Entity {path}: kinematic entities are only bound on isaaclab3")
         if node.reset:
             from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 

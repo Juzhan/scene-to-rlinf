@@ -21,6 +21,7 @@ def native_interface(native):
     actions = native.action_manager
     result = {
         "backend": getattr(native, 'backend_name', DEFAULT_BACKEND),
+        "physics": getattr(native, 'physics_name', None),
         "observations": {}, "actions": [], "articulations": {},
         "action_dim": actions.total_action_dim, "step_dt": native.step_dt,
     }

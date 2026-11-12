@@ -343,11 +343,15 @@ def usd_robot(usd_path, fix_root_link=True, stiffness=None, damping=None):
                                                                     stiffness=stiffness, damping=damping)})
 
 
-def usd_object(usd_path, mass=None, scale=1.0):
-    """Imported USD prop: static without a mass; with a mass the USD must already carry rigid-body physics."""
+def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False):
+    """Imported USD prop: static without a mass; with a mass the USD must already carry rigid-body physics.
+
+    isaaclab3 follows the USD's own rigid bodies and joints instead (dynamic, fixable in place)."""
     import isaaclab.sim as sim
     from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 
+    if fix_root_link:
+        raise NotImplementedError('usd_object fix_root_link is bound on isaaclab3 only')
     scale = tuple(scale) if isinstance(scale, (list, tuple)) else (float(scale),) * 3
     spawn = sim.UsdFileCfg(usd_path=str(workspace_file(usd_path)), scale=scale)
     if mass is None:

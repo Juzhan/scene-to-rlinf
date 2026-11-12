@@ -17,7 +17,6 @@ from types import UnionType
 from typing import Literal, Union, get_args, get_origin, get_type_hints
 
 from .layout import load_scene_config, world_spec_from_config
-from shared.backends.isaac.assets import FACTORIES
 from .assets import asset_backends, image_outputs
 from shared.backends.isaac.scene import scene_metadata
 from shared.backends.isaac.task_config import _ACTION_CLASSES, _OBSERVATION_NAMES, _TASK_NAMES, _selection
@@ -29,14 +28,15 @@ _ASSETS = {
     "m20": ("M20 轮足机器人", "本地 M20，12 个腿关节与 4 个轮关节；轮子沿用速度驱动参数。", ["articulation", "root_state", "joint_state"]),
     "go2": ("Go2 四足机器人", "原生 Unitree Go2 关节与驱动配置。", ["articulation", "root_state", "joint_state"]),
     "anymal_c": ("ANYmal-C 四足机器人", "原生 ANYbotics ANYmal-C，12 个腿关节与 ANYdrive 执行器配置。", ["articulation", "root_state", "joint_state"]),
-    "franka_panda": ("Franka Panda 机械臂", "原生 Panda 机械臂和双指夹爪。", ["articulation", "root_state", "joint_state"]),
+    "franka_panda": ("Franka Panda 机械臂", "原生 Panda 机械臂和双指夹爪。`tracking: stiff`（仅 isaaclab3）选刚度高、补偿重力的跟踪方式，供笛卡尔增量 IK 使用。", ["articulation", "root_state", "joint_state"]),
     "dex_cube": ("可抓取方块", "原生 DexCube 刚体；尺寸由资产与 scale 决定。", ["rigid_body", "root_state"]),
     "ground_plane": ("平面地面", "各并行环境共享的物理地面。", ["geometry"]),
     "box": ("长方体", "完整边长（米）；质量为空时是静态设施。", ["geometry"]),
     "ball": ("球", "自由刚体球；半径、质量、颜色与摩擦可调。", ["rigid_body", "root_state"]),
     "urdf_robot": ("导入的 URDF 机器人", "工作区内的 URDF，首次使用时转换为 USD（缓存于 .cache/urdf_usd）；所有关节共用一组隐式 PD 增益，请按机器人调整。", ["articulation", "root_state", "joint_state"]),
     "usd_robot": ("导入的 USD 机器人", "工作区内带关节的 USD；未填增益时沿用 USD 中的关节驱动。", ["articulation", "root_state", "joint_state"]),
-    "usd_object": ("导入的 USD 物体", "质量为空时是静态设施；填写质量时 USD 内需已有刚体与碰撞属性。`run.py asset terrain` 生成的双格式地形地块也用它。", ["geometry"]),
+    "usd_articulation": ("导入的带关节 USD 物体", "为已有场景保留，新场景用 usd_object：等同带关节的 usd_object，默认固定根部。", ["root_state", "joint_state"]),
+    "usd_object": ("导入的 USD 物体", "按 USD 中的物理结构仿真（仅 isaaclab3）：单个刚体是动态物体，带关节的多刚体是被动关节物体（不加执行器，关节只受接触及 USD 中的阻尼、限位影响，可读关节位置/速度、声明 frames）；勾选固定根部则原地不动。USD 未写质量的动态刚体须填写质量。USD 中没有刚体时：质量为空是静态几何（如 `run.py asset terrain` 的地形地块），填写质量则以根部为刚体。SimReady 资产先用 `run.py asset simready` 包装。isaac/mjlab 上仍是质量为空即静态。", ["geometry"]),
     "seattle_table": ("工作台", "SeattleLab 工作台资产。", ["geometry"]),
     "terrain": ("程序化地形", "仅 Isaac，只为已有项目保留，不在资产架提供：复用 Isaac Lab 地形生成器按难度课程排布子地形。新场景用 `run.py asset terrain` 生成双后端地块，再以 usd_object 引用。", ["terrain", "geometry"]),
     "height_scanner": ("地形高度扫描器", "从机器人附近向地形投射射线。", ["height_scan"]),
@@ -47,7 +47,7 @@ _ASSETS = {
     "clear_sky": ("天空照明", "使用原生晴空环境贴图。", ["lighting"]),
 }
 # Still loadable for existing scenes, but not offered when adding entities.
-_NOT_ON_SHELF = {"terrain"}
+_NOT_ON_SHELF = {"terrain", "usd_articulation"}
 _OBSERVATIONS = {
     "base_lin_vel": ("机身线速度", "机器人自身坐标系中的三轴线速度。", "base_lin_vel", "m/s", "robot_root", ["robot"], 3),
     "base_ang_vel": ("机身角速度", "机器人自身坐标系中的三轴角速度。", "base_ang_vel", "rad/s", "robot_root", ["robot"], 3),
@@ -98,6 +98,11 @@ CATEGORIES = {
 }
 
 
+def factory_capabilities(factory):
+    """Capabilities of a built-in asset factory; empty for project factories and unknown names."""
+    return list(_ASSETS.get(factory, (None, None, []))[2])
+
+
 def entity_category(capabilities, kind="entity", factory=None):
     """Presentation categories describe capabilities, not mandatory YAML roles."""
     if "articulation" in capabilities or kind == "robot":
@@ -111,15 +116,28 @@ def entity_category(capabilities, kind="entity", factory=None):
     return "object" if factory else "group"
 
 
-def asset_capabilities(factory, capabilities, parameters=None):
+def asset_capabilities(factory, capabilities, parameters=None, kinematic=False):
     """Parameter-dependent capabilities a factory declares only by its arguments.
 
     ``box`` and ``usd_object`` are static facilities without a mass and a rigid root body with
     one, which the backends already read as ``position``/``linear_velocity``; the metadata must
-    follow or such a body cannot be selected as an observation.
+    follow or such a body cannot be selected as an observation. A kinematic entity also has a
+    rigid root body, whatever its mass. A ``usd_object`` file with rigid bodies is an object as its
+    UsdPhysics schemas say (isaaclab3): a rigid root, and joint readings when it has movable joints.
     """
     parameters = parameters or {}
-    if factory in ("box", "usd_object") and parameters.get("mass") is not None and "rigid_body" not in capabilities:
+    if factory == "usd_object" and parameters.get("usd_path"):
+        from shared.asset_formats import recorded_joint_order, usd_body_structure, usd_joint_order
+        from .assets import workspace_file
+        path = workspace_file(parameters["usd_path"])
+        structure = usd_body_structure(path)
+        if structure != "static":
+            added = ["rigid_body", "root_state"]
+            if structure == "articulation" and (recorded_joint_order(path) or usd_joint_order(path)):
+                added.append("joint_state")
+            return [*capabilities, *(item for item in added if item not in capabilities)]
+    if (factory in ("box", "usd_object") and (parameters.get("mass") is not None or kinematic)
+            and "rigid_body" not in capabilities):
         return [*capabilities, "rigid_body", "root_state"]
     return capabilities
 
@@ -131,6 +149,7 @@ _PARAMETER_LABELS = {
                "depth_clipping": "超出远裁剪面的深度"},
     "box": {"size": "边长 xyz（m）", "mass": "质量（kg，空为静态）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
     "ball": {"radius": "半径（m）", "mass": "质量（kg）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
+    "usd_object": {"usd_path": "USD 文件", "mass": "质量（kg，空则取 USD）", "scale": "缩放", "fix_root_link": "固定根部"},
 }
 # Starting values the editor fills in for required parameters when an asset is added from the shelf.
 _PARAMETER_EXAMPLES = {
@@ -247,11 +266,10 @@ project registries and metadata are discovered for ordinary Python packages.
         source_path = source
         directory, settings = source.parent, load_scene_config(source)
     package = _project_package(directory)
-    assets, terms = dict(FACTORIES), {}
+    from .project import project_registry
+    assets, terms, _ = project_registry(package, backend=None)
     asset_docs, term_docs = {}, {}
     if package:
-        from .project import project_registry
-        assets, terms, _ = project_registry(package)
         from importlib.util import find_spec
         for suffix, target, attribute in (("assets", asset_docs, "ASSET_METADATA"), ("terms", term_docs, "TERM_METADATA")):
             name = package + "." + suffix
@@ -271,7 +289,8 @@ project registries and metadata are discovered for ordinary Python packages.
             continue
         builtin = _ASSETS.get(node.factory, (node.factory, "项目自定义资产。", []))
         docs = asset_docs.get(node.factory, {})
-        capabilities = asset_capabilities(node.factory, list(docs.get("capabilities", builtin[2])), node.parameters)
+        capabilities = asset_capabilities(node.factory, list(docs.get("capabilities", builtin[2])), node.parameters,
+                                          node.kinematic)
         category = entity_category(capabilities, node.kind, node.factory)
         entities.append({"path": path, "native_key": metadata.keys[path], "factory": node.factory,
                          "supported_backends": asset_backends(node.factory),
@@ -279,7 +298,7 @@ project registries and metadata are discovered for ordinary Python packages.
                          "kind": node.kind, "label": node.name, "capabilities": capabilities,
                          "local_pose": asdict(node.pose), "layout_pose": asdict(pose),
                          "parameters": deepcopy(node.parameters), "scope": metadata.scopes[path],
-                         "pose_authored": node.pose_authored})
+                         "pose_authored": node.pose_authored, "kinematic": node.kinematic})
     by_key = {entity["native_key"]: entity for entity in entities}
     robots = [entity for entity in entities if "articulation" in entity["capabilities"] or entity["kind"] == "robot"]
     task, preset = settings.get("task", {}), settings.get("task", {}).get("preset")

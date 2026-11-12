@@ -1,11 +1,9 @@
 """Shared scene -> native mjlab SceneCfg. No policy or training loop."""
 from math import isfinite
+from shared.assembly.randomization import COMBINE
 from shared.assembly.spec import Abstract, Mount, Pose, Sensor
 
 INITIAL_STATE = {'joint_positions', 'joint_velocities', 'linear_velocity', 'angular_velocity'}
-# PhysX friction of a material against the default friction-1 material, per combine mode.
-COMBINE = {'average': lambda value: (value + 1) / 2, 'min': lambda value: min(value, 1.),
-           'multiply': lambda value: value, 'max': lambda value: max(value, 1.)}
 
 
 def validate(description, settings, *, step_dt=None):
@@ -147,6 +145,10 @@ def build_scene_config(description, settings, factories):
         if {'joint_positions', 'joint_velocities'} & node.initial_state.keys() and not cfg.spec_fn().joints:
             raise ValueError(f'{path}: this asset has no configurable joints')
         apply_initial_state(cfg, node.initial_state, path)
+        if node.reset is not None and node.reset.joint_positions:
+            raise NotImplementedError(f'{path}: joint reset (reset.joint_positions) is only bound on isaaclab3')
+        if node.kinematic:
+            raise NotImplementedError(f'{path}: kinematic entities are only bound on isaaclab3')
         if node.reset is not None and not any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in cfg.spec_fn().joints):
             raise ValueError(f'{path}: reset cannot move a fixed-base entity')
         entities[key] = cfg

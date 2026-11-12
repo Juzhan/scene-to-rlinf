@@ -1,7 +1,7 @@
 """Backend-independent lazy Task evaluation, result validation and per-environment reset.
 
-Besides reward/success/failure/metrics a Task may return ``set``: abstract entity name ->
-next (B, 3) position or (B, 7) xyz + wxyz pose. It is the Task's per-step event; the backend's
+Besides reward/success/failure/metrics a Task may return ``set``: abstract or kinematic entity
+name -> next (B, 3) position or (B, 7) xyz + wxyz pose. It is the Task's per-step event; the backend's
 command term applies it after resets, before observations (``take``).
 """
 from importlib import import_module
@@ -71,17 +71,18 @@ class Runtime:
         return result
 
     def _settings(self, values):
-        """Validate the ``set`` entries: commanded abstract entities, one pose row per environment."""
+        """Validate the ``set`` entries: commanded abstract or kinematic entities, one pose row per environment."""
         from .abstract import abstract_entities, commanded
+        from .kinematic import kinematic_entities
         env = self.env
         if not isinstance(values, dict):
-            raise ValueError('Task set must map abstract entity names to poses')
-        held = commanded(self.settings)
+            raise ValueError('Task set must map abstract or kinematic entity names to poses')
+        held = {*commanded(self.settings), *kinematic_entities(self.settings)}
         result = {}
         for name, value in values.items():
             if name not in held:
                 node = abstract_entities(self.settings).get(name)
-                reason = ('it is not an abstract entity' if node is None else
+                reason = ('it is neither an abstract entity nor declared kinematic' if node is None else
                           'it follows its mounted entity' if node.mount is not None else
                           'it is a reset region, which stays static')
                 raise ValueError(f'Task set {name!r}: cannot move it, {reason}')
@@ -100,7 +101,7 @@ class Runtime:
         return result
 
     def take(self, name):
-        """This step's Task-set pose of one abstract entity, once; None when the Task did not move it."""
+        """This step's Task-set pose of one abstract or kinematic entity, once; None when the Task did not move it."""
         if self.step != self.env.common_step_counter:
             return None
         return self.pending.pop(name, None)

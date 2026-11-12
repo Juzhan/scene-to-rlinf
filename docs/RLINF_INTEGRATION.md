@@ -13,6 +13,7 @@
 - `ObjectPolicy` 解包 `states` 并构造 `Obs`。训练轨迹的 `forward_inputs` 仍按原生批处理要求使用平铺命名 Tensor 字典。
 - `state_ppo.yaml` 的原生 `sampling_params` 区分训练与评估；共享模型读取 `do_sample`，直接调用也支持显式 `mode`。不修改 rollout worker。
 - 默认模板使用原生学习率配置，移除 `adaptive_kl_target`，不另外实现 actor/优化循环。旧实验的自适应学习率结果不可当作新配方结果。
+- 价值头单独学习率 `actor.optim.value_lr` 与价值头预热 `actor.optim.critic_warmup_steps`（前 N 个优化步只训练价值头）是原生选项，按参数名中的 `value_head` 选参数，因此需要 `actor.fsdp_config.use_orig_params: true`；默认的扁平 FSDP 参数下按名字找不到，预热会报空参数列表。从预训练 actor 微调时（go2_chase、go2_crowd）用较小的 actor lr 加价值头预热，原因见 `projects/go2_crowd/README.md`。
 - Isaac 终态快照与自动复位接入仍在共享 adapter 中，复用原生循环；不要求项目维护 env/worker。
 - 检查点保留数量使用已有的共享 Runner 子类；启动入口选择该子类，未修改第三方类或训练循环。
 

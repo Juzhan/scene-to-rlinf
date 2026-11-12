@@ -1,10 +1,11 @@
 {
   "files": {
     "wholebody.pt": {
-      "sha256": "fda151eaccc0af949df8a94fe45cf0f4a6461685d0d00c4c0da320ef6db76eaf",
+      "sha256": "1d04226e5adca9ef927aea8aebb46b3a8a9d753c83486ca574740b202aa029e5",
       "bytes": 1640995,
-      "source": "this workspace, run outputs/go2_piper_wholebody/runs/20261023_185843_d8380ea45fb3, global_step_6000 actor/model_state_dict/full_weights.pt",
-      "trained_with": "RLinf PPO on the mjlab backend, 2048 environments, 6000 epochs, rough_40m terrain (2026-10-23)",
+      "source": "this workspace, run outputs/go2_piper_wholebody/runs/20261102_075914_a56abadb3214, global_step_6000 actor/model_state_dict/full_weights.pt",
+      "trained_with": "RLinf PPO on the isaaclab3 backend (Newton physics), 2048 environments, 6000 epochs, seed 42, rough_40m terrain, domain randomization from train.yaml (base mass add [-1, 2] kg, friction [0.6, 1.0], pushes) (2026-11-02)",
+      "replaces": "mjlab-trained weights of run 20261023_185843_d8380ea45fb3 global_step_6000 (sha256 fda151eaccc0af949df8a94fe45cf0f4a6461685d0d00c4c0da320ef6db76eaf), still in git history",
       "contents": "executor state dict (keys model.*): actor MLP 70-512-256-128-18, asymmetric value head 80-512-256-128-1, actor_logstd",
       "interface": "actor 70 inputs = policy.py actor_features (angular velocity, projected gravity, Go2 and Piper joint offsets and velocities, previous action, planner command); critic adds critic_features (10); 18 actions decoded by decode_action",
       "loaded_by": "policy.py build_executor(weights=...)"

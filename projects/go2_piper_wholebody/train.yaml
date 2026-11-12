@@ -27,9 +27,28 @@ env:
       # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
       backend: isaaclab3
       physics: newton
+      # Sampled once per environment (pushes at random intervals); evaluation inherits it unless a
+      # condition below replaces it. A randomized friction replaces world.contact_materials.robot.
+      randomization:
+        robot:
+          mass: {bodies: [base], add: [-1.0, 2.0]}
+          friction: [0.6, 1.0]
+          push: {interval_s: [10, 15], velocity: {x: [-0.5, 0.5], y: [-0.5, 0.5]}}
   eval:
     total_num_envs: 16
     max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+# run.py evaluate go2_piper_wholebody --conditions all: one evaluation per condition, summary.json in
+# the evaluation folder. randomization replaces the one above (null: none).
+evaluation:
+  conditions:
+    nominal: {randomization: null}
+    training_range: {}
+    heavy_base:
+      randomization: {robot: {mass: {bodies: [base], add: [2.5, 3.5]}}}
+    low_friction:
+      randomization: {robot: {friction: [0.4, 0.5]}}
+    strong_pushes:
+      randomization: {robot: {push: {interval_s: [3, 5], velocity: {x: [-1.0, 1.0], y: [-1.0, 1.0]}}}}
 actor:
   # One epoch of samples (envs x 24) split into 4 minibatches.
   global_batch_size: 12288

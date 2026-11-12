@@ -97,7 +97,7 @@
   回合内移动抽象体是任务设定，不写进 scene.yaml：evaluate 返回 `set: {名: [B,3] 位置或 [B,7] xyz+wxyz}`，
   由后端原生 command 项在复位之后、观察之前生效；刚复位的环境保持采样位姿，Task 看到的是策略上一步观察到的位置。
   可移动的是未跟随、且不被任何 `reset.region` 引用的抽象体，它们另有 `<名>.linear_velocity`（位移/step_dt，复位后为 0）；
-  区域保持静态常量，非法 set 运行时报错并写明实体名。决策步长用 obs.simulation.step_dt。物理实体的 Task 事件尚未接入。
+  区域保持静态常量，非法 set 运行时报错并写明实体名。决策步长用 obs.simulation.step_dt。物理实体只有声明 `kinematic: true` 的（仅 isaaclab3）能由同一 `set` 移动，见 docs/SCENE_BACKENDS.md；动力学实体的 Task 事件尚未接入。
   两后端同样支持静态、随机复位、Task 移动和跟随读数。
 - 统一入口负责评估/录像/汇总。MuJoCo/VLA 专用项目尚未自动迁移到这套 Python Task 运行接入。
 
@@ -192,3 +192,14 @@
 - `.venv-mjlab` 为增量验证环境，不升级现有 Isaac 依赖；Go2 两后端共用 `assets/go2/`（USD 与其转换 MJCF，来源见 `source/SOURCE.json`）。
 - 新机器人/物体资产用 `run.py asset convert` 同时备好 USD 与 MJCF，记录 ASSET.json 并通过对齐检查；不手写转换器，不在转换文件里写执行器增益，对齐不通过时不静默修正。
 - 后续按 `docs/SCENE_BACKENDS.md` 扩展传感器和连接，不把短训练参数更新当作学会任务；关节顺序以 ASSET.json `joint_order`（= Isaac 顺序）为准，由各后端读数换序；同名资产仍不保证动力学/权重兼容。
+
+## 域随机化与多条件评估
+
+- 域随机化写在 train.yaml `env.train.init_params.randomization`（实体 → mass/friction/com/push），评估默认跟随；
+  声明由 `shared/assembly/randomization.py` 校验，各后端 `randomization.py` 绑成原生事件项，后端不支持时明确报错。
+  摩擦按 PhysX 材料系数理解；MuJoCo 系引擎（Newton、mjlab）给被随机化实体的几何体接触优先级并换算成同等组合结果。
+  尺寸等无法按环境随机的量通过评估条件改场景，不在 randomization 里伪造。
+- 评估条件写在 train.yaml 顶层 `evaluation.conditions`（不传给 RLinf），`run.py evaluate <项目> --conditions all`
+  每个条件独立评估并写 summary.json；条件取自当前项目配方，可用于旧运行快照，每个条件目录记录实际应用内容。
+  条件只能替换随机化或改实体字段，不能改训练组件和策略接口。
+- “多条件可靠成功”需写明条件、引擎、轨迹数与种子；单一种子、少量轨迹只说明在这些条件下成功。

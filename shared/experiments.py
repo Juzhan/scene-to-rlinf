@@ -137,7 +137,8 @@ def _digest(value):
 
 def _resolved_interface(value, *, bodies=True):
     # Policies read joints, roots, frames and sensors, never the articulation body array;
-    # its order is still compared on one backend, while converted assets order bodies natively.
+    # its order is still compared on one backend and physics engine; converted assets and
+    # engines (IL3 Newton vs OvPhysX) order bodies natively.
     if not value:
         return None
     keys = ("joint_names", "body_names") if bodies else ("joint_names",)
@@ -152,7 +153,8 @@ def _resolved_interface(value, *, bodies=True):
 
 def _same_backend(before, after):
     from shared.assembly.assets import selected_backend
-    return selected_backend(before) == selected_backend(after)
+    return (selected_backend(before) == selected_backend(after)
+            and (before or {}).get("physics") == (after or {}).get("physics"))
 
 
 def _differences(before, after, path=""):
@@ -634,10 +636,12 @@ def prepare_replay(cfg, module, *, checkpoint=None, allow_scene_change=False, al
     return cfg, module, report
 
 
-def evaluation_directory(cfg, report):
+def evaluation_directory(cfg, report, destination=None):
     """Keep independent evaluation logs and the recorded compatibility decision."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    destination = Path(cfg.runner.logger.log_path) / "evaluations" / f"{stamp}_{uuid.uuid4().hex[:8]}"
+    if destination is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        destination = Path(cfg.runner.logger.log_path) / "evaluations" / f"{stamp}_{uuid.uuid4().hex[:8]}"
+    destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     (destination / "project_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     with open_dict(cfg):

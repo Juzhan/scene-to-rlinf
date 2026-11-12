@@ -67,11 +67,18 @@ class PreparedScene:
 
 
 def project_registry(package=None, *, factories=None, terms=None, tasks=None, backend=DEFAULT_BACKEND):
-    """Discover optional project assets.py and terms.py; never invoke factories."""
-    from .assets import factories_for
+    """Discover optional project assets.py and terms.py; never invoke factories.
 
-    assets, registered_terms, registered_tasks = factories_for(backend), {}, {}
-    support = backend_module(backend, 'project')
+    ``backend=None`` is the static view used for generated types and the catalog: asset names of every
+    backend (the default backend's factories win a shared name), terms as on the default backend.
+    Preparing a scene for one backend still rejects an asset that backend lacks."""
+    from .assets import BACKENDS, factories_for
+
+    chosen = (*(name for name in BACKENDS if name != DEFAULT_BACKEND), DEFAULT_BACKEND) if backend is None else (backend,)
+    assets, registered_terms, registered_tasks = {}, {}, {}
+    for name in chosen:
+        assets.update(factories_for(name))
+    support = backend_module(backend or DEFAULT_BACKEND, 'project')
     if package:
         for suffix in ("assets", "terms"):
             name = package + "." + suffix
@@ -79,9 +86,10 @@ def project_registry(package=None, *, factories=None, terms=None, tasks=None, ba
                 continue
             module = import_module(name)
             if suffix == "assets":
-                if support.UNKEYED_FACTORIES:
-                    assets.update(getattr(module, "FACTORIES", {}))
-                assets.update(getattr(module, 'BACKEND_FACTORIES', {}).get(backend, {}))
+                for one in chosen:
+                    if backend_module(one, 'project').UNKEYED_FACTORIES:
+                        assets.update(getattr(module, "FACTORIES", {}))
+                    assets.update(getattr(module, 'BACKEND_FACTORIES', {}).get(one, {}))
             else:
                 if not support.PROJECT_TERMS:
                     continue  # Native simulator terms are not portable across backends.
@@ -203,6 +211,13 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
         backend_module(backend, 'project').validate_project(
             description, settings, registered_terms, tasks=registered_tasks, factories=assets,
             require_training=require_training, evaluation=evaluation)
+        from .randomization import resolve
+        randomization = parameters.get('randomization')
+        if randomization is not None and not isinstance(randomization, dict):
+            from omegaconf import OmegaConf
+            randomization = OmegaConf.to_container(randomization, resolve=True)
+        settings['_randomization'] = resolve(randomization, description)
+        backend_module(backend, 'randomization').validate(settings['_randomization'], settings)
         return PreparedScene(path, settings, application, assets, registered_terms, registered_tasks, description, backend)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"{path}: {error}") from error
@@ -273,7 +288,7 @@ class Project:
         from shared.integrations.rlinf.isaac import register_isaac_assembly_env
         object_api = (self.scene_config.parent / 'task.py').is_file()
         if object_api:
-            factories, terms, _ = project_registry(self.package)
+            factories, terms, _ = project_registry(self.package, backend=None)
             refresh_observation_types(self.scene_config, self.package, factories=factories, terms=terms)
         policy = import_module(self.package + ".policy")
         from .layout import load_scene_config

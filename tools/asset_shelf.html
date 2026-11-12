@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<!-- The scene editor's asset shelf: a compact tools/simready_library.html for every asset source.
+     The editor embeds it as an iframe srcdoc (same origin as the editor, so a card can be dropped on
+     the 3D view) and replaces __LIBRARY_PORT__; data and actions go to tools/simready_library.py. -->
+<style>
+:root { --accent: #2e6edc; --line: #e3e6ea; --muted: #6b7280; --bg: #f6f7f9; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; font: 12.5px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; color: #1f2328;
+       background: var(--bg); display: flex; flex-direction: column; overflow: hidden; }
+header { flex: none; display: grid; gap: 6px; padding: 8px; background: #fff; border-bottom: 1px solid var(--line); }
+.row { display: flex; gap: 6px; align-items: center; min-width: 0; }
+input, select, button { font-family: inherit; }
+#search { flex: 1; min-width: 0; padding: 6px 9px; border: 1px solid #cfd4da; border-radius: 7px; font-size: 13px; }
+#category { flex: 1; min-width: 0; padding: 4px 6px; border: 1px solid #cfd4da; border-radius: 7px; font-size: 12px; background: #fff; color: inherit; }
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.full { flex: none; font-size: 11.5px; color: var(--accent); text-decoration: none; white-space: nowrap; }
+.full:hover { text-decoration: underline; }
+#summary { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#results { flex: 1; min-height: 0; overflow: auto; padding: 8px; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 7px; }
+.card { position: relative; background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer;
+        user-select: none; transition: box-shadow .12s, border-color .12s; }
+.card:hover { box-shadow: 0 3px 10px rgba(0,0,0,.08); border-color: #c9d3e0; }
+.card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.card:active { cursor: grabbing; }
+.img { aspect-ratio: 1; padding: 5px; display: grid; place-items: center; background: #fff; }
+.img img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.img svg { width: 56%; height: 56%; color: #8a94a3; }
+.img .none { color: #b0b6bf; font-size: 11px; }
+.card .text { padding: 4px 6px 5px; border-top: 1px solid #f0f1f3; }
+.card .name { font-size: 11.5px; font-weight: 600; line-height: 1.3; min-height: 2.6em; overflow-wrap: anywhere;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card .meta { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge { position: absolute; top: 4px; font-size: 10px; line-height: 1.5; padding: 0 5px; border-radius: 8px; white-space: nowrap;
+         background: rgba(255,255,255,.92); border: 1px solid var(--line); pointer-events: none; }
+.badge.n { right: 4px; color: var(--accent); border-color: #c6d7f5; }
+.badge.cloud { left: 4px; color: var(--muted); }
+#more { height: 30px; }
+#empty { display: none; padding: 30px 10px; text-align: center; color: var(--muted); }
+#empty a { color: var(--accent); }
+footer { flex: none; display: grid; gap: 7px; padding: 8px; background: #fff; border-top: 1px solid var(--line);
+         box-shadow: 0 -4px 12px rgba(0,0,0,.04); max-height: 46%; overflow: auto; scrollbar-width: thin; }
+.head { display: flex; gap: 8px; min-width: 0; }
+.pic { flex: none; width: 46px; height: 46px; border: 1px solid var(--line); border-radius: 7px; background: #fff;
+       display: grid; place-items: center; overflow: hidden; }
+.pic img { width: 100%; height: 100%; object-fit: contain; }
+.pic svg { width: 60%; height: 60%; color: #8a94a3; }
+.head .body { min-width: 0; flex: 1; }
+.title { font-weight: 600; font-size: 13px; line-height: 1.3; overflow-wrap: anywhere; }
+.sub { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.desc { font-size: 11px; color: #4b5563; margin-top: 2px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden; }
+.variants { display: flex; gap: 4px; overflow-x: auto; padding: 1px 1px 3px; scrollbar-width: thin; }
+.variants img { flex: none; width: 30px; height: 30px; object-fit: contain; background: #fff; border: 1px solid var(--line);
+                border-radius: 5px; cursor: pointer; }
+.variants img.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.field { display: grid; grid-template-columns: 52px 1fr; gap: 6px; align-items: center; font-size: 11.5px; color: var(--muted); }
+.field input, .field select { min-width: 0; width: 100%; padding: 4px 7px; border: 1px solid #cfd4da; border-radius: 6px; font-size: 12px;
+                              background: #fff; color: #1f2328; }
+.xyz { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.actions { display: flex; gap: 6px; align-items: center; }
+button.place { flex: 1; padding: 6px 10px; border: 0; border-radius: 7px; background: #1f883d; color: #fff; font-size: 13px;
+               font-weight: 600; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+button.place:hover { background: #1a7f37; }
+button.place.armed { background: #fff; color: #9a5b00; box-shadow: inset 0 0 0 1px #f0d29b; }
+button.place:disabled { background: #9db8a5; cursor: default; }
+.hint { font-size: 11px; color: var(--muted); }
+#message { font-size: 11.5px; overflow-wrap: anywhere; } #message:empty { display: none; }
+#message.error { color: #c62828; } #message.ok { color: #1a7f37; } #message.busy { color: var(--accent); }
+.bar { height: 5px; background: #eef0f3; border-radius: 3px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+#offline { display: none; padding: 16px; color: #c62828; font-size: 12px; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row"><input id="search" type="search" placeholder="搜索，如 franka、apple、mug（/）" autocomplete="off">
+    <a class="full" id="full" target="_blank" rel="noopener" title="在新标签页打开完整的 SimReady 资产库">完整库 ↗</a></div>
+  <div class="row"><select id="category"></select></div>
+  <div id="summary">读取中…</div>
+</header>
+<section id="results"><div id="grid"></div><div id="empty">没有匹配的资产</div><div id="more"></div></section>
+<div id="offline"></div>
+<footer id="detail"><div class="hint">点选资产查看详情；也可以把卡片直接拖进 3D 视图放置。</div></footer>
+<script>
+const PORT = __LIBRARY_PORT__;
+const embedded = location.protocol === 'about:';  // the editor's srcdoc: the API is on the editor's host
+const API = embedded ? `${parent.location.protocol}//${parent.location.hostname}:${PORT}/` : '/';
+const TYPE = 'application/x-rlinf-asset';
+const CHUNK = 60;
+const $ = id => document.getElementById(id);
+const esc = text => String(text ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const SHAPES = {  // abstract entities have no model: a line drawing of their shape
+  point: '<circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/>',
+  direction: '<path d="M4 18L19 5M19 5h-7M19 5v7"/>',
+  rectangle: '<path d="M3 15l7-7h11l-7 7z"/>',
+  box: '<path d="M4 8l8-4 8 4v8l-8 4-8-4z M4 8l8 4 8-4 M12 12v8"/>',
+  // icons for assets without a sketch (sensors and lights have no mesh; others until 生成缩略图)
+  sensor: '<rect x="3" y="7" width="13" height="10" rx="2"/><path d="M16 11l5-3v8l-5-3z"/>',
+  light: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/>',
+  object: '<circle cx="12" cy="12" r="8"/><ellipse cx="12" cy="12" rx="8" ry="3"/>',
+  robot: '<path d="M5 20h8M9 20v-5l5-6 4 3M14 9l-2-4"/><circle cx="9" cy="15" r="1.5"/><circle cx="14" cy="9" r="1.5"/>',
+  terrain: '<path d="M3 17l5-6 4 4 3-3 6 5z"/>'};
+const shapeSvg = shape => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">${SHAPES[shape]}</svg>`;
+const store = (() => { try { return embedded ? parent.sessionStorage : sessionStorage; } catch { return null; } })();
+const remembered = JSON.parse((store && store.getItem('rlinf-shelf.v2')) || '{}');
+
+const state = {items: [], byId: {}, shown: [], rendered: 0, categories: [], itemsRevision: null, revision: null,
+               choice: null, variant: null, server: null, nameEdited: false, optionsKey: ''};
+
+async function api(path, body) {
+  const response = await fetch(API + 'api/shelf/' + path, body === undefined ? {} :
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+
+async function loadItems() {
+  const data = await api('items');
+  state.items = data.items; state.categories = data.categories; state.loading = data.loading;
+  state.byId = Object.fromEntries(data.items.map(item => [item.id, item]));
+  state.itemsRevision = data.revision;
+  const select = $('category'), current = select.options.length ? select.value : remembered.category;
+  // SimReady has ~180 categories, most with one or two assets: fold the small ones into 其他
+  const groups = {}, small = data.categories.filter(c => c.value.startsWith('simready:') && c.value !== 'simready:' && c.count < 5);
+  state.small = new Set(small.map(c => c.value));
+  for (const category of data.categories) if (!state.small.has(category.value)) (groups[category.group] = groups[category.group] || []).push(category);
+  if (small.length) groups.SimReady.push({value: OTHER, label: `其他 ${small.length} 类`, count: small.reduce((n, c) => n + c.count, 0)});
+  // opens on one category (the last used, else the first); 全部 is the last choice
+  select.innerHTML = Object.entries(groups).map(([group, list]) =>
+    `<optgroup label="${esc(group)}">${list.map(c => `<option value="${esc(c.value)}">${esc(c.label)}（${c.count}）</option>`).join('')}</optgroup>`).join('')
+    + `<option value="">全部（${data.items.length}）</option>`;
+  select.value = current !== undefined && [...select.options].some(option => option.value === current) ? current : (data.categories[0]?.value ?? '');
+  refresh(true);
+}
+
+const OTHER = 'simready:~other';
+const shelfCategory = item => state.small && state.small.has(item.category) ? OTHER : item.category;
+const inCategory = (item, category) => !category || shelfCategory(item) === category
+                                       || category === 'simready:' && item.category.startsWith('simready:');
+function refresh(keepScroll) {
+  const words = $('search').value.toLowerCase().split(/\s+/).filter(Boolean), category = $('category').value;
+  const matching = state.items.filter(item => words.every(word => item.search.includes(word)));
+  let shown = matching.filter(item => inCategory(item, category));
+  if (words.length) {  // names starting with the first word first, otherwise the shelf order
+    const starts = item => item.label.toLowerCase().replace(/ /g, '_').startsWith(words[0]) ? 0 : 1;
+    shown = shown.map((item, index) => [starts(item), index, item]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
+  }
+  state.shown = shown;
+  const scroll = $('results').scrollTop;
+  $('grid').innerHTML = ''; state.rendered = 0;
+  more(keepScroll ? Math.max(CHUNK, (remembered.rendered || 0)) : CHUNK);
+  $('results').scrollTop = keepScroll ? (state.firstScroll ?? scroll) : 0;
+  state.firstScroll = undefined;
+  $('empty').style.display = shown.length ? 'none' : 'block';
+  $('empty').innerHTML = !shown.length && words.length && category && matching.length
+    ? `本类没有匹配的资产；<a href="#" id="everywhere">在全部中查看 ${matching.length} 项</a>` : '没有匹配的资产';
+  if ($('everywhere')) $('everywhere').onclick = event => { event.preventDefault(); $('category').value = ''; refresh(); };
+  $('summary').textContent = `${shown.length} 项` + (state.loading ? ' · SimReady 目录读取中…' : '')
+    + (shown.length ? ' · 拖进视图即可放置' : '');
+  save();
+}
+function save() {
+  if (!store) return;
+  Object.assign(remembered, {query: $('search').value, category: $('category').value, scroll: $('results').scrollTop, rendered: state.rendered});
+  store.setItem('rlinf-shelf.v2', JSON.stringify(remembered));
+}
+
+function picture(item, image) {
+  image = image === undefined ? item.image : image;
+  if (image) return `<img loading="lazy" alt="" src="${API + image}">`;
+  const icon = item.shape || item.category.replace(/^simready:.*/, '');
+  return SHAPES[icon] ? shapeSvg(icon) : '<span class="none">无预览</span>';
+}
+function card(item) {
+  const div = document.createElement('div');
+  div.className = 'card' + (item.id === state.choice ? ' sel' : '');
+  div.dataset.id = item.id; div.draggable = true;
+  div.title = item.label + (item.members ? `\n${item.members.length > 1 ? item.members.length + ' 个变体 · ' : ''}${item.local === true ? '本地' : item.local ? '部分本地' : '在线，添加时下载'}` : '');
+  div.innerHTML = (item.local === false ? '<span class="badge cloud">☁</span>' : '') + (item.badge ? `<span class="badge n">${esc(item.badge)}</span>` : '')
+    + `<div class="img">${picture(item)}</div><div class="text"><div class="name">${esc(item.label)}</div><div class="meta">${esc(item.meta)}</div></div>`;
+  const image = div.querySelector('.img img');
+  if (image) image.onerror = () => { div.querySelector('.img').innerHTML = '<span class="none">无预览</span>'; };
+  div.onclick = () => select(item.id);
+  div.ondragstart = event => {
+    const chosen = item.id === state.choice;
+    event.dataTransfer.setData(TYPE, JSON.stringify({id: item.id, variant: chosen ? state.variant : null, name: chosen ? $('name')?.value || '' : ''}));
+    event.dataTransfer.effectAllowed = 'copy';
+  };
+  return div;
+}
+function more(count = CHUNK) {
+  const fragment = document.createDocumentFragment();
+  for (const item of state.shown.slice(state.rendered, state.rendered + count)) fragment.appendChild(card(item));
+  state.rendered = Math.min(state.shown.length, state.rendered + count);
+  $('grid').appendChild(fragment);
+}
+new IntersectionObserver(entries => { if (entries[0].isIntersecting && state.rendered < state.shown.length) more(); },
+                         {root: $('results'), rootMargin: '400px'}).observe($('more'));
+
+function mark() {
+  for (const div of $('grid').children) div.classList.toggle('sel', div.dataset.id === state.choice);
+}
+function reveal(id) {  // show the editor's choice (e.g. a just imported asset), clearing the filters if needed
+  let index = state.shown.findIndex(item => item.id === id);
+  if (index < 0) {  // switch to the item's own category
+    const item = state.byId[id]; if (!item) return;
+    $('search').value = ''; $('category').value = shelfCategory(item); refresh(); index = state.shown.findIndex(entry => entry.id === id);
+  }
+  if (index < 0) return;
+  if (index >= state.rendered) more(index - state.rendered + CHUNK);
+  $('grid').children[index]?.scrollIntoView({block: 'nearest'});
+}
+
+async function select(id, variant = null) {
+  state.choice = id; state.variant = variant; state.nameEdited = false; mark();
+  try { apply(await api('select', {id, variant})); } catch (error) { message(error.message, 'error'); }
+}
+async function post(path, body) {
+  try { apply(await api(path, body)); } catch (error) { message(error.message, 'error'); }
+}
+
+function apply(server) {
+  const previous = state.server;
+  state.server = server;
+  if (server.items !== state.itemsRevision) { state.itemsRevision = server.items; loadItems().then(() => { mark(); }); }
+  if (server.choice !== state.choice || server.focus) { state.choice = server.choice; mark(); if (server.focus && server.choice) reveal(server.choice); }
+  state.variant = server.variant;
+  if (previous && server.name !== previous.name && document.activeElement !== $('name')) state.nameEdited = false;  // e.g. added: next suggestion
+  if (server.revision !== state.revision) { state.revision = server.revision; detail(server); }
+  controls(server, previous);
+}
+
+function detail(server) {
+  const item = state.byId[server.choice], info = server.detail;
+  if (!item || !info) {
+    $('detail').innerHTML = '<div class="hint">点选资产查看详情；也可以把卡片直接拖进 3D 视图放置。</div><div id="message"></div>';
+    state.optionsKey = ''; return;
+  }
+  const members = item.members && item.members.length > 1 ? item.members : null;
+  const name = $('name') && document.activeElement === $('name') || state.nameEdited ? $('name').value : server.name;
+  $('detail').innerHTML = `<div class="head"><div class="pic">${picture(item, info.image)}</div><div class="body">
+      <div class="title">${esc(info.title)}</div><div class="sub">${esc(info.meta)}${members ? ` · ${members.length} 个变体` : ''}</div>
+      ${info.lines.length ? `<div class="desc" title="${esc(info.lines.join('\n'))}">${info.lines.map(esc).join('<br>')}</div>` : ''}</div></div>
+    ${members ? `<div class="variants" title="${members.length} 个变体">${members.map(member =>
+      `<img loading="lazy" src="${API + member.image}" title="${esc(member.name)}${member.local ? '' : '（在线）'}" data-key="${esc(member.key)}" class="${member.key === server.variant ? 'sel' : ''}">`).join('')}</div>` : ''}
+    <label class="field">实体名称<input id="name" value="${esc(name)}" spellcheck="false" autocomplete="off"></label>
+    <div id="options"></div>
+    <div class="actions"><button class="place" id="place"></button></div>
+    <div id="job" class="bar" style="display:none"><i></i></div><div id="message"></div>`;
+  const pic = $('detail').querySelector('.pic img');
+  if (pic) pic.onerror = () => { pic.replaceWith(Object.assign(document.createElement('span'), {className: 'hint', textContent: '无预览'})); };
+  for (const image of $('detail').querySelectorAll('.variants img')) image.onclick = () => select(item.id, image.dataset.key);
+  $('detail').querySelector('.variants img.sel')?.scrollIntoView({block: 'nearest', inline: 'nearest'});
+  $('name').oninput = () => { state.nameEdited = true; };
+  $('name').onkeydown = event => { if (event.key === 'Enter') $('place').click(); };
+  $('place').onclick = () => state.server && state.server.placing ? post('cancel', {}) : post('arm', {name: $('name').value});
+  state.optionsKey = '';
+}
+
+function controls(server, previous) {
+  if (!$('place')) return;
+  const options = server.options || {}, key = JSON.stringify(options);
+  if (key !== state.optionsKey && !$('options').contains(document.activeElement)) {
+    state.optionsKey = key;
+    const choices = (list, value) => list.map(option => `<option${option === value ? ' selected' : ''}>${esc(option)}</option>`).join('');
+    $('options').innerHTML = (options.mount ? `<label class="field">安装到<select id="mount">${choices(options.mount.options, options.mount.value)}</select></label>` : '')
+      + (options.body ? `<label class="field" style="margin-top:6px">连杆<select id="body">${choices(options.body.options, options.body.value)}</select></label>` : '')
+      + (options.size ? `<label class="field">尺寸 (m)<span class="xyz">${options.size.map((value, index) =>
+          `<input type="number" step="0.01" min="0.001" value="${+value.toFixed(4)}" data-index="${index}">`).join('')}</span></label>` : '');
+    $('options').style.display = $('options').innerHTML ? 'grid' : 'none';
+    $('options').style.gap = '6px';
+    if ($('mount')) $('mount').onchange = () => post('option', {mount: $('mount').value});
+    if ($('body')) $('body').onchange = () => post('option', {body: $('body').value});
+    for (const input of $('options').querySelectorAll('.xyz input')) input.onchange = () =>
+      post('option', {size: [...$('options').querySelectorAll('.xyz input')].map(field => parseFloat(field.value) || 0.001)});
+  }
+  if (!state.nameEdited && document.activeElement !== $('name') && $('name').value !== server.name) $('name').value = server.name;
+  const job = server.job, busy = job && job.running;
+  $('place').textContent = server.placing ? '取消放置（Esc）' : server.button;
+  $('place').classList.toggle('armed', !!server.placing);
+  $('place').disabled = !!busy && !server.placing;
+  $('job').style.display = busy ? 'block' : 'none';
+  if (busy) $('job').firstElementChild.style.width = job.total ? (100 * job.done / job.total).toFixed(0) + '%' : '15%';
+  if (server.placing) message(server.mounted ? '' : '在 3D 视图中点击放置位置（落在点到的表面上）', 'busy');
+  else if (job && (busy || previous && previous.job && previous.job.running)) message(job.message, job.error ? 'error' : busy ? 'busy' : 'ok');
+  else if (previous && previous.placing) message('');
+}
+function message(text, kind) { const node = $('message'); if (node) { node.textContent = text || ''; node.className = kind || ''; } }
+
+async function poll() {
+  try {
+    apply(await api('state'));
+    $('offline').style.display = 'none'; $('results').style.display = '';
+  } catch (error) {
+    $('offline').textContent = `无法连接资产服务 ${API}（${error.message}）。远程访问时需同时转发该端口。`;
+    $('offline').style.display = 'block';
+  }
+  setTimeout(poll, state.server && (state.server.placing || state.server.job && state.server.job.running) ? 400 : 900);
+}
+
+function installDrop() {
+  // The view is the editor page around this frame: accept our cards there and hand the drop point
+  // (relative to the canvas) to the editor, which casts the ray from that browser's camera.
+  if (!embedded) return;
+  const view = parent, doc = parent.document, base = API;
+  for (const [type, handler] of view.__rlinfShelfDrop || []) doc.removeEventListener(type, handler, true);
+  const canvasAt = (x, y) => { const node = doc.elementFromPoint(x, y); return node && node.tagName === 'CANVAS' ? node : null; };
+  const over = event => {
+    if (!event.dataTransfer || ![...event.dataTransfer.types].includes(TYPE) || !canvasAt(event.clientX, event.clientY)) return;
+    event.preventDefault(); event.dataTransfer.dropEffect = 'copy';
+  };
+  const drop = event => {
+    if (!event.dataTransfer || ![...event.dataTransfer.types].includes(TYPE)) return;
+    const canvas = canvasAt(event.clientX, event.clientY);
+    if (!canvas) return;
+    event.preventDefault();
+    const rect = canvas.getBoundingClientRect(), asset = JSON.parse(event.dataTransfer.getData(TYPE));
+    view.fetch(base + 'api/shelf/drop', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...asset, u: (event.clientX - rect.left) / rect.width, v: (event.clientY - rect.top) / rect.height,
+                            aspect: rect.width / rect.height})}).catch(() => {});  // the editor reports the outcome
+  };
+  view.__rlinfShelfDrop = [['dragover', over], ['drop', drop]];
+  for (const [type, handler] of view.__rlinfShelfDrop) doc.addEventListener(type, handler, true);
+}
+
+$('full').href = API;
+$('search').value = remembered.query || '';
+state.firstScroll = remembered.scroll;
+$('search').addEventListener('input', () => { clearTimeout(state.typing); state.typing = setTimeout(() => refresh(), 120); });
+$('category').addEventListener('change', () => refresh());
+$('results').addEventListener('scroll', () => { clearTimeout(state.saving); state.saving = setTimeout(save, 200); });
+document.addEventListener('keydown', event => {
+  const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if (event.key === '/' && !typing) { event.preventDefault(); $('search').focus(); $('search').select(); }
+  else if (event.key === 'Escape') { if (typing) document.activeElement.blur(); if (state.server && state.server.placing) post('cancel', {}); }
+});
+installDrop();
+poll();
+</script>
+</body>
+</html>

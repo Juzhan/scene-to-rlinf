@@ -1,6 +1,8 @@
 """Robot capabilities on observation views: one interface, implemented by each backend.
 
-``obs.<robot>`` nodes of the generated types inherit :class:`RobotView`. Besides
+``obs.<robot>`` nodes of the generated types inherit :class:`RobotView`; so do other
+entities with joints (articulated objects such as ``usd_articulation``, see
+:func:`robot_interface`), for which joint_names and frame_pose are the useful part. Besides
 the selected tensors they answer kinematic queries about the same robot, batched
 over environments, in the environment frame (metres, wxyz quaternions):
 
@@ -171,6 +173,13 @@ ASSET_FRAMES = {
 FRAME_FIELDS = ('position', 'orientation')
 
 
+def robot_interface(node):
+    """Robots and entities whose asset has joint readings (articulated objects) answer frame queries."""
+    from .catalog import asset_capabilities, factory_capabilities
+    return node.kind == 'robot' or 'joint_state' in asset_capabilities(
+        node.factory, factory_capabilities(node.factory), node.parameters)
+
+
 def robot_frames(world):
     """Robot key -> {frame name: (body, (position, orientation))} of a composed scene, without a simulator.
 
@@ -182,7 +191,7 @@ def robot_frames(world):
     methods = {name for name in dir(RobotView) if not name.startswith('_')}
     result = {}
     for path, (node, _) in index.items():
-        if node.kind != 'robot':
+        if not robot_interface(node):
             continue
         frames = dict(ASSET_FRAMES.get(node.factory, {}))
         for frame in node.frames:
@@ -219,7 +228,7 @@ def provider(env, settings, kinematics_type):
         if frames is None:
             raise ValueError('robot frames are resolved by prepare_scene; settings were not prepared')
         if name not in frames:
-            raise ValueError(f'{name} is not a robot entity (kind: robot) of this scene')
+            raise ValueError(f'{name} is neither a robot (kind: robot) nor an articulated entity of this scene')
         if name not in cache:
             cache[name] = kinematics_type(env, name, frames[name])
         return cache[name]

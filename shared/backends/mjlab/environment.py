@@ -72,6 +72,11 @@ def build_config(prepared, *, num_envs, seed, horizon, visualize=False):
                       for source in settings['observations']['policy']})
     # Authored root resets and attachments run after mjlab's default reset to the initial state.
     cfg.events.update(event_configuration(prepared.description, keys, scene.entities))
+    from .randomization import events as randomization_events
+    for name, term in randomization_events(settings.get('_randomization', ()), settings).items():
+        if name in cfg.events:
+            raise ValueError(f'Scene event name is reserved: {name}')
+        cfg.events[name] = term
     output = {'rewards':cfg.rewards, 'terminations':cfg.terminations, 'events':cfg.events}
     attach_task(output, prepared.terms['object_api'], settings)
     cfg.terminations['workspace_time_limit'] = TerminationTermCfg(func=mdp.time_out, time_out=True)
@@ -237,6 +242,7 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
     window = Window(viewer or {}) if headless is False else None
     class NativeEnv(TerminalObservationMixin, ManagerBasedRlEnv):
         backend_name = 'mjlab'
+        physics_name = 'mujoco_warp'
         def render(self):
             if video is None:
                 raise ValueError('Create the mjlab environment with a viewer to render video frames')

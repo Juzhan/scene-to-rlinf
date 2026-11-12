@@ -72,6 +72,8 @@ class Entity:
     prim_name: str | None = None  # Optional native prim leaf name; logical entity name stays stable.
     meshes: tuple[str, ...] = ()  # Scene references for native ray sensors.
     pose_authored: bool = True  # Loader distinguishes omitted poses from an explicit identity pose.
+    # Collides but ignores forces and gravity; it stays where reset placed it unless the Task moves it (``set``).
+    kinematic: bool = False
     kind: ClassVar[str] = "entity"
 
 
@@ -119,10 +121,30 @@ class RootReset:
     yaw_range: tuple[float, float] = (0., 0.)
     inset: float = 0.
     interval: float | None = None  # Abstract entities only: resample every interval seconds.
+    # Joint name -> [min, max] position drawn uniformly per environment (articulations only).
+    joint_positions: dict = field(default_factory=dict)
+
+    @property
+    def moves_root(self):
+        return bool(self.states) or bool(self.pose_range) or self.region is not None
 
     def __post_init__(self):
-        if sum((bool(self.states), bool(self.pose_range), self.region is not None)) != 1:
-            raise ValueError("Reset requires exactly one of nonempty states, pose_range or region")
+        if sum((bool(self.states), bool(self.pose_range), self.region is not None)) > 1:
+            raise ValueError("Reset takes at most one of nonempty states, pose_range or region")
+        if not self.moves_root and not self.joint_positions:
+            raise ValueError("Reset requires states, pose_range, region or joint_positions")
+        if not isinstance(self.joint_positions, dict):
+            raise ValueError("Reset joint_positions maps joint names to [min, max]")
+        joints = {}
+        for name, bounds in self.joint_positions.items():
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+                    or not isinstance(bounds, (tuple, list)) or len(bounds) != 2
+                    or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                               and isfinite(value) for value in bounds) or bounds[0] > bounds[1]):
+                raise ValueError(f"Reset joint_positions.{name} requires an exact joint name and finite ordered "
+                                 "[min, max]")
+            joints[name] = tuple(float(value) for value in bounds)
+        object.__setattr__(self, "joint_positions", joints)
         if self.region is not None and (not isinstance(self.region, str) or not re.fullmatch(
                 r"[A-Za-z_][A-Za-z_0-9]*(/[A-Za-z_][A-Za-z_0-9]*)+", self.region)):
             raise ValueError("Reset region must be a scene path such as world/spawn_area")
@@ -259,6 +281,9 @@ class WorldSpec:
                 raise ValueError(f"Entity {path}: reset interval is only available on abstract entities; "
                                  "physical assets are placed at episode reset")
             self._check_reset_region(path, node, result)
+            if node.kinematic is not False and (node.kinematic is not True or not node.factory
+                                                or isinstance(node, Sensor) or node.scope == "global"):
+                raise ValueError(f"Entity {path}: kinematic is true or false, on a per-environment physical asset")
             if node.frames and (not node.factory or isinstance(node, Sensor)):
                 raise ValueError(f"Body frames require a concrete non-sensor asset: {path}")
             frame_names = set()
@@ -300,9 +325,13 @@ class WorldSpec:
                     raise ValueError("Physical joint parent must not be a sensor")
             # Backends randomize roots first, then place attached children at their joint frames,
             # so only the root of an attachment chain may own a pose reset.
-            if result[joint.child.entity][0].reset is not None:
+            child_reset = result[joint.child.entity][0].reset
+            if child_reset is not None and child_reset.moves_root:
                 raise ValueError(f"{joint.child.entity}: an attached child is placed by its parent; "
                                  "remove its reset (randomize the root of the attachment chain instead)")
+            if result[joint.child.entity][0].kinematic:
+                raise ValueError(f"{joint.child.entity}: a kinematic entity is moved by the Task, it cannot be "
+                                 "attached to a parent")
             child = joint.child.entity
             if child in incoming:
                 raise ValueError(f"Multiple attachment parents for {child}")
@@ -332,7 +361,7 @@ class WorldSpec:
         if posixpath.dirname(path) != self.root.name:
             raise ValueError(f"Abstract entity {path} must be a top-level scene entity")
         if (node.factory or node.children or node.connections or node.frames or node.meshes or node.prim_name
-                or node.scope or node.parameters or node.initial_state):
+                or node.scope or node.parameters or node.initial_state or node.kinematic):
             raise ValueError(f"Abstract entity {path} has no model, physics, children or native properties; "
                              "it only declares shape, size, pose, mount and reset")
         if node.mount is not None:
@@ -347,6 +376,8 @@ class WorldSpec:
         if node.reset is not None:
             if not isinstance(node.reset, RootReset):
                 raise ValueError(f"Expected RootReset at {path}")
+            if node.reset.joint_positions:
+                raise ValueError(f"Abstract entity {path} has no joints to reset")
             self._check_reset_region(path, node, result)
 
     def ordered_connections(self):

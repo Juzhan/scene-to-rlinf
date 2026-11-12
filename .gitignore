@@ -27,6 +27,7 @@ events.out.tfevents.*
 !/projects/piper_pick/
 !/projects/go2_chase/
 !/projects/go2_piper_wholebody/
+!/projects/box_stack_diffsim/
 # The web editor's unsaved working copy (.scene.yaml.<pid>.editing).
 /projects/*/.*.editing
 

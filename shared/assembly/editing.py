@@ -206,7 +206,7 @@ class SceneDocument:
             raise ValueError("Entity edits require parent-local poses; mounted sensors require body-local poses")
         if path not in self.targets:
             raise ValueError(f"Unknown entity: {path}")
-        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes"}
+        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes", "kinematic"}
         if self.entities[path].get("kind") == "abstract":
             allowed = {"pose", "tags", "reset", "mount", "shape", "size"}
         if changes.keys() - allowed:
@@ -228,8 +228,20 @@ class SceneDocument:
             if meshes is not None and (not isinstance(meshes, list) or not all(isinstance(m, str) for m in meshes)):
                 raise ValueError("Sensor mesh targets must be a list of entity paths")
             changes["meshes"] = meshes
-        for key in ("reset", "mount", "meshes"):
-            # None clears an optional rule (static, unmounted entity, no ray targets).
+        if "reset" in changes:
+            # Editors place roots; joint ranges written in scene.yaml survive a placement edit.
+            joints = (self.entities[path].get("reset") or {}).get("joint_positions")
+            if joints and "joint_positions" not in (changes["reset"] or {}):
+                changes["reset"] = {**(changes["reset"] or {}), "joint_positions": deepcopy(_plain(joints))}
+        if "kinematic" in changes:
+            if self.targets[path][1] is not None:
+                raise ValueError(f"{path}: kinematic is set on scene-owned entities, not on assembly parts")
+            if not isinstance(changes["kinematic"], bool):
+                raise ValueError("kinematic is true or false")
+            if not changes["kinematic"]:  # The default: written only when true.
+                changes["kinematic"] = None
+        for key in ("reset", "mount", "meshes", "kinematic"):
+            # None clears an optional rule (static, unmounted entity, no ray targets, dynamic body).
             if key in changes and changes[key] is None and self.targets[path][1] is None:
                 self.targets[path][0].pop(key, None)
                 del changes[key]
@@ -717,6 +729,7 @@ class SceneDocument:
                              "initial_state": _plain(node.get("initial_state", {})),
                              "reset": _plain(node.get("reset", {})),
                              "camera_only": node.get("camera_only", False),
+                             "kinematic": bool(node.get("kinematic", False)), "scope": meta.get("scope"),
                              "display_pose": display_pose,
                              "pose_authored": "pose" in node, "parameters": node.get("parameters", {}),
                              "tags": node.get("tags", []), "mount": mount, "meshes": list(node.get("meshes", [])),
@@ -872,7 +885,9 @@ def apply_edits(path, payload):
     from .catalog import _project_package
     from .project import project_registry, _check_factory
     from shared.backends.isaac.task_config import validate_task_settings
-    factories, terms, tasks = project_registry(_project_package(document.path.parent))
+    from .visuals import geometry_backend
+    factories, terms, tasks = project_registry(_project_package(document.path.parent),
+                                               backend=geometry_backend(document.path))
     for entity_path, node in document.entities.items():
         if node.get("factory"):
             _check_factory(node["factory"], node.get("parameters", {}), factories, entity_path)

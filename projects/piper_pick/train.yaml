@@ -23,10 +23,35 @@ env:
       # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
       backend: isaaclab3
       physics: newton
+      # Sampled once per environment; evaluation inherits it unless a condition replaces it.
+      randomization:
+        cube:
+          mass: {scale: [0.5, 2.0]}
+          friction: [0.6, 1.2]
   # evaluate: same environment, each round runs one whole episode.
   eval:
     total_num_envs: 16
     max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+# run.py evaluate piper_pick --conditions all: one evaluation per condition, summary.json in the
+# evaluation folder. randomization replaces the one above (null: none); scene edits named entities.
+# task.py's CUBE_REST assumes the 4.8 cm cube (scale 0.8): the 0.7/0.9 cubes must lift 43/37 mm.
+evaluation:
+  conditions:
+    nominal: {randomization: null}
+    training_range: {}
+    heavy_cube:
+      randomization: {cube: {mass: {scale: [2.0, 3.0]}}}
+    low_friction:
+      randomization: {cube: {friction: [0.4, 0.5]}}
+    small_cube:
+      randomization: null
+      scene: {cube: {parameters: {scale: [0.7, 0.7, 0.7]}}}
+    large_cube:
+      randomization: null
+      scene: {cube: {parameters: {scale: [0.9, 0.9, 0.9]}}}
+    wide_area:
+      randomization: null
+      scene: {cube_area: {size: [0.24, 0.24]}}
 actor:
   global_batch_size: 4096
   micro_batch_size: 1024

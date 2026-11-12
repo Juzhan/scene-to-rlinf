@@ -1,0 +1,145 @@
+schema_version: 1
+name: world
+application:
+  headless: true
+  enable_cameras: false
+  fast_shutdown: false
+simulation:
+  dt: 0.01
+  render_interval: 4
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+world:
+  env_spacing: 2.5
+targets:
+  cube_lower:
+    position:
+    - 0.45
+    - 0.0
+    - 0.43
+  cube_upper:
+    position:
+    - 0.45
+    - 0.0
+    - 0.492
+entities:
+- name: floor
+  scope: global
+  factory: ground_plane
+  pose:
+    position:
+    - 0.0
+    - 0.0
+    - 0.0
+- name: light
+  scope: global
+  factory: dome_light
+- name: table
+  factory: box
+  pose:
+    position:
+    - 0.45
+    - 0.0
+    - 0.2
+  parameters:
+    size:
+    - 0.5
+    - 0.5
+    - 0.4
+    color:
+    - 0.55
+    - 0.5
+    - 0.45
+    friction: 0.8
+- name: robot
+  assembly: assemblies/arm.yaml
+- name: cube_lower
+  factory: box
+  pose:
+    position:
+    - 0.45
+    - -0.09
+    - 0.43
+  parameters:
+    size:
+    - 0.06
+    - 0.06
+    - 0.06
+    mass: 0.2
+    color:
+    - 0.8
+    - 0.3
+    - 0.25
+    friction: 0.8
+- name: cube_upper
+  factory: box
+  pose:
+    position:
+    - 0.32
+    - 0.09
+    - 0.43
+  parameters:
+    size:
+    - 0.06
+    - 0.06
+    - 0.06
+    mass: 0.2
+    color:
+    - 0.25
+    - 0.45
+    - 0.85
+    friction: 0.8
+- name: ee_frame
+  kind: sensor
+  factory: frame_transformer
+  mount:
+    entity: world/robot
+    body: panda_hand
+  parameters:
+    target_body: panda_hand
+    target_position:
+    - 0
+    - 0
+    - 0.1034
+control:
+  train: executor
+  components:
+    planner:
+      period: 0.02
+      dimension: 3
+      model: .policy:build_planner
+      observations:
+      - cube_upper.target.position
+    executor:
+      period: 0.02
+      dimension: 8
+      model: .policy:build_executor
+      observations:
+      - robot.joint_position
+      - robot.joint_velocity
+      - cube_upper.position
+      - cube_lower.position
+      - planner.output
+      - ee_frame.frame_positions
+      - robot.default_joint_position
+      decode: .policy:decode_action
+  output:
+    arm:
+      type: joint_position
+      asset_name: robot
+      joint_names:
+      - panda_joint1
+      - panda_joint2
+      - panda_joint3
+      - panda_joint4
+      - panda_joint5
+      - panda_joint6
+      - panda_joint7
+    gripper:
+      type: joint_position
+      asset_name: robot
+      joint_names:
+      - panda_finger_joint1
+      - panda_finger_joint2

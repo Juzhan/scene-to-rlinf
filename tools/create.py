@@ -151,7 +151,10 @@ def create_project(name, template="planner_executor", policy=None, dry_run=False
             path.write_text(text)
         if (staging / 'task.py').is_file():
             from shared.assembly.object_schema import generate
-            generate(staging / 'scene.yaml', catalog_directory=source)
+            from shared.assembly.project import project_registry
+            # The same static view as check: asset names of every backend, not just the default one.
+            factories, terms, _ = project_registry(backend=None)
+            generate(staging / 'scene.yaml', catalog_directory=source, factories=factories, terms=terms)
         staging.rename(target)
     except BaseException:
         shutil.rmtree(staging)

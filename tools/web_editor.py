@@ -17,12 +17,13 @@ import copy
 import functools
 import gzip
 import hashlib
-import base64
+import html
 import io
 import json
 import os
 from pathlib import Path
 import posixpath
+import queue
 import re
 import sys
 import threading
@@ -36,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from shared import simready  # noqa: E402
 from shared.assembly import frames as F  # noqa: E402
 from shared.assembly.editing import SceneDocument, apply_edits, editing_copy  # noqa: E402
 from shared.assembly.mesh_preview import triangles  # noqa: E402
@@ -76,6 +78,11 @@ TREE_ROW = ('[id="{id}"]{{height:1.65em!important;padding:0 6px 0 {pad}px!import
 CAMERA_FOCAL, CAMERA_APERTURE = 24.0, 20.955
 GL_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 GIZMO_SCALE = .35
+# Entities a press-and-drag in the view slides over the floor; robots and terrain move only with the gizmo
+# so dragging across them still orbits the camera.
+DRAGGABLE = ('object', 'abstract')
+SHELF_PAGE = Path(__file__).with_name('asset_shelf.html')  # the add tab's asset shelf (an iframe)
+SKETCH_BACKGROUND = (243, 245, 248)  # canvas of the editor's flat-shaded asset sketches
 
 
 def _gizmo_handles():
@@ -116,10 +123,10 @@ THUMBNAILS = ROOT / '.cache' / 'asset_thumbnails'
 GALLERY_SCENE = ROOT / '.cache' / 'asset_gallery' / 'scene.yaml'
 # User-imported assets: named shared-factory presets, listed in the gallery.
 LIBRARY = ROOT / 'assets' / 'library.json'
-IMPORT_FACTORIES = ('urdf_robot', 'usd_robot', 'usd_object')
+IMPORT_FACTORIES = ('urdf_robot', 'usd_robot', 'usd_object', 'usd_articulation')
 # Tiles written by `run.py asset terrain`: listed on the shelf as usd_object presets.
 TERRAINS = ROOT / 'assets' / 'terrains'
-IMPORT_KINDS = {'机器人（带关节）': 'robot', '物体': 'object'}
+IMPORT_KINDS = {'机器人（带关节）': 'robot', '物体（柜门、抽屉等关节自动识别）': 'object'}
 # Global polish on top of viser 1.1.1's Mantine panels. Folder classes are viser's
 # compiled names; if they change the panels simply fall back to viser's look.
 THEME_CSS = """
@@ -189,21 +196,26 @@ CONTROL_REMOVE_CSS = ('div:has(> [id="{id}"]){{height:1px;padding:0!important;po
                       '{{margin:0!important;width:auto!important;height:auto!important}}'
                       '[id="{id}"] .mantine-Button-section svg{{position:static!important;transform:none!important;'
                       'display:block;width:15px;height:15px}}')
-GALLERY_CARD = ('[id="{id}"]{{height:auto!important;min-height:104px;padding:{padding}!important;'
-                'background:{bg} {image} center 6px/auto 66px no-repeat!important;border:{border}!important;'
-                'color:var(--mantine-color-text)!important;font-weight:400!important;'
-                'display:flex!important;align-items:center;justify-content:center}}'
-                '[id="{id}"] .mantine-Button-label{{white-space:normal!important;line-height:1.2;font-size:12px;'
-                'height:auto!important;justify-content:center;text-align:center}}'
-                '[id="{id}"] .mantine-Button-inner{{flex-direction:column;align-items:center;justify-content:center;'
-                'gap:8px;height:auto!important;width:100%}}'
-                # Mantine's left-section margin offsets the icon sideways once the row becomes a column.
-                # Its icon box keeps the small icon size with the svg absolutely placed, so the enlarged
-                # icon would overflow it; let the svg size the box instead.
-                '[id="{id}"] .mantine-Button-section,[id="{id}"] .mantine-Button-section > div'
-                '{{margin:0!important;justify-content:center;width:auto!important;height:auto!important}}'
-                '[id="{id}"] .mantine-Button-section svg{{position:static!important;transform:none!important;'
-                'width:30px;height:30px;opacity:.55}}')
+def sketch_on_white(path):
+    """PNG bytes of a shelf picture; editor sketches drawn on their grey canvas are brightened to white."""
+    from PIL import Image
+    with Image.open(path) as image:
+        if image.convert('RGB').getpixel((0, 0)) != SKETCH_BACKGROUND:
+            return path.read_bytes()
+        table = [min(255, round(v * 255 / c)) for c in SKETCH_BACKGROUND for v in range(256)]
+        stream = io.BytesIO()
+        image.convert('RGB').point(table).save(stream, format='PNG', optimize=True)
+    return stream.getvalue()
+
+
+def simready_preview_url(entry):
+    """The official SimReady preview, as served beside the editor (tools/simready_library.py)."""
+    return f"preview/320/{urllib.parse.quote(entry['publisher'])}/{urllib.parse.quote(entry['name'])}.jpg"
+
+
+def simready_thumbnail(publisher, name):
+    """Asset-shelf card image of a SimReady wrapper: the official white-background preview."""
+    return THUMBNAILS / f'simready-light_{publisher}_{name}.png'
 
 
 def _resolve(owner, reference):
@@ -419,7 +431,7 @@ def render_thumbnail(record, positions=None, size=128):
     low, high = screen.reshape(-1, 2).min(axis=0), screen.reshape(-1, 2).max(axis=0)
     scale = canvas * .86 / max(float(np.max(high - low)), 1e-6)
     screen = (screen - (low + high) / 2) * scale + canvas / 2
-    image = Image.new('RGB', (canvas, canvas), (243, 245, 248))
+    image = Image.new('RGB', (canvas, canvas), SKETCH_BACKGROUND)
     draw = ImageDraw.Draw(image)
     base = np.array([96, 140, 196])
     for index in np.argsort(depth):
@@ -455,6 +467,35 @@ def terrain_tiles():
     return tiles
 
 
+def usd_joints(path):
+    """Movable joints of a USD file: its ASSET.json joint_order when recorded, else read from the file."""
+    from shared.asset_formats import recorded_joint_order, usd_joint_order
+    recorded = recorded_joint_order(path)
+    return list(recorded) if recorded is not None else usd_joint_order(path)
+
+
+def recorded_assets():
+    """Library-style presets for objects imported under assets/ (e.g. ``run.py asset simready``):
+    usd_object, dynamic as their USD bodies and joints say. Robots stay with their own factories."""
+    items = []
+    for path in sorted(ROOT.glob('assets/*/ASSET.json')):
+        try:
+            record = json.loads(path.read_text())
+            usd, joints, source = record['formats']['usd'], record.get('joint_order') or [], record['simready']
+        except (OSError, ValueError, KeyError):
+            continue
+        note = f'SimReady {source.get("asset", path.parent.name)}（{source.get("license", "许可见 ASSET.json")}）'
+        note += f' · {len(joints)} 个被动关节，可读关节位置/速度' if joints else ' · 无关节'
+        item = {'id': 'asset_' + path.parent.name, 'label': path.parent.name, 'category': 'object',
+                'factory': 'usd_object', 'parameters': {'usd_path': usd}, 'note': note}
+        parts = Path(record.get('source', '')).parts
+        if parts[:2] == ('assets', 'simready') and len(parts) > 3:  # the official preview of its mirrored source
+            item['simready'] = parts[2], parts[3]
+            item['thumbnail'] = simready_thumbnail(*item['simready']).stem
+        items.append(item)
+    return items
+
+
 def save_library(entries):
     LIBRARY.parent.mkdir(parents=True, exist_ok=True)
     temporary = LIBRARY.with_suffix('.tmp')
@@ -471,7 +512,7 @@ def action(method):
 
 
 class Editor:
-    def __init__(self, scene, *, host='127.0.0.1', port=8080, native_preview=True):
+    def __init__(self, scene, *, host='127.0.0.1', port=8080, native_preview=True, library_port=None):
         import viser
         self.scene = None
         self._edit(scene)
@@ -481,6 +522,7 @@ class Editor:
         self.syncing = 0
         self.dragging = False
         self.selected = None
+        self.drag_events, self.body_drag, self.placing = queue.Queue(), None, None
         self.draft = None
         self.backend_problem = None  # Why the project's backend rejects the saved scene, if it does.
         self.export_thread = None
@@ -502,6 +544,9 @@ class Editor:
             self.start_export()
         threading.Thread(target=self._watch_changes, daemon=True).start()
         threading.Thread(target=self._camera_renderer, daemon=True).start()
+        threading.Thread(target=self._drag_worker, daemon=True).start()
+        self._start_library(host, library_port or self.server.get_port() + 1)
+        threading.Thread(target=self._load_simready, daemon=True).start()
 
     def guarded(self, function):
         def wrapper(*args, **kwargs):
@@ -539,7 +584,8 @@ class Editor:
             except (OSError, ValueError, KeyError):
                 self.manifest = {}
             self.preview_restore = None  # Previews refer to the nodes being replaced.
-            self.pending = {'actions': {}, 'resets': {}, 'meshes': {}, 'shapes': {}, 'shown': None, 'components': {}}
+            self.pending = {'actions': {}, 'resets': {}, 'meshes': {}, 'shapes': {}, 'kinematic': {}, 'shown': None,
+                            'components': {}}
             self.labels, self.parameters = {}, {}
             self._build_tree()
             if state:
@@ -900,8 +946,15 @@ class Editor:
             handle = scene.add_frame(name, show_axes=True, axes_length=shape['length'] * (1.6 if highlight else 1),
                                      axes_radius=shape['length'] * .04)
         # No per-node click handlers: viser outlines hovered clickable nodes and
-        # lets them swallow pointer events meant for the transform gizmo.
+        # lets them swallow pointer events meant for the transform gizmo. Bodies that can be
+        # moved get a drag handler instead: pressing on one and dragging slides it (see _drag).
         node.handle = handle
+        if kind in ('mesh', 'box', 'sphere') and node.owner and node.owner[0] == 'entity' \
+                and self.items.get(node.owner[1], {}).get('category') in DRAGGABLE:
+            async def dragged(event, owner=node.owner):  # async: phases arrive in order
+                self.drag_events.put((owner, event.phase, event.start_position, event.end_position,
+                                      event.client.camera.position))
+            handle.on_drag(dragged)
 
     def _update_frame(self, node):
         handle = self.handles.get(id(node))
@@ -914,7 +967,13 @@ class Editor:
             return
         shapes = self.info[owner[1]]['meshes'] if owner[0] == 'entity' else []
         for shaped in [node, *shapes]:
-            if shaped.shape and shaped.name:
+            if not (shaped.shape and shaped.name):
+                continue
+            solid = shaped.shape['type'] in ('mesh', 'sphere', 'box') and not shaped.shape.get('region')
+            if solid and shaped.handle is not None and shaped.shape.get('color') is not None:
+                # Recolour in place: re-adding the node would end a drag that is selecting it.
+                shaped.handle.color = COLORS['selected'] if on else shaped.shape.get('color')
+            else:
                 self._draw_shape(shaped, highlight=on)
 
     def _client_connected(self, client):
@@ -982,6 +1041,14 @@ class Editor:
     @action
     def _scene_clicked(self, event):
         origin = np.asarray(event.ray_origin, float)
+        if self.placing:
+            point = self.surface_point(origin, event.ray_direction)
+            if point is None:
+                raise ValueError('没有点到地面或物体表面，请朝下点击')
+            placing = self.placing
+            self.cancel_placement()
+            placing['add']([round(float(value), 4) for value in point])
+            return
         if self.gizmo.visible and self._near_gizmo(origin, event.ray_direction):
             return  # Clicks on the transform handles never select what lies behind them.
         self.select(self.pick(origin, event.ray_direction, self.selected))
@@ -1013,7 +1080,9 @@ class Editor:
 
     @action
     def escape(self):
-        if self.preview_restore:
+        if self.placing:
+            self.cancel_placement(f'已取消放置 {self.placing["label"]}')
+        elif self.preview_restore:
             self._end_preview()
             self._rebuild_inspector()
             self.report('已取消预览，恢复原位')
@@ -1101,6 +1170,82 @@ class Editor:
             self.pose_fields[1].value = tuple(round(v, 3) for v in F.matrix_euler(node.local))
         finally:
             self.syncing -= 1
+
+    def _drag_worker(self):
+        """Body drags in event order (viser callbacks run on a pool): the grab point follows the pointer
+        over the horizontal plane at its height, so the entity slides without changing height."""
+        while True:
+            owner, phase, grab, pointer, camera = self.drag_events.get()
+            try:
+                self._drag(owner, phase, np.asarray(grab, float), np.asarray(pointer, float), np.asarray(camera, float))
+            except Exception as error:  # noqa: BLE001 - reported, the next drag starts fresh
+                traceback.print_exc()
+                self.body_drag = None
+                self.report(f'拖动失败：{error}', error=True)
+
+    def _drag(self, owner, phase, grab, pointer, camera):
+        with self.lock:
+            if phase == 'start':
+                node = self._node_of(owner)
+                if node is None or self._locked(owner) or self.preview_restore or self.placing:
+                    return
+                if owner != self.selected:
+                    self.select(owner)
+                self.checkpoint(('drag', owner, time.monotonic()))  # each drag is one undo step
+                self.body_drag = {'owner': owner, 'grab': grab, 'world': node.world().copy()}
+                return
+            drag = self.body_drag
+            if drag is None or drag['owner'] != owner:
+                return
+            if phase == 'end':
+                self.body_drag, self.undo_tag = None, None
+            # `pointer` lies on the pointer ray (viser's camera-facing drag plane); meet the grab height.
+            ray = pointer - camera
+            if abs(ray[2]) > 1e-6:
+                t = (drag['grab'][2] - camera[2]) / ray[2]
+                hit = camera + t * ray
+                if t > 0 and np.linalg.norm(hit - camera) < 100:
+                    node = self._node_of(owner)
+                    world = drag['world'].copy()
+                    world[:2, 3] += (hit - drag['grab'])[:2]
+                    node.local = np.linalg.inv(node.parent.world()) @ world if node.parent else world
+                    self._update_frame(node)
+                    self._place_gizmo()
+                    self._sync_pose_fields(node)
+            if phase == 'end':
+                self.request_camera_view()
+                self.report(f'已移动 {self.items[owner[1]]["name"]}（保存后写入 scene.yaml）')
+
+    def surface_point(self, origin, direction):
+        """Where a view ray first meets a robot, object or terrain surface, else the floor (z = 0)."""
+        origin = np.asarray(origin, float)
+        direction = np.asarray(direction, float) / np.linalg.norm(direction)
+        hidden = {id(self._node_of(owner)) for owner in self.hidden}
+        nearest = None
+        for node in self.nodes:
+            if not node.shape or not node.owner or node.owner[0] != 'entity' \
+                    or self.items[node.owner[1]]['category'] not in ('robot', 'object', 'terrain') \
+                    or hidden and any(id(n) in hidden for n in (node, *node.ancestors())):
+                continue
+            inverse = np.linalg.inv(node.world())
+            distance = ray_shape(node.shape, inverse[:3, :3] @ origin + inverse[:3, 3], inverse[:3, :3] @ direction)
+            if distance is not None and (nearest is None or distance < nearest):
+                nearest = distance
+        if nearest is None and direction[2] < -1e-6:
+            nearest = -origin[2] / direction[2]
+        return None if nearest is None else origin + nearest * direction
+
+    def arm_placement(self, label, add):
+        """The next click in the view adds `label` there through ``add(position)``; Esc cancels."""
+        self.placing = {'label': label, 'add': add}
+        self.place_style.content = '<style>canvas{cursor:crosshair!important}</style>'
+        self.report(f'放置 {label}：在 3D 视图中点击位置（落在点到的表面上，Esc 取消）')
+
+    def cancel_placement(self, text=None):
+        self.placing = None
+        self.place_style.content = ''
+        if text:
+            self.report(text)
 
     @action
     def _pose_field_changed(self, _event):
@@ -1224,6 +1369,8 @@ class Editor:
                     changes['parameters'] = parameters
             if path in self.pending['resets']:
                 changes['reset'] = self.pending['resets'][path]
+            if self.pending['kinematic'].get(path, item.get('kinematic', False)) != item.get('kinematic', False):
+                changes['kinematic'] = self.pending['kinematic'][path]
             if path in self.pending['meshes'] and self.pending['meshes'][path] != item.get('meshes', []):
                 changes['meshes'] = self.pending['meshes'][path] or None
             if path in self.pending['shapes']:
@@ -1482,23 +1629,34 @@ class Editor:
             self.tree_folder = gui.add_folder(None)
             self.tree_items = []
         with panel.add_tab('添加', icon='plus'):
-            with gui.add_folder('资产'):
-                self.asset_category = gui.add_dropdown('类别', ['全部'])
-                self.gallery_style, self.gallery_pick_style = gui.add_html(''), gui.add_html('')
-                self.gallery_folder = gui.add_folder('陈列栏')
-                self.gallery_cards, self.gallery_signature, self.asset_choice = {}, None, None
-                self.asset_card = gui.add_markdown('')
-                self.asset_name = gui.add_text('实体名称', 'new_object')
+            self.place_style = gui.add_html('')
+            # The shelf is a small page (tools/asset_shelf.html, served with the SimReady library) listing
+            # every source: this backend's catalog, the user library and its imports, abstract entities
+            # and the SimReady datasets. A card is dragged into the view, or chosen and placed by a click
+            # in the view. The fields below hold what it does not show.
+            self.shelf_frame = gui.add_html('<small>资产架启动中…</small>')
+            self.gallery_entries, self.asset_choice, self.asset_variant, self.shelf_items = {}, None, None, []
+            self.shelf_categories, self.shelf_detail, self.shelf_focus = [], None, False
+            self.shelf_revision, self.shelf_items_revision, self.entity_name = 0, 0, 'new_object'
+            self.mount_targets, self.mount_groups = {}, {}
+            self.simready_entries, self.simready_problems, self.simready_loaded = {}, {}, False
+            self.simready_job, self.library, self.library_url, self.shelf_pictures = None, None, None, {}
+            with gui.add_folder('选项 · 按坐标添加', expand_by_default=False):
                 self.asset_mount = gui.add_dropdown('安装到', [NONE], hint='传感器随该实体的连杆运动')
                 self.asset_mount_body = gui.add_dropdown('安装连杆', [ROOT_BODY])
                 self.asset_mount.on_update(lambda _: self.syncing or self.guarded(self._offer_mount_bodies)())
-                self.mount_targets, self.mount_groups = {}, {}
+                self.asset_mount_body.on_update(lambda _: self.syncing or self._shelf_changed())
+                self.asset_size = gui.add_vector3('尺寸 (m)', (.5, .5, .5), min=(.001, .001, .001), step=.001,
+                                                  hint='全长；矩形取前两项')
                 self.asset_parameters = gui.add_text('参数 (JSON)', '{}', multiline=True)
                 self.asset_placement = gui.add_dropdown('初始位置', ['资产默认初始位置', '指定位置'])
                 self.asset_position = gui.add_vector3('位置 (m)', (0.0, 0.0, 0.0), step=.001)
-                self.asset_size = gui.add_vector3('尺寸 (m)', (.5, .5, .5), min=(.001, .001, .001), step=.001,
-                                                  hint='全长；矩形取前两项')
-                gui.add_button('添加到场景', color='green', icon='plus').on_click(lambda _: self._add_asset())
+                gui.add_button('按坐标添加选中的资产', icon='plus').on_click(lambda _: self._add_asset())
+            with gui.add_folder('更多', expand_by_default=False):
+                self.simready_status = gui.add_markdown('<small>SimReady：正在读取目录…</small>')
+                gui.add_button('打开完整 SimReady 资产库', icon='layout-grid').on_click(
+                    lambda event: self._open_library(event.client))
+                self.simready_link = gui.add_markdown('')
                 gui.add_button('生成缺失示意图（Isaac 后台）', icon='photo').on_click(lambda _: self.start_thumbnails())
             with gui.add_folder('导入 URDF / USD', expand_by_default=False):
                 gui.add_markdown('<small>登记到资产库（assets/library.json），所有项目的陈列栏都可使用；'
@@ -1514,7 +1672,6 @@ class Editor:
                 self.group_folder = gui.add_folder(None)
                 self.group_boxes = {}
                 gui.add_button('组成布局组合', icon='stack-2').on_click(lambda _: self._create_group())
-            self.asset_category.on_update(lambda _: self._refresh_assets())
         with panel.add_tab('观察', icon='eye'):
             # Rebuilt per scene: training switch, then one page of input checkboxes per module.
             self.observation_folder = gui.add_folder(None)
@@ -1577,14 +1734,6 @@ class Editor:
                 lambda _, callback=callback: callback())
 
     def _refresh_lists(self):
-        self.syncing += 1
-        try:
-            categories = sorted({entry.get('category', 'object') for entry in self.snapshot['catalog'].get('assets', [])
-                                 if entry.get('on_shelf', True)}) + ['abstract']
-            self.category_names = {'全部': None, **{CATEGORY_LABELS.get(c, c): c for c in categories}}
-            self.asset_category.options = list(self.category_names)
-        finally:
-            self.syncing -= 1
         self._rebuild_tree_gui()
         self._rebuild_group_choices()
         self._refresh_assets()
@@ -1802,6 +1951,8 @@ class Editor:
             self._initial_section(path)
         if item['category'] not in ('sensor', 'terrain', 'light') and not info['fixed']:
             self._reset_section(path)
+        if item['category'] == 'object' and item.get('scope') != 'global' and not info['fixed'] and not item.get('mount'):
+            self._motion_section(path)
         if item.get('meshes') or 'height_scan' in self.asset_entry(item['factory']).get('capabilities', []):
             self._meshes_section(path)
         self._add(gui.add_button('删除实体', color='red', icon='trash')).on_click(lambda _: self._delete(path))
@@ -2046,12 +2197,21 @@ class Editor:
         self.report('已解除，世界位置保留')
 
     @action
-    def _add_asset(self):
+    def _add_asset(self, position=None):
+        return self._add_choice(position)
+
+    def _add_choice(self, position=None):
+        """Add the shelf's choice: at `position` (a click or drop in the view), else as the form says."""
+        key = self._simready_choice()
+        if key:
+            if position is None:
+                position = list(self.asset_position.value) if self.asset_placement.value == '指定位置' else [0, 0, 0]
+            return self.library_add(key, self.entity_name, position)
         choice = self.gallery_entries.get(self.asset_choice)
         if not choice:
-            raise ValueError('请在陈列栏中选择资产')
+            raise ValueError('请在资产架中选择资产')
         if choice.get('shape'):
-            return self._add_abstract(choice['shape'])
+            return self._add_abstract(choice['shape'], position)
         factory = choice['factory']
         parameters = json.loads(self.asset_parameters.value or '{}')
         if not isinstance(parameters, dict):
@@ -2059,7 +2219,7 @@ class Editor:
         self._save_first()
         entry = next(item for item in self.snapshot['catalog']['assets'] if item['id'] == factory)
         category = entry.get('category', 'object')
-        name = self.asset_name.value.strip()
+        name = self.entity_name
         entity = {'name': name, 'factory': factory, 'kind': category if category in ('robot', 'sensor') else 'entity',
                   'parameters': parameters}
         if category == 'sensor' and self.asset_mount.value != FREE:
@@ -2067,16 +2227,21 @@ class Editor:
             for key, field in entry.get('parameters', {}).items():
                 if field.get('mount_body') and key not in parameters:  # e.g. the frame a transformer reports.
                     parameters[key] = self._root_body(entity['mount']['entity'])
-        elif self.asset_placement.value == '指定位置':
-            entity['pose'] = {'position': list(self.asset_position.value), 'orientation': [1, 0, 0, 0]}
+        elif position is not None or self.asset_placement.value == '指定位置':
+            entity['pose'] = {'position': list(position or self.asset_position.value), 'orientation': [1, 0, 0, 0]}
+        self._add_entity(entity, entry)
+
+    def _add_entity(self, entity, entry):
         retargeted = self._aim_rays(entity, 'height_scan' in entry.get('capabilities', []))
         self._apply({'revision': self.snapshot['revision'], 'add_entities': [entity], 'entities': retargeted})
-        added = next((item for item in self.snapshot['entities'] if item['name'] == name and item['factory'] == factory), None)
+        added = next((item for item in self.snapshot['entities']
+                      if item['name'] == entity['name'] and item['factory'] == entity['factory']), None)
         if added:
             self.select(('entity', added['path']))
             if self.visual(added)[0] is None and added['category'] in ('robot', 'object', 'terrain'):
                 self.start_export()
-        self.report(f'已添加 {name}')
+        self.report(f'已添加 {entity["name"]}')
+        self._describe_asset()  # a fresh name for the next one
 
     def _offer_mounts(self):
         """Robots and objects a new sensor can go on; the selected one, else the first robot.
@@ -2115,6 +2280,7 @@ class Editor:
         self.asset_mount_body.visible = target is not None
         # Mounted: the pose is an offset on the body, set afterwards in the inspector.
         self.asset_placement.visible = self.asset_position.visible = target is None
+        self._shelf_changed()
 
     def _root_body(self, target):
         body = self.initial_display(target).get('root_body', '')
@@ -2163,7 +2329,7 @@ class Editor:
             entries[factory] = {'label': entry.get('label', factory), 'factory': factory, 'parameters': None,
                                 'category': entry.get('category', 'object'), 'entry': entry,
                                 'key': thumbnail_key(factory, {})}
-        for item in load_library() + terrain_tiles():
+        for item in load_library() + terrain_tiles() + recorded_assets():
             entry = catalog.get(item.get('factory'))
             if entry:
                 if item.get('note'):
@@ -2173,7 +2339,7 @@ class Editor:
                 entries['library:' + item['id']] = {
                     'label': item.get('label') or item['id'], 'factory': item['factory'], 'library': item,
                     'parameters': item.get('parameters', {}), 'category': item.get('category') or entry.get('category', 'object'),
-                    'entry': entry, 'key': thumbnail_key(item['factory'], item.get('parameters', {}))}
+                    'entry': entry, 'key': item.get('thumbnail') or thumbnail_key(item['factory'], item.get('parameters', {}))}
         for shape, label in ABSTRACT_SHAPES.items():
             # Abstract entities: no model or physics, listed alongside assets.
             entries['abstract:' + shape] = {
@@ -2183,53 +2349,218 @@ class Editor:
         return entries
 
     def _refresh_assets(self):
+        """Rebuild the shelf's items and categories (scene catalog, library, SimReady); the shelf page refetches."""
         self.gallery_entries = self._gallery()
-        category = self.category_names.get(self.asset_category.value) if hasattr(self, 'category_names') else None
-        shown = [choice for choice, entry in self.gallery_entries.items() if category is None or entry['category'] == category]
-        thumbnails = {choice: THUMBNAILS / (self.gallery_entries[choice]['key'] + '.png') for choice in shown}
-        signature = [(choice, self.gallery_entries[choice]['label'], thumbnails[choice].is_file()) for choice in shown]
-        if signature != self.gallery_signature:
-            self.gallery_signature = signature
-            for card in self.gallery_cards.values():
-                card.remove()
-            self.gallery_cards = {}
-            with self.gallery_folder:
-                for choice in shown:
-                    entry = self.gallery_entries[choice]
-                    card = self.server.gui.add_button(entry['label'], hint=entry['entry'].get('description') or None,
-                                                      icon=None if thumbnails[choice].is_file() else
-                                                      entry.get('icon') or ICONS.get(entry['category'], 'box'))
-                    card.on_click(lambda _, choice=choice: self._choose_asset(choice))
-                    self.gallery_cards[choice] = card
-            rules = []
-            for index, (choice, card) in enumerate(self.gallery_cards.items()):
-                path = thumbnails[choice]
-                image = 'url(data:image/png;base64,' + base64.b64encode(path.read_bytes()).decode() + ')' if path.is_file() else ''
-                rules.append(GALLERY_CARD.format(id=card._impl.uuid, image=image, bg='var(--mantine-color-default)',
-                                                 padding='74px 4px 4px' if image else '8px 4px',
-                                                 border='1px solid var(--mantine-color-default-border)'))
-                if index == 0:  # Lay the folder's button wrappers out as a two-column grid.
-                    rules.append(f'div:has(> div > [id="{card._impl.uuid}"]){{display:grid!important;'
-                                 'grid-template-columns:1fr 1fr;gap:6px;padding:0 4px}}'
-                                 f'div:has(> div > [id="{card._impl.uuid}"]) > div{{margin:0!important;padding:0!important}}')
-            self.gallery_style.content = '<style>' + ''.join(rules) + '</style>'
-        if self.asset_choice not in self.gallery_cards:
-            self.asset_choice = next(iter(self.gallery_cards), None)
+        items = []
+        for choice, entry in self.gallery_entries.items():
+            source = (entry.get('library') or {}).get('simready')
+            if source and '/'.join(source) in self.simready_entries:
+                continue  # A wrapped SimReady asset is shown once, as its SimReady card.
+            label = CATEGORY_LABELS.get(entry['category'], entry['category'])
+            meta = entry['entry'].get('category_label') or label
+            picture = THUMBNAILS / (entry['key'] + '.png')
+            items.append({'id': choice, 'label': entry['label'], 'category': entry['category'], 'members': None,
+                          'meta': meta + (' · 资产库' if entry.get('library') else ''), 'badge': None,
+                          'shape': entry.get('shape'), 'local': True,
+                          'image': f"thumb/{urllib.parse.quote(entry['key'])}.png" if picture.is_file() else None,
+                          'search': f"{entry['label']} {choice} {entry['category']} {label}".lower()})
+        families = {}
+        for key, entry in sorted(self.simready_entries.items()):
+            base = re.sub(r'_[a-z]{0,2}\d{1,3}$', '', entry['name'])  # e.g. the 20 apple variants
+            families.setdefault(f"{entry['publisher']}/{base}", []).append(entry)
+        for family, members in families.items():
+            first = next((entry for entry in members if entry['local']), members[0])
+            base, category = family.split('/', 1)[1], members[0]['category']
+            shown = base[len(category) + 1:] if base.startswith(category + '_') and len(base) > len(category) + 1 else base
+            local = sum(entry['local'] for entry in members)
+            items.append({'id': 'simready:' + family, 'label': shown.replace('_', ' '), 'category': 'simready:' + category,
+                          'members': [{'key': f"{entry['publisher']}/{entry['name']}", 'name': entry['name'],
+                                       'local': entry['local'], 'image': simready_preview_url(entry)} for entry in members],
+                          'first': f"{first['publisher']}/{first['name']}", 'shape': None,
+                          'local': local == len(members) or ('partial' if local else False),
+                          'badge': f'×{len(members)}' if len(members) > 1 else None, 'image': simready_preview_url(first),
+                          'meta': category + ('' if first['publisher'] == 'nvidia' else f" · {first['publisher']}"),
+                          'search': f"{family} {category} {' '.join(entry['name'] for entry in members)}".lower()})
+        counts = {}
+        for item in items:
+            counts[item['category']] = counts.get(item['category'], 0) + 1
+        own = [c for c in CATEGORY_LABELS if c in counts] + sorted(c for c in counts if c not in CATEGORY_LABELS
+                                                                   and not c.startswith('simready:'))
+        categories = [{'value': c, 'label': CATEGORY_LABELS.get(c, c), 'count': counts[c], 'group': '本项目可用'} for c in own]
+        simready_count = sum(n for c, n in counts.items() if c.startswith('simready:'))
+        if simready_count:
+            categories.append({'value': 'simready:', 'label': 'SimReady 全部', 'count': simready_count, 'group': 'SimReady'})
+            categories += [{'value': c, 'label': c[9:], 'count': counts[c], 'group': 'SimReady'}
+                           for c in sorted((c for c in counts if c.startswith('simready:')), key=lambda c: (-counts[c], c))]
+        self.shelf_items, self.shelf_categories = items, categories
+        self.shelf_items_revision += 1
+        if self._shelf_item() is None:
+            self.asset_choice = self.asset_variant = None
         self._describe_asset()
+
+    def _shelf_item(self, choice=None):
+        choice = self.asset_choice if choice is None else choice
+        return next((item for item in self.shelf_items if item['id'] == choice), None)
+
+    def _simready_choice(self):
+        """publisher/asset of the SimReady card (and variant) chosen on the shelf, else None."""
+        item = self._shelf_item()
+        if not item or not item['members']:
+            return None
+        return self.asset_variant if any(member['key'] == self.asset_variant for member in item['members']) else item['first']
+
+    def _shelf_changed(self):
+        self.shelf_revision += 1
+
+    def _mounting(self):
+        """The entity a sensor about to be added is mounted on (it then needs no place in the view)."""
+        return self.mount_targets.get(self.asset_mount.value) if self.asset_mount.visible else None
+
+    @action
+    def _shelf_arm(self):
+        item = self._shelf_item()
+        if item is None:
+            raise ValueError('请先在资产架中选择资产')
+        if self._mounting() is not None:
+            return self._add_choice()  # a mounted sensor has no place to click
+        self.arm_placement(self.entity_name or item['label'], lambda position: self._add_asset(position))
+        self._shelf_changed()
 
     @action
     def _choose_asset(self, choice):
-        self.asset_choice = choice
+        """Select `choice` (e.g. a just imported asset); the shelf page clears its filters to show it."""
+        self.asset_choice, self.asset_variant, self.shelf_focus = choice, None, True
         self._describe_asset()
 
+    # The shelf page's API (tools/asset_shelf.html through tools/simready_library.py).
+    def shelf_get(self, name, query):
+        with self.lock:
+            if name == 'items':
+                return {'items': self.shelf_items, 'categories': self.shelf_categories,
+                        'loading': not self.simready_loaded, 'revision': self.shelf_items_revision}
+            if name == 'state':
+                return self._shelf_state()
+        raise KeyError(f'未知的资产架请求 {name}')
+
+    def shelf_post(self, name, request):
+        """Shelf actions; a rejected one is also shown in the editor and comes back to the page as an error."""
+        with self.lock:
+            try:
+                if name == 'select':
+                    self._shelf_select(request.get('id'), request.get('variant'))
+                elif name == 'option':
+                    self._shelf_option(request)
+                elif name == 'arm':
+                    self._shelf_name(request)
+                    self._shelf_arm.__wrapped__(self)
+                elif name == 'cancel':
+                    if self.placing:
+                        self.cancel_placement(f'已取消放置 {self.placing["label"]}')
+                elif name == 'drop':
+                    self._shelf_drop(request)
+                else:
+                    raise KeyError(f'未知的资产架请求 {name}')
+            except Exception as error:
+                self.report(f'⚠️ {error}', error=True)
+                raise
+            self.shelf_revision += 1
+            return self._shelf_state()
+
+    def _shelf_state(self):
+        mount = self._mounting()
+        options = {}
+        if self.asset_mount.visible:
+            options['mount'] = {'options': list(self.asset_mount.options), 'value': self.asset_mount.value}
+        if self.asset_mount_body.visible:
+            options['body'] = {'options': list(self.asset_mount_body.options), 'value': self.asset_mount_body.value}
+        if self.asset_size.visible:
+            options['size'] = [float(v) for v in self.asset_size.value]
+        state = {'items': self.shelf_items_revision, 'revision': self.shelf_revision, 'choice': self.asset_choice,
+                 'variant': self._simready_choice(), 'name': self.entity_name, 'detail': self.shelf_detail,
+                 'focus': self.shelf_focus, 'options': options, 'mounted': mount is not None,
+                 'button': f'安装到 {self.asset_mount.value}' if mount is not None else '点击放置',
+                 'placing': self.placing and self.placing['label'], 'job': self.simready_job}
+        self.shelf_focus = False
+        return state
+
+    def _shelf_select(self, choice, variant=None):
+        if self._shelf_item(choice) is None:
+            raise KeyError(f'资产架中没有 {choice}')
+        if self.placing:
+            self.cancel_placement()
+        if choice != self.asset_choice or variant != self.asset_variant:
+            self.asset_choice, self.asset_variant = choice, variant
+            self._describe_asset()
+
+    def _shelf_name(self, request):
+        name = str(request.get('name') or '').strip()
+        if name:
+            if not name.isidentifier():
+                raise ValueError(f'实体名称 {name!r} 须是 Python 标识符（字母、数字、下划线）')
+            self.entity_name = name
+
+    def _shelf_option(self, request):
+        self._shelf_name(request)
+        self.syncing += 1
+        try:
+            if request.get('mount') in (self.asset_mount.options or ()):
+                self.asset_mount.value = request['mount']
+            if request.get('size'):
+                self.asset_size.value = tuple(float(v) for v in request['size'])
+        finally:
+            self.syncing -= 1
+        if 'mount' in request:
+            self._offer_mount_bodies()
+        if request.get('body') in (self.asset_mount_body.options or ()):
+            self.asset_mount_body.value = request['body']
+
+    def _shelf_drop(self, request):
+        """A card dropped on the view at (u, v) of its canvas: add it where that pixel's ray meets a surface."""
+        self._shelf_select(request.get('id'), request.get('variant'))
+        self._shelf_name(request)
+        if self._mounting() is not None:
+            return self._add_choice()
+        u, v, aspect = (float(request[key]) for key in ('u', 'v', 'aspect'))
+        clients = list(self.server.get_clients().values())
+        if not clients:
+            raise ValueError('没有打开的 3D 视图')
+        # The browser that dropped it: the one whose view has this canvas' proportions.
+        camera = min(clients, key=lambda client: abs(client.camera.aspect - aspect)).camera
+        half = np.tan(camera.fov / 2)
+        ray = F.quat_matrix(camera.wxyz)[:3, :3] @ [(2 * u - 1) * half * aspect, (2 * v - 1) * half, 1.0]  # OpenCV camera
+        point = self.surface_point(camera.position, ray)
+        if point is None:
+            raise ValueError('没有落在地面或物体表面上，请拖到地面上')
+        self._add_choice([round(float(value), 4) for value in point])
+
+    def shelf_picture(self, key):
+        """A catalog sketch for the shelf page, brightened to its white cards."""
+        path = THUMBNAILS / f'{key}.png'
+        if '/' in key or '..' in key or not path.is_file():
+            raise KeyError(f'没有示意图 {key}')
+        stamp = (path, path.stat().st_mtime)
+        if stamp not in self.shelf_pictures:
+            self.shelf_pictures[stamp] = sketch_on_white(path)
+        return self.shelf_pictures[stamp]
+
     def _describe_asset(self):
-        card = self.gallery_cards.get(self.asset_choice)
-        self.gallery_pick_style.content = '' if card is None else \
-            f'<style>[id="{card._impl.uuid}"]{{border:2px solid rgb(255,170,40)!important;background-color:rgba(255,170,40,.12)!important}}</style>'
-        choice = self.gallery_entries.get(self.asset_choice)
-        if not choice:
-            self.asset_card.content = '无可用资产'
-            return
+        """Fit the option fields to the chosen asset, suggest a name and publish the shelf's detail."""
+        self.shelf_detail = None
+        key = self._simready_choice()
+        if key:
+            self._describe_simready(key)
+        elif self.gallery_entries.get(self.asset_choice):
+            self._describe_gallery()
+        else:
+            for field in (self.asset_mount, self.asset_mount_body, self.asset_size, self.asset_parameters):
+                field.visible = False
+        self._shelf_changed()
+
+    def _detail(self, title, meta, lines, image=None):
+        self.shelf_detail = {'title': title, 'meta': meta, 'lines': [line for line in lines if line], 'image': image}
+
+    def _describe_gallery(self):
+        choice, item = self.gallery_entries[self.asset_choice], self._shelf_item()
         shape = choice.get('shape')
         sensor = shape is None and choice['category'] == 'sensor'
         self.asset_parameters.visible = shape is None
@@ -2239,38 +2570,217 @@ class Editor:
             self._offer_mounts()
         self.asset_size.visible = shape in ('rectangle', 'box')
         if shape:
-            self.asset_card.content = (f'**{choice["label"]}** · 抽象体 · `{shape}`  \n'
-                                       f'无模型、无物理；与物体一样可选作观察、跟随物体（mount）、随机复位。'
-                                       f'{ABSTRACT_NOTES[shape]}含义由 task.py / 模型决定。')
+            self._detail(choice['label'], f'抽象体 · {shape}', [
+                '无模型、无物理；可选作观察、跟随物体（mount）、随机复位。' + ABSTRACT_NOTES[shape] + '含义由 task.py / 模型决定。'],
+                item['image'])
             self._suggest_name({'point': 'target', 'direction': 'heading', 'rectangle': 'area', 'box': 'volume'}[shape], {})
             return
         factory, entry = choice['factory'], choice['entry']
         required = [name for name, field in entry.get('parameters', {}).items() if field.get('required')]
-        fields = ', '.join(f'`{name}`' for name in entry.get('parameters', {}))
+        fields = ', '.join(entry.get('parameters', {}))
         library = choice.get('library')
-        source = (f'{"地形地块" if library.get("category") == "terrain" else "资产库"} · `{factory}`' if library
-                  else f'`{factory}`')
-        self.asset_card.content = (f'**{choice["label"]}** · {entry.get("category_label", "")} · {source}  \n'
-                                   f'{entry.get("description", "")}  \n'
-                                   + (f'能力：{", ".join(entry.get("capabilities", []))}  \n' if entry.get('capabilities') else '')
-                                   + (f'**必填参数**：{", ".join(required)}  \n' if required and not choice.get('library') else '')
-                                   + (f'可选参数：{fields}' if fields else ''))
+        source = (f'{"地形地块" if library.get("category") == "terrain" else "资产库"} · {factory}' if library
+                  else factory)
+        self._detail(choice['label'], f'{entry.get("category_label") or CATEGORY_LABELS.get(choice["category"], "")} · {source}', [
+            entry.get('description', ''),
+            f'能力：{", ".join(entry.get("capabilities", []))}' if entry.get('capabilities') else '',
+            f'必填参数：{", ".join(required)}' if required and not library else '',
+            f'参数：{fields}（“选项 · 按坐标添加”中填写）' if fields else ''], item['image'])
         parameters = choice['parameters'] if choice['parameters'] is not None else \
             {name: field.get('default', field.get('example')) for name, field in entry.get('parameters', {}).items()
              if field.get('required') and ('default' in field or 'example' in field)}
-        self._suggest_name(re.sub(r'\W', '_', choice['library']['id'] if choice.get('library') else factory), parameters)
+        self._suggest_name(re.sub(r'\W', '_', library['id'] if library else factory), parameters)
 
-    def _suggest_name(self, base, parameters):
+    def _describe_simready(self, key):
+        entry = self.simready_entries[key]
+        self.asset_parameters.visible = self.asset_size.visible = False
+        self.asset_mount.visible = self.asset_mount_body.visible = False
+        self.asset_placement.visible = self.asset_position.visible = True
+        size = f" · {entry['bytes'] / 1e6:.1f} MB" if entry.get('bytes') else ''
+        usage = self._simready_usage().get(key)
+        self._detail(entry['name'], f"SimReady · {entry['category']} · " + ('本地' if entry['local'] else '在线，添加时下载') + size, [
+            f'作为 usd_object 加入：刚体与关节按 USD 原样，默认动态 · {simready.LICENSE}',
+            f'场景中已有：{", ".join(usage)}' if usage else ''], simready_preview_url(entry))
+        base = re.sub(r'_[a-z]{0,2}\d{1,3}$', '', entry['name']).split('_')
+        self._suggest_name(base[-1] if len(base) > 1 else base[0], {})
+
+    def _unused_name(self, base):
         names = {item['name'] for item in self.snapshot['entities']}
         candidate, index = base, 2
         while candidate in names:
             candidate, index = f'{base}_{index}', index + 1
+        return candidate
+
+    def _suggest_name(self, base, parameters):
+        candidate = self._unused_name(base)
         self.syncing += 1
         try:
-            self.asset_name.value = candidate
+            self.entity_name = candidate
             self.asset_parameters.value = json.dumps(parameters, ensure_ascii=False)
         finally:
             self.syncing -= 1
+
+    # ----------------------------------------------------------------- SimReady
+    def _start_library(self, host, port):
+        """The full-page SimReady browser (tools/simready_library.py) on the editor's host."""
+        import types
+        from tools.simready_library import Library
+        try:
+            self.library = Library(host, port, types.SimpleNamespace(
+                catalog=self.library_catalog, asset=self.library_asset, status=self.library_status, add=self.library_add,
+                shelf_get=self.shelf_get, shelf_post=self.shelf_post, shelf_picture=self.shelf_picture,
+                origin_port=self.server.get_port()))
+        except OSError as error:
+            self.report(f'⚠️ SimReady 资产库未启动：{error}', error=True)
+            return
+        shown = 'localhost' if host in ('127.0.0.1', '0.0.0.0', '::', '') else host
+        self.library_url = f'http://{shown}:{self.library.port}/'
+        self.simready_link.content = f'<small>[在新标签页打开]({self.library_url}) · {self.library_url}</small>'
+        print(f'SimReady asset library: {self.library_url}')
+        # srcdoc: the page shares the editor's origin, so it can reach the view for drops; it calls the
+        # library server on the editor's host name (a remote browser needs that port forwarded too).
+        page = SHELF_PAGE.read_text().replace('__LIBRARY_PORT__', str(self.library.port))
+        self.shelf_frame.content = (f'<iframe srcdoc="{html.escape(page)}" title="资产架" style="display:block;width:100%;'
+                                    'height:calc(100vh - 250px);min-height:380px;border:1px solid #e3e6ea;'
+                                    'border-radius:8px;background:#f6f7f9"></iframe>')
+
+    def _open_library(self, client):
+        """The browser in a near-full-screen dialog over the editor."""
+        if not self.library_url:
+            raise ValueError('SimReady 资产库未启动')
+        modal = client.gui.add_modal('SimReady 资产库')
+        with modal:
+            client.gui.add_html(
+                '<style>.mantine-Modal-content{flex:0 0 96vw!important;max-width:96vw!important}'
+                '.mantine-Modal-inner{padding:2vh 2vw!important}</style>'
+                f'<iframe src="{self.library_url}" style="width:100%;height:84vh;border:0;border-radius:6px"></iframe>')
+            client.gui.add_button('关闭（新增的实体已在场景中，保存后写入 scene.yaml）').on_click(lambda _: modal.close())
+
+    def _load_simready(self):
+        """List SimReady assets (mirror, else online) and give wrapped ones their official preview."""
+        try:
+            entries, problems = simready.catalog()
+            for item in recorded_assets():
+                target = simready_thumbnail(*item['simready']) if item.get('simready') else None
+                if target and not target.is_file():
+                    with contextlib.suppress(Exception):  # offline: the card keeps its icon
+                        simready.thumbnail(*item['simready'], target)
+        except Exception as error:  # noqa: BLE001 - surfaced in the browser
+            traceback.print_exc()
+            entries, problems = [], {'目录': str(error)}
+        with self.lock:
+            self.simready_entries = {f"{entry['publisher']}/{entry['name']}": entry for entry in entries}
+            self.simready_problems, self.simready_loaded = problems, True
+            local = sum(entry['local'] for entry in entries)
+            self.simready_status.content = f'<small>{len(entries)} 个资产（本地 {local}）' + ''.join(
+                f'<br>⚠️ {source} 未能在线列出（只显示本地）：{text[:160]}' for source, text in problems.items()) + '</small>'
+            self._refresh_assets()
+
+    def _simready_usage(self):
+        """{publisher/asset: names of scene entities whose usd_object loads its wrapper}."""
+        sources = {item['parameters']['usd_path']: '/'.join(item['simready'])
+                   for item in recorded_assets() if item.get('simready')}
+        usage = {}
+        for entity in self.snapshot['entities']:
+            key = sources.get((entity.get('parameters') or {}).get('usd_path'))
+            if key:
+                usage.setdefault(key, []).append(entity['name'])
+        return usage
+
+    def library_catalog(self):
+        with self.lock:
+            usage = self._simready_usage()
+            entries = [{**entry, 'scene': usage.get(key, [])} for key, entry in self.simready_entries.items()]
+        return {'entries': entries, 'problems': self.simready_problems, 'loading': not self.simready_loaded,
+                'license': simready.LICENSE,
+                'sources': {name: {'repo': source['repo'], 'revision': source['revision']}
+                            for name, source in simready.SOURCES.items()}}
+
+    def library_asset(self, key):
+        entry = self.simready_entries.get(key)
+        if entry is None:
+            raise KeyError(f'未知的 SimReady 资产 {key!r}')
+        publisher, name = entry['publisher'], entry['name']
+        listed = simready.files(publisher, name, online=False)
+        if listed is None:
+            with contextlib.suppress(Exception):  # offline or delisted: details stay partial
+                listed = simready.files(publisher, name)
+        skipped = simready.duplicates(listed) if listed else set()
+        absent = simready.missing(publisher, name, listed) if listed and entry['local'] else None
+        root = simready.root_usd(name, listed) if listed else None
+        if root is None and entry['local']:
+            found = simready.local_root(publisher, name)
+            root = found.relative_to(simready.MIRROR / publisher).as_posix() if found else None
+        info = {'local': entry['local'], 'root': root.split('/', 1)[1] if root else None,
+                'files': len(listed) - len(skipped) if listed else None,
+                'bytes': sum(item['size'] for item in listed if item['path'] not in skipped) if listed else entry['bytes'],
+                'missing': None if absent is None else {'count': len(absent), 'bytes': sum(item['size'] for item in absent)},
+                'wrapper': None, 'wrapper_other': False, 'joints': None}
+        record_path = ROOT / 'assets' / name / 'ASSET.json'
+        if record_path.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                record = json.loads(record_path.read_text())
+                info['wrapper'] = f'assets/{name}'
+                info['wrapper_other'] = bool(root) and record.get('source') != f'assets/simready/{publisher}/{root}'
+                info['joints'] = len(record.get('joint_order') or [])
+        with self.lock:
+            info['scene'] = self._simready_usage().get(key, [])
+            info['suggested'] = self._unused_name(re.sub(r'\W', '_', name).lower())
+        return info
+
+    def library_status(self):
+        return self.simready_job
+
+    def library_add(self, key, name, position):
+        """Download/wrap ``key`` in the background, then add it to the scene as a usd_object at ``position``."""
+        entry = self.simready_entries.get(key)
+        if entry is None:
+            raise KeyError(f'未知的 SimReady 资产 {key!r}')
+        if not name.isidentifier():
+            raise ValueError(f'实体名称 {name!r} 须是 Python 标识符（字母、数字、下划线）')
+        position = [float(value) for value in position]
+        if len(position) != 3:
+            raise ValueError('位置须是 3 个数')
+        with self.lock:
+            if self.simready_job and self.simready_job['running']:
+                raise ValueError(f'{self.simready_job["key"]} 仍在准备中')
+            if name in {item['name'] for item in self.snapshot['entities']}:
+                raise ValueError(f'场景中已有实体 {name}')
+            job = self.simready_job = {'key': key, 'name': name, 'running': True, 'error': False, 'done': 0, 'total': 0,
+                                       'message': f'准备 {key}（{"本地镜像" if entry["local"] else "从 Hugging Face 下载"}，再包装）…'}
+        self.report(job['message'])
+        threading.Thread(target=self._prepare_simready, args=(job, entry, position), daemon=True).start()
+        return job
+
+    def _prepare_simready(self, job, entry, position):
+        shown = [0.0]
+
+        def progress(done, total):
+            job.update(done=done, total=total, message=f'下载 {job["key"]}：{done / 1e6:.1f}/{total / 1e6:.1f} MB')
+            if time.time() - shown[0] > 1 or done == total:
+                shown[0] = time.time()
+                self.report(job['message'])
+
+        try:
+            record = simready.prepare(entry['publisher'], entry['name'], progress)
+            entry['local'] = True
+            with contextlib.suppress(Exception):  # the shelf card falls back to its icon
+                simready.thumbnail(entry['publisher'], entry['name'], simready_thumbnail(entry['publisher'], entry['name']))
+            with self.lock:
+                factory = next((item for item in self.snapshot['catalog']['assets'] if item['id'] == 'usd_object'), None)
+                if factory is None:
+                    raise ValueError(f'已准备 {record["formats"]["usd"]}，但当前后端的资产目录没有 usd_object')
+                self._save_first()
+                self._add_entity({'name': job['name'], 'factory': 'usd_object', 'kind': 'entity',
+                                  'parameters': {'usd_path': record['formats']['usd']},
+                                  'pose': {'position': position, 'orientation': [1, 0, 0, 0]}}, factory)
+                self._refresh_assets()  # the wrapper also joins the asset shelf
+                job.update(scene=self._simready_usage().get(job['key'], []), running=False,
+                           message=f'已添加 {job["name"]}（{job["key"]}）；在编辑器中保存后写入 scene.yaml')
+        except Exception as error:  # noqa: BLE001 - surfaced in both pages
+            traceback.print_exc()
+            job.update(running=False, error=True, message=f'{job["key"]} 未添加：{error}')
+            self.report(f'⚠️ {job["message"]}', error=True)
 
     # --------------------------------------------------------------- thumbnails
     def _harvest_thumbnails(self):
@@ -2376,6 +2886,7 @@ class Editor:
                 raise ValueError('URDF 请按“机器人（带关节）”导入')
             factory, parameters = 'urdf_robot', {'urdf_path': stored, 'fix_base': self.import_fixed.value}
         elif suffix in ('.usd', '.usda', '.usdc', '.usdz'):
+            # Objects follow their USD bodies: dynamic, with passive joints (cabinet doors, drawers) if any.
             factory = 'usd_robot' if kind == 'robot' else 'usd_object'
             parameters = {'usd_path': stored, **({'fix_root_link': self.import_fixed.value} if kind == 'robot' else {})}
         else:
@@ -2393,10 +2904,10 @@ class Editor:
                     'factory': factory, 'parameters': parameters}
             library.append(same)
             save_library(library)
-        self.asset_category.value = '全部'
         self._refresh_assets()
         self._choose_asset('library:' + same['id'])
-        self.report(f'已登记资产 {same["label"]}；添加到场景后由 Isaac 加载。示意图在后台生成')
+        joints = f'，带 {len(usd_joints(path))} 个被动关节' if factory == 'usd_object' and usd_joints(path) else ''
+        self.report(f'已登记资产 {same["label"]}{joints}；添加到场景后加载。示意图在后台生成')
         self.start_thumbnails(keys={thumbnail_key(factory, parameters)})
 
     @action
@@ -2786,8 +3297,11 @@ class Editor:
             if current.get('region'):
                 gui.add_markdown(f'当前：随机放置于 `{current["region"]}`，偏航 {current.get("yaw_range", [0, 0])}'
                                  + (f'，每 {current["interval"]} s 重采样' if current.get('interval') else ''))
-            elif current:
+            elif current.get('states') or current.get('pose_range'):
                 gui.add_markdown('当前：YAML 中的 states / pose_range 复位')
+            if current.get('joint_positions'):
+                gui.add_markdown('关节随机范围（scene.yaml 中编辑，此处保留）：' + '，'.join(
+                    f'`{joint}` {list(bounds)}' for joint, bounds in current['joint_positions'].items()))
             if not areas:
                 gui.add_markdown('先在“添加 › 资产”陈列栏中添加抽象矩形或长方体，作为放置范围。')
             else:
@@ -2821,6 +3335,21 @@ class Editor:
             stage.on_click(execute)
         if clear is not None:
             clear.on_click(remove)
+
+    def _motion_section(self, path):
+        gui, title = self.server.gui, '运动方式'
+        current = self.pending['kinematic'].get(path, self.items[path].get('kinematic', False))
+        with self._section(title):
+            box = gui.add_checkbox('由 Task 移动（kinematic）', current)
+            gui.add_markdown('<small>不受力、不下落，能推动机器人；每步位姿由 task.py 返回的 `set` 给出，'
+                             '复位仍按“随机复位”放置。此类物体彼此不碰撞。</small>')
+
+        @self.guarded
+        def update(_):
+            self.checkpoint()
+            self.pending['kinematic'][path] = bool(box.value)
+            self.report(f'{path} 的运动方式已暂存；保存后写入 scene.yaml')
+        box.on_update(update)
 
     def _meshes_section(self, path):
         gui, title = self.server.gui, '射线目标'
@@ -2876,12 +3405,12 @@ class Editor:
         self._apply({'revision': self.snapshot['revision'], 'layout_groups': {name: None}}, select=None)
 
     # ---------------------------------------------------------- abstract entities
-    def _add_abstract(self, shape):
-        name = self.asset_name.value.strip()
+    def _add_abstract(self, shape, position=None):
+        name = self.entity_name
         size = [float(v) for v in self.asset_size.value][:{'rectangle': 2, 'box': 3}.get(shape, 0)]
         self._save_first()
         entity = {'name': name, 'kind': 'abstract', 'shape': shape, 'size': size,
-                  'pose': {'position': list(self.asset_position.value), 'orientation': [1, 0, 0, 0]}}
+                  'pose': {'position': list(position or self.asset_position.value), 'orientation': [1, 0, 0, 0]}}
         root = self.snapshot['name']
         self._apply({'revision': self.snapshot['revision'], 'add_entities': [entity]},
                     select=('entity', f'{root}/{name}'))
@@ -3167,11 +3696,14 @@ def main(argv=None):
     parser.add_argument('--host', default='127.0.0.1', help='Use 0.0.0.0 only on a trusted network')
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--no-native-preview', action='store_true', help='Do not start the Isaac geometry export')
+    parser.add_argument('--library-port', type=int, help='SimReady asset library page (default: editor port + 1, '
+                                                         'or the next free one)')
     args = parser.parse_args(argv)
     scene = args.scene or ROOT / 'projects' / args.project / 'scene.yaml'
     if not Path(scene).is_file():
         parser.error(f'No scene.yaml: {scene}')
-    editor = Editor(scene, host=args.host, port=args.port, native_preview=not args.no_native_preview)
+    editor = Editor(scene, host=args.host, port=args.port, native_preview=not args.no_native_preview,
+                    library_port=args.library_port)
     print(f'RLinf scene editor: http://{"localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host}:{editor.server.get_port()}')
     try:
         while True:

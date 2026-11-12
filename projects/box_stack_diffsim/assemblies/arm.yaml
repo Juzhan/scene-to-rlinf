@@ -1,0 +1,24 @@
+schema_version: 1
+root:
+  name: arm
+  kind: robot
+  factory: franka_panda
+  frames:
+    - name: tcp
+      body: panda_hand
+      pose:
+        position: [0, 0, 0.1034]
+  children:
+    - name: wrist_camera
+      kind: sensor
+      factory: camera
+      camera_only: true
+      parameters:
+        width: 160
+        height: 120
+      mount:
+        entity: ".."
+        body: panda_hand
+      pose:
+        position: [0.20, 0, 0.06]
+        orientation: [0, 1, 0, 0]

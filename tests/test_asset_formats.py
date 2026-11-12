@@ -7,9 +7,11 @@ import pytest
 pytest.importorskip('mujoco')
 pytest.importorskip('pxr')
 
-from shared.asset_formats import (compare, joint_order_problems, mjcf_joint_order, physx_stage, recorded_joint_order,
-                                  source_problems, upstream_files, urdf_to_mjcf, usd_capsules_into_mjcf,
-                                  usd_frames_into_mjcf, usd_joint_order, vendor, vendor_url)
+from shared.asset_formats import (_footprint_boxes, compare, environment_layer, joint_order_problems,
+                                  mjcf_joint_order, physx_stage,
+                                  recorded_joint_order, source_problems, upstream_files, urdf_to_mjcf,
+                                  usd_body_structure, usd_capsules_into_mjcf, usd_frames_into_mjcf, usd_joint_order,
+                                  url_dependencies, vendor, vendor_url)
 from shared.assembly.joint_order import canonical_joints
 
 INERTIAL = '<inertial><origin xyz="{com}"/><mass value="{mass}"/><inertia ixx="0.01" iyy="0.02" izz="0.03" ixy="0" ixz="0" iyz="0"/></inertial>'
@@ -440,3 +442,111 @@ def test_canonical_joints_reorders_only_when_the_engine_order_differs():
         ('A_hip', 'B_hip', 'A_knee', 'B_knee'), [0, 2, 1, 3])
     with pytest.raises(ValueError, match='differ from the asset joint_order'):
         canonical_joints(native, ('A_hip', 'B_hip', 'A_knee'), 'robot')
+
+
+def test_environment_layer_makes_a_static_newton_loadable_scene(tmp_path):
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    stage = Usd.Stage.CreateNew(str(tmp_path / 'scene.usda'))
+    UsdGeom.SetStageMetersPerUnit(stage, 0.01)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    root = UsdGeom.Xform.Define(stage, '/Root')
+    stage.SetDefaultPrim(root.GetPrim())
+    floor = UsdGeom.Mesh.Define(stage, '/Root/floor')
+    floor.CreatePointsAttr([(0, 0, 0), (100, 0, 0), (0, 100, 0)])
+    floor.CreateFaceVertexCountsAttr([3])
+    floor.CreateFaceVertexIndicesAttr([0, 1, 2])
+    UsdPhysics.CollisionAPI.Apply(floor.GetPrim())
+    group = UsdGeom.Mesh.Define(stage, '/Root/wall')  # empty Mesh holding the collider for its child
+    UsdPhysics.CollisionAPI.Apply(group.GetPrim())
+    UsdGeom.Xformable(group).AddScaleOp().Set(Gf.Vec3f(-1.0))
+    part = UsdGeom.Mesh.Define(stage, '/Root/wall/part')
+    part.CreatePointsAttr([(0, 0, 0), (0, 10, 0), (0, 0, 10)])
+    part.CreateFaceVertexCountsAttr([3])
+    part.CreateFaceVertexIndicesAttr([0, 1, 2])
+    crate = UsdGeom.Xform.Define(stage, '/Root/crate')
+    UsdPhysics.RigidBodyAPI.Apply(crate.GetPrim())
+    UsdGeom.Xform.Define(stage, '/Root/props/lost').GetPrim().GetReferences().AddReference('./missing.usd')
+    stage.Save()
+
+    report = environment_layer(tmp_path / 'scene.usda', tmp_path / 'usd/scene.usda')
+    assert report['deactivated_missing'] == ['/Root/props']
+    out = Usd.Stage.Open(str(tmp_path / 'usd/scene.usda'))
+    assert not out.GetCompositionErrors()
+    assert out.GetPrimAtPath('/Root/wall').GetTypeName() == 'Xform'
+    assert out.GetPrimAtPath('/Root/wall/part').HasAPI(UsdPhysics.CollisionAPI)
+    assert report['unmirrored_meshes'] == ['/Root/wall/part'] and report['removed_bodies'] == 1
+    world = UsdGeom.XformCache().GetLocalToWorldTransform(out.GetPrimAtPath('/Root/wall/part'))
+    assert world.ExtractRotationMatrix().GetDeterminant() > 0
+    corner = world.Transform(Gf.Vec3d(*UsdGeom.Mesh(out.GetPrimAtPath('/Root/wall/part')).GetPointsAttr().Get()[1]))
+    assert Gf.IsClose(corner, Gf.Vec3d(0, -0.1, 0), 1e-6)  # the mirrored surface stays where it was, in metres
+    assert report['colliders'] == 2 and usd_body_structure(tmp_path / 'usd/scene.usda') == 'static'
+
+
+def test_mdl_dependencies_include_relative_modules(tmp_path):
+    material = tmp_path / 'road.mdl'
+    material.write_text('import ::base::*;\nimport .::SimPBR_Core::*;\nimport ..::lib::Noise::fbm;\n'
+                        'using .::OmniUe4Base import *;\ncolor: texture_2d("./tex/road.png")\n')
+    assert url_dependencies(material) == ['./tex/road.png', './SimPBR_Core.mdl', '../lib/Noise.mdl',
+                                          './OmniUe4Base.mdl']
+
+
+def test_footprint_boxes_fill_a_turned_hollow_building_in_its_own_frame():
+    import numpy as np
+    corners = np.array([(0, 0), (6, 0), (6, 4), (0, 4)], float)
+    walls = []
+    for a, b in zip(corners, np.roll(corners, -1, 0)):
+        low_a, low_b, high_a = (*a, 0.0), (*b, 0.0), (*a, 3.0)
+        walls += [(low_a, low_b, high_a), (low_b, (*b, 3.0), high_a)]
+    yaw = np.radians(30)
+    turn = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+    boxes, found, bottom, top = _footprint_boxes(np.array(walls) @ turn.T + (10, 20, 1))
+    assert len(boxes) == 1 and np.isclose(found, yaw) and (bottom, top) == (1, 4)
+    x, y, size_x, size_y = boxes[0]
+    centre = turn[:2, :2] @ (3, 2) + (10, 20)
+    assert np.allclose((x, y), centre, atol=0.2) and abs(size_x - 6) < 0.21 and abs(size_y - 4) < 0.21
+
+
+def test_environment_layer_substitutes_a_missing_vendored_file(tmp_path):
+    import numpy as np
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    (tmp_path / 'source').mkdir()
+    (tmp_path / 'source/SOURCE.json').write_text('{}')
+    stage = Usd.Stage.CreateNew(str(tmp_path / 'source/scene.usda'))
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, '/Root').GetPrim())
+    UsdPhysics.CollisionAPI.Apply(UsdGeom.Cube.Define(stage, '/Root/floor').GetPrim())
+    oak = UsdGeom.Xform.Define(stage, '/Root/tree')
+    oak.GetPrim().GetReferences().AddReference('./trees/oak.usd')
+    oak.AddRotateZOp().Set(0.0)
+    house = UsdGeom.Xform.Define(stage, '/Root/props/house')
+    house.AddTranslateOp().Set((5.0, 0.0, 0.0))
+    walls = UsdGeom.Mesh.Define(stage, '/Root/props/house/walls')
+    walls.CreatePointsAttr([(0, 0, 0), (0, 1, 0), (0, 0, 1)])
+    walls.CreateFaceVertexCountsAttr([3])
+    walls.CreateFaceVertexIndicesAttr([0, 1, 2])
+    stage.Save()
+    tree = Usd.Stage.CreateNew(str(tmp_path / 'maple.usda'))
+    UsdGeom.SetStageMetersPerUnit(tree, 0.01)
+    tree.SetDefaultPrim(UsdGeom.Xform.Define(tree, '/Maple').GetPrim())
+    UsdGeom.Cube.Define(tree, '/Maple/crown')
+    tree.Save()
+
+    report = environment_layer(tmp_path / 'source/scene.usda', tmp_path / 'usd/scene.usda',
+                               {'oak.usd': tmp_path / 'maple.usda'}, ['/Root/props'])
+    assert report['substituted_missing'] and not report['stubbed_missing'] and not report['deactivated_missing']
+    out = Usd.Stage.Open(str(tmp_path / 'usd/scene.usda'))
+    walls = out.GetPrimAtPath('/Root/props/house/walls')
+    assert report['footprint_boxes'] == {'/Root/props/house': 1} and not walls.HasAPI(UsdPhysics.CollisionAPI)
+    box = out.GetPrimAtPath('/Root/footprint_colliders/house')
+    assert box.HasAPI(UsdPhysics.CollisionAPI) and UsdGeom.Imageable(box).ComputePurpose() == UsdGeom.Tokens.guide
+    bound = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.guide]).ComputeWorldBound(box).ComputeAlignedRange()
+    # the wall's cross-sections at 0.3 and 0.9 m span y 0-0.7 m on a 0.2 m grid, from its base to its top
+    assert np.allclose(bound.GetMin(), (5, 0, 0)) and np.allclose(bound.GetMax(), (5.2, 0.8, 1))
+    crown = out.GetPrimAtPath('/Root/tree/substitute/crown')
+    assert crown.IsValid()
+    scale = UsdGeom.XformCache().GetLocalToWorldTransform(crown).ExtractRotationMatrix().GetRow(0).GetLength()
+    assert abs(scale - 0.01) < 1e-6
+    # without the substitute, the same missing file becomes an empty stub again
+    report = environment_layer(tmp_path / 'source/scene.usda', tmp_path / 'usd2/scene.usda')
+    assert report['stubbed_missing'] and not report['substituted_missing']

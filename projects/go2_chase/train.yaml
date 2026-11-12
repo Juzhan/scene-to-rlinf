@@ -32,8 +32,16 @@ actor:
   global_batch_size: 8192
   micro_batch_size: 2048
   optim:
-    lr: 0.0003
+    # Fine-tuning the pretrained actor: Adam's first steps move every weight by about lr, and at
+    # 3e-4 one step shifts the action mean by ~0.9 (approx_kl in the hundreds); 1e-5 keeps it ~0.01.
+    # The value head starts untrained, so it alone learns for the first 200 optimizer steps.
+    lr: 0.00001
     value_lr: 0.0003
+    critic_warmup_steps: 200
+  fsdp_config:
+    # Expose the module's own parameter names: value_lr and the critic warmup pick the value head
+    # by name, which a single flat FSDP parameter hides.
+    use_orig_params: true
   model:
     model_type: go2_chase__planner_executor_policy
     obs_dim: null

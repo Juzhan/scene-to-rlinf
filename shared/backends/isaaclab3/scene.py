@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from math import isfinite
 
+from shared.assembly.robot import robot_interface
 from shared.assembly.spec import Abstract, Mount, Pose, Sensor
 from shared.backends.isaac.scene import scene_metadata
 from .frames import wxyz, xyzw
@@ -62,8 +63,8 @@ def validate(description, settings):
             elif node.meshes:
                 raise ValueError(f'{path}: only {list(RAY_SENSORS)} cast rays at meshes')
             continue
-        if node.frames and node.kind != 'robot':
-            raise NotImplementedError(f'{path}: isaaclab3 body frames are read on robot entities only')
+        if node.frames and not robot_interface(node):
+            raise NotImplementedError(f'{path}: isaaclab3 body frames are read on robots and articulated entities only')
         if node.mount or node.meshes:
             raise NotImplementedError(f'{path}: isaaclab3 mounts only sensors {list(SENSORS)}')
         if node.initial_state.keys() - INITIAL_STATE:
@@ -181,12 +182,20 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
         func = getattr(spawn, 'func', None)
         if func is not None and (func if isinstance(func, str) else f'{func.__module__}:{func.__name__}') == NATIVE:
             spawn.func = SPAWN_FROM_USD
+        compensate_gravity(spawn, path)
+        if node.kinematic:
+            from .kinematic import make_kinematic
+            if metadata.scopes[path] != 'environment':
+                raise ValueError(f'Entity {path}: a kinematic entity moves per environment; it needs environment scope')
+            native = make_kinematic(native, path)
         apply_initial_state(native, node.initial_state, path)
         if node.reset:
             if metadata.scopes[path] != 'environment':
                 raise ValueError(f'Entity {path}: per-environment reset requires environment scope')
-            if not _free_root(native):
+            if node.reset.moves_root and not (node.kinematic or _free_root(native)):
                 raise ValueError(f'Entity {path}: pose reset requires a dynamic rigid object or a free-root articulation')
+            if node.reset.joint_positions and not isinstance(native, ArticulationCfg):
+                raise ValueError(f'Entity {path}: joint reset requires an articulation')
         if hasattr(native, 'init_state'):
             if not node.pose_authored:
                 initial = native.init_state
@@ -201,6 +210,36 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
         setattr(config, key, native)
     _validate_connections(description, config, metadata)
     return config
+
+
+def compensate_gravity(spawn, path):
+    """Bodies spawned without gravity keep it off on every engine.
+
+    Asset presets switch gravity off with PhysX's per-body ``disable_gravity``. Newton reads that flag
+    only on the physics scene, so such bodies also get MuJoCo ``gravcomp=1``, as Isaac Lab 3's own
+    Franka differential-IK preset authors both; PhysX ignores the MuJoCo fragment. An explicit
+    gravcomp is kept."""
+    from isaaclab.sim.spawners.utils import fragment_mapping
+    from isaaclab_newton.sim.schemas import MujocoRigidBodyCfg, MujocoRigidBodyPropertiesCfg
+    props = getattr(spawn, 'rigid_props', None)
+    if props is None:
+        return
+    as_mapping = isinstance(props, dict)
+    mapping = fragment_mapping(props, '')
+    if mapping is None:
+        if getattr(props, 'disable_gravity', False):
+            raise NotImplementedError(f'Entity {path}: give disable_gravity as a schema fragment so Newton can '
+                                      'compensate it')
+        return
+    compensated = {}
+    for pattern, fragments in mapping.items():
+        fragments = list(fragments) if isinstance(fragments, (list, tuple)) else [fragments]
+        if (any(getattr(fragment, 'disable_gravity', None) for fragment in fragments)
+                and not any(isinstance(fragment, (MujocoRigidBodyCfg, MujocoRigidBodyPropertiesCfg))
+                            and fragment.gravcomp is not None for fragment in fragments)):
+            fragments.append(MujocoRigidBodyCfg(gravcomp=1.0))
+        compensated[pattern] = fragments
+    spawn.rigid_props = compensated if as_mapping else compensated['']
 
 
 def _validate_connections(description, config, metadata):
@@ -224,7 +263,7 @@ def event_configuration(description):
     assets = {path: node for path, (node, _) in description.index().items() if path in metadata.keys}
     events = {}
     for path, node in assets.items():
-        if node.reset is None or node.reset.region is not None:
+        if node.reset is None or not node.reset.moves_root or node.reset.region is not None:
             continue
         key, rule = metadata.keys[path], asdict(node.reset)
         if rule['states']:
@@ -235,6 +274,11 @@ def event_configuration(description):
             events['assembly_root_poses_' + key] = EventTermCfg(
                 func=mdp.reset_root_state_uniform, mode='reset',
                 params={'pose_range': rule['pose_range'], 'velocity_range': {}, 'asset_cfg': SceneEntityCfg(key)})
+    for path, node in assets.items():
+        if node.reset is not None and node.reset.joint_positions:
+            key = metadata.keys[path]
+            events['assembly_joint_positions_' + key] = EventTermCfg(
+                func=reset_joint_positions, mode='reset', params={'name': key, 'ranges': node.reset.joint_positions})
     region_rules = {metadata.keys[path]: asdict(node.reset) for path, node in assets.items()
                     if node.reset is not None and node.reset.region is not None}
     if region_rules:
@@ -305,6 +349,25 @@ def reset_root_states(env, env_ids, *, name, states):
     asset.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
     asset.write_root_velocity_to_sim_index(root_velocity=asset.data.default_root_vel.torch[env_ids].clone(),
                                            env_ids=env_ids)
+
+
+def reset_joint_positions(env, env_ids, *, name, ranges):
+    """Named joints drawn uniformly per environment, at rest, after the authored defaults; joints
+    without drives (passive cabinet doors and drawers) simply start there."""
+    import torch
+    env_ids = _env_ids(env, env_ids)
+    asset = env.scene[name]
+    missing = ranges.keys() - set(asset.joint_names)
+    if missing:
+        raise ValueError(f'Entity {name}: reset joints {sorted(missing)} not in {asset.joint_names}')
+    columns = [asset.joint_names.index(joint) for joint in ranges]
+    low, high = env.scene.env_origins.new_tensor(list(ranges.values())).T
+    position = asset.data.default_joint_pos.torch[env_ids].clone()
+    position[:, columns] = low + (high - low) * torch.rand(len(env_ids), len(columns), device=env.device)
+    velocity = asset.data.default_joint_vel.torch[env_ids].clone()
+    velocity[:, columns] = 0.
+    asset.write_joint_state_to_sim_index(position=position, velocity=velocity, env_ids=env_ids)
+    asset.set_joint_position_target_index(target=position, env_ids=env_ids)
 
 
 def _relative(parent_pose, child_pose):

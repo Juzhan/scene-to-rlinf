@@ -8,7 +8,7 @@ from functools import cache
 from typing import Literal
 
 from shared.assembly.assets import (GO2_SUPERMIMIC, CameraData, Go2Actuators, ball_parameters, box_parameters,
-                                   camera_parameters, checked, go2_parameters)
+                                   camera_parameters, checked, go2_parameters, workspace_file)
 from shared.asset_formats import nucleus_copy
 # Scopes follow the isaac backend; its scene_metadata resolves native keys and prim paths for both.
 from shared.backends.isaac.assets import FACTORY_SCOPES  # noqa: F401
@@ -17,7 +17,7 @@ from shared.backends.isaac.assets import FACTORY_SCOPES  # noqa: F401
 # fields (solver iterations, combine modes) apply on OvPhysX and are ignored by Newton, as in
 # Isaac Lab 3's own presets.
 from shared.backends.isaac.assets import (clear_sky, contact_sensor, dex_cube, m20, piper, piper_x,
-                                          seattle_table, terrain, usd_object, usd_robot)
+                                          seattle_table, terrain, usd_robot)
 
 
 @checked(go2_parameters)
@@ -59,16 +59,78 @@ def anymal_c():
     return config
 
 
-def franka_panda(fix_root_link=True):
-    """Isaac Lab 3's FRANKA_PANDA_LEGACY_CFG, whose USD is the vendored panda_instanceable.usd."""
-    from isaaclab_assets.robots.franka import FRANKA_PANDA_LEGACY_CFG
+FrankaTracking = Literal['native', 'stiff']
+
+
+def franka_parameters(fix_root_link=True, tracking='native'):
+    if tracking not in FrankaTracking.__args__:
+        raise ValueError(f'franka_panda.tracking must be one of {list(FrankaTracking.__args__)}')
+
+
+@checked(franka_parameters)
+def franka_panda(fix_root_link=True, tracking: FrankaTracking = 'native'):
+    """Isaac Lab 3's FRANKA_PANDA_LEGACY_CFG, whose USD is the vendored panda_instanceable.usd.
+
+    ``tracking: stiff`` selects its FRANKA_PANDA_LEGACY_HIGH_PD_CFG instead (arm stiffness 400, damping 80,
+    gravity off on the robot links), the preset Isaac Lab's differential-IK tasks use: increments on the
+    measured joint positions then do not let the arm sag. Scene building keeps gravity off on Newton too
+    (scene.compensate_gravity)."""
+    from isaaclab_assets.robots.franka import FRANKA_PANDA_LEGACY_CFG, FRANKA_PANDA_LEGACY_HIGH_PD_CFG
     from shared.backends.isaac.assets import franka_panda_usd
 
-    config = FRANKA_PANDA_LEGACY_CFG.copy()
+    franka_parameters(fix_root_link, tracking)
+    config = (FRANKA_PANDA_LEGACY_HIGH_PD_CFG if tracking == 'stiff' else FRANKA_PANDA_LEGACY_CFG).copy()
     config.spawn.usd_path = str(franka_panda_usd())
     # Lab 3's per-solver articulation fragments carry no fix_root_link; the spawner owns that topology flag.
     config.spawn.fix_root_link = fix_root_link
     return config
+
+
+def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False):
+    """Imported USD object, simulated as its UsdPhysics schemas say (``usd_body_structure``).
+
+    One rigid body is a dynamic rigid object; jointed bodies are an articulation without actuators,
+    whose joints move only under contact and the drives, limits and friction authored in the USD.
+    ``fix_root_link`` fixes the object in place: the articulation root, or the rigid body made
+    kinematic. A USD without rigid bodies stays static geometry (terrain tiles); with a ``mass`` its
+    root becomes the rigid body. ``mass`` replaces the authored mass of a single body and is required
+    when the USD authors none."""
+    import isaaclab.sim as sim
+    from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+    from shared.asset_formats import (recorded_joint_order, usd_authored_mass, usd_body_structure,
+                                      usd_joint_order)
+
+    path = workspace_file(usd_path)
+    structure = usd_body_structure(path)
+    scale = tuple(scale) if isinstance(scale, (list, tuple)) else (float(scale),) * 3
+    spawn = sim.UsdFileCfg(usd_path=str(path), scale=scale)
+    if structure == 'articulation':
+        if mass is not None:
+            raise ValueError(f'{usd_path}: an articulated object takes its link masses from the USD')
+        spawn.articulation_props = sim.ArticulationRootPropertiesCfg(fix_root_link=fix_root_link)
+        initial = ArticulationCfg.InitialStateCfg()
+        if not (recorded_joint_order(path) or usd_joint_order(path)):
+            # Parts held by fixed joints only: the default '.*' joint pattern would match nothing.
+            initial.joint_pos, initial.joint_vel = {}, {}
+        return ArticulationCfg(prim_path="", spawn=spawn, init_state=initial, actuators={})
+    if structure == 'static' and mass is None:
+        return AssetBaseCfg(prim_path="", spawn=spawn)
+    if mass is None and not fix_root_link and not usd_authored_mass(path):
+        raise ValueError(f'{usd_path}: the USD authors no mass for its rigid body; set usd_object.mass')
+    if structure == 'static' or fix_root_link:
+        # A bare fragment creates the rigid body on the spawn prim when the asset has none.
+        spawn.rigid_props = sim.UsdPhysicsRigidBodyCfg(kinematic_enabled=True if fix_root_link else None)
+    if mass is not None:
+        spawn.mass_props = sim.MassPropertiesCfg(mass=mass)
+    return RigidObjectCfg(prim_path="", spawn=spawn)
+
+
+def usd_articulation(usd_path, fix_root_link=True):
+    """Kept for existing scenes: a jointed :func:`usd_object`, fixed by default."""
+    from shared.asset_formats import usd_body_structure
+    if usd_body_structure(workspace_file(usd_path)) != 'articulation':
+        raise ValueError(f'{usd_path}: usd_articulation needs jointed bodies; use usd_object')
+    return usd_object(usd_path, fix_root_link=fix_root_link)
 
 
 GROUND_PLANE = "Isaac/IsaacLab/Environments/Grid/default_ground_plane_checker_v1/default_ground_plane.usda"
@@ -224,7 +286,7 @@ def frame_transformer(target_body, target_position=(0.0, 0.0, 0.0),
 FACTORIES = {factory.__name__: factory for factory in (
     go2, anymal_c, franka_panda, m20, piper, piper_x, ground_plane, dome_light, clear_sky, terrain,
     seattle_table, dex_cube, box, ball,
-    usd_robot, usd_object, height_scanner, contact_sensor, frame_transformer, camera)}
+    usd_robot, usd_articulation, usd_object, height_scanner, contact_sensor, frame_transformer, camera)}
 # Global entities without collision shapes; ray casts never hit them.
 NO_SHAPES = ('dome_light', 'clear_sky')
 # Sensors this backend binds to a mount body; height_scanner also casts at ``meshes``.

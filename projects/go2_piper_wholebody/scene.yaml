@@ -145,14 +145,14 @@ entities:
     camera_only: true
     pose:
       position:
-        - 0.0
-        - 0.0
-        - 0.0
+        - -0.07390057572325381
+        - 7.804000416673567e-17
+        - 0.04966296420461391
       orientation:
-        - 1.0
-        - 0.0
-        - 0.0
-        - 0.0
+        - 5.5347085374508075e-17
+        - -0.7071067811865476
+        - 0.7071067811865475
+        - 1.6901656512390854e-17
     mount:
       entity: world/piperx
       body: gripper_base
@@ -161,6 +161,16 @@ entities:
     kind: entity
     parameters:
       usd_path: assets/terrains/rough_40m/usd/rough.usda
+    pose:
+      position:
+        - 0.5428260038172246
+        - 0.3691861950578288
+        - 0.0
+      orientation:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
 control:
   train: executor
   components:

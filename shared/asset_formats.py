@@ -27,8 +27,15 @@ and the sha256 of each file:
     run.py asset vendor $NUCLEUS/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd assets/go2 --base $NUCLEUS
 
 MuJoCo backends call mjcf_for(): the recorded conversion when present, else a cached one.
+
+SimReady assets (assets/simready/<publisher>/<asset>/simready_usd/) are used as USD only, through a
+wrapper layer that references them unchanged and authors what Isaac Lab needs (see simready_wrap):
+
+    run.py asset simready assets/simready/nvidia/cabinet_file_a01/simready_usd/sm_cabinet_file_a01_01.usd \
+        assets/cabinet_file_a01
 """
 import argparse
+import functools
 from collections import Counter
 import hashlib
 import importlib.util
@@ -41,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1057,7 +1065,8 @@ def nucleus_copy(asset, path):
     return file
 
 
-def _download(url, attempts=3):
+def _download(url, attempts=5):
+    from http.client import HTTPException
     from urllib.error import HTTPError, URLError
     from urllib.request import urlopen
     for attempt in range(attempts):
@@ -1066,45 +1075,64 @@ def _download(url, attempts=3):
                 return response.read()
         except HTTPError:
             raise
-        except (URLError, OSError):
+        except (URLError, OSError, HTTPException):
             if attempt == attempts - 1:
                 raise
+            time.sleep(2 ** attempt)
 
 
-def _exists(url):
+def _exists(url, attempts=5):
     """False when the server reports no such file (S3 answers 403 for missing keys); other errors raise."""
+    from http.client import HTTPException
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
-    try:
-        with urlopen(Request(url, method='HEAD'), timeout=60):
-            return True
-    except HTTPError as error:
-        if error.code in (403, 404):
-            return False
-        raise
-    except URLError as error:
-        if isinstance(error.reason, FileNotFoundError):
-            return False
-        raise
+    for attempt in range(attempts):
+        try:
+            with urlopen(Request(url, method='HEAD'), timeout=60):
+                return True
+        except HTTPError as error:
+            if error.code in (403, 404):
+                return False
+            raise
+        except URLError as error:
+            if isinstance(error.reason, FileNotFoundError):
+                return False
+            if attempt == attempts - 1:
+                raise
+        except (OSError, HTTPException):
+            if attempt == attempts - 1:
+                raise
+        time.sleep(2 ** attempt)
 
 
 def url_dependencies(path):
-    """Relative references a downloaded file makes: USD layers/assets, or the textures an MDL material names."""
+    """Relative references a downloaded file makes: USD layers/assets, or the textures and relative
+    modules (`import .::Core::*`, `using ..::lib::Base import *`) an MDL material names."""
     if path.suffix in USD_SUFFIXES:
         from pxr import UsdUtils
         return [item for group in UsdUtils.ExtractExternalReferences(str(path)) for item in group]
     if path.suffix == '.mdl':
-        return re.findall(r'texture_2d\(\s*"([^"]+)"', path.read_text(errors='ignore'))
+        text = path.read_text(errors='ignore')
+        modules = []
+        for kind, module, star in re.findall(r'\b(import|using)\s+(\.{1,2}(?:::\w+)+)(::\*)?', text):
+            parts = module.split('::')
+            if kind == 'import' and not star:
+                parts = parts[:-1]  # import .::module::symbol
+            modules.append('/'.join(parts) + '.mdl')
+        return re.findall(r'texture_2d\(\s*"([^"]+)"', text) + modules
     return []
 
 
-def vendor_url(url, output, base=None):
+def vendor_url(url, output, base=None, threads=16):
     """Download a model (and every file it references, recursively) to OUTPUT/source/<path below BASE>.
 
     BASE is the source root recorded in SOURCE.json, by default the URL's scheme and host; for
     Isaac Nucleus pass the release directory (…/Assets/Isaac/5.1). References that are absolute,
     point outside BASE, or do not exist there (Kit's built-in MDLs such as OmniPBR.mdl) are not
-    copied and are returned as unresolved."""
+    copied and are returned as unresolved. Files are fetched THREADS at a time, one reference
+    level after another; SOURCE.json is saved after every level, and files it already records
+    with matching content are not downloaded again, so an interrupted run resumes."""
+    from concurrent.futures import ThreadPoolExecutor
     from urllib.parse import urljoin, urlsplit
     output = Path(output).resolve()
     parts = urlsplit(url)
@@ -1120,36 +1148,45 @@ def vendor_url(url, output, base=None):
             raise SystemExit(f"{record_path} records {existing.get('repository') or existing.get('url')}; "
                              'one asset vendors one source')
         record = existing
-    pending, seen, unresolved = [url], set(), []
-    while pending:
-        current = pending.pop()
-        if current in seen:
-            continue
-        seen.add(current)
+
+    def fetch(current):
         name = current[len(base):]
+        target = record_path.parent / name
+        if name in record['sha256'] and target.is_file() and digest(target) == record['sha256'][name]:
+            return target, record['sha256'][name]
         content = _download(current)
         hash_ = hashlib.sha256(content).hexdigest()
         if record['sha256'].get(name, hash_) != hash_:
-            raise SystemExit(f'{record_path.parent / name} already holds different content')
-        target = record_path.parent / name
+            raise SystemExit(f'{target} already holds different content')
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-        record['sha256'][name] = hash_
         print(f'{name}: {len(content)} bytes', flush=True)
-        for reference in url_dependencies(target):
-            reference = reference.replace('<UDIM>', '1001')
-            dependency = urljoin(current, reference)
-            if '://' in reference or not dependency.startswith(base):
-                unresolved.append(reference)
-                continue
-            if dependency in seen:
-                continue
-            if not _exists(dependency):
-                unresolved.append(reference)
-                continue
-            pending.append(dependency)
-    record['sha256'] = dict(sorted(record['sha256'].items()))
-    record_path.write_text(json.dumps(record, indent=2) + '\n')
+        return target, hash_
+
+    def save():
+        record['sha256'] = dict(sorted(record['sha256'].items()))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(record, indent=2) + '\n')
+
+    level, seen, unresolved = [url], {url}, []
+    with ThreadPoolExecutor(threads) as pool:
+        while level:
+            candidates = {}
+            for current, (target, hash_) in zip(level, pool.map(fetch, level)):
+                record['sha256'][current[len(base):]] = hash_
+                for reference in url_dependencies(target):
+                    reference = reference.replace('<UDIM>', '1001')
+                    dependency = urljoin(current, reference)
+                    if '://' in reference or not dependency.startswith(base):
+                        unresolved.append(reference)
+                    elif dependency not in seen:
+                        candidates.setdefault(dependency, reference)
+            save()
+            seen |= set(candidates)
+            level = []
+            for (dependency, reference), present in zip(candidates.items(), pool.map(_exists, candidates)):
+                (level if present else unresolved).append(dependency if present else reference)
+    save()
     return record, workspace_path(record_path.parent / url[len(base):]), sorted(set(unresolved))
 
 
@@ -1251,6 +1288,589 @@ def mjcf_for(source, *, packages=None, root=None):
                 shutil.rmtree(staging)
     return output / 'mjcf' / f'{source.stem}.xml'
 
+# SimReady USD -> wrapper USD ---------------------------------------------------
+
+def _rigid_body_of(prim):
+    from pxr import UsdPhysics
+    while prim and not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        prim = prim.GetParent()
+    return prim if prim else None
+
+
+def usd_authored_mass(path):
+    """Whether the USD at `path` authors a mass or density on any rigid body or collider."""
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(str(Path(path).resolve()))
+    return any(prim.HasAPI(UsdPhysics.MassAPI) and (UsdPhysics.MassAPI(prim).GetMassAttr().Get()
+                                                   or UsdPhysics.MassAPI(prim).GetDensityAttr().Get())
+               for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()))
+
+
+def usd_body_structure(path):
+    """What the USD at `path` simulates, read from its UsdPhysics schemas with the default variants:
+    'articulation' (rigid bodies joined by joints, with an articulation root), 'rigid' (one rigid
+    body) or 'static' (no rigid body: colliders and visuals only, e.g. terrain tiles)."""
+    path = Path(path).resolve()
+    return _usd_body_structure(str(path), path.stat().st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=None)
+def _usd_body_structure(path, _mtime):
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(path)
+    prims = list(Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()))
+    # physics:rigidBodyEnabled = false makes a body static (scene props in Isaac environments).
+    bodies = [prim for prim in prims if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+              and UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Get() is not False]
+    joints = [prim for prim in prims if prim.IsA(UsdPhysics.Joint)
+              and any(UsdPhysics.Joint(prim).GetBody0Rel().GetTargets() + UsdPhysics.Joint(prim).GetBody1Rel().GetTargets())]
+    if joints or any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in prims):
+        if not any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in prims):
+            raise ValueError(f'{workspace_path(path)}: jointed bodies without ArticulationRootAPI; wrap SimReady '
+                             'assets with: run.py asset simready <source> assets/<name>')
+        return 'articulation'
+    if len(bodies) > 1:
+        raise ValueError(f'{workspace_path(path)}: {len(bodies)} rigid bodies without joints; one USD object '
+                         'is one rigid body or one articulation')
+    return 'rigid' if bodies else 'static'
+
+
+def simready_layer(source, target):
+    """Write `target`, a USD layer that references the SimReady `source` unchanged and adds overrides:
+
+    - rigid bodies and colliders inside instances become ordinary prims: Isaac Lab authors physics
+      properties (fixed root, mass, material) through apply_nested, which skips instance proxies with a
+      warning, and OvPhysX ignores the mass authored on a collider inside an instance (a 0.157 kg
+      SimReady apple weighed 0.087 kg);
+    - joint body0/body1 targets naming a collider mesh are retargeted to the rigid body containing it,
+      only where the mesh frame equals the body frame, so the authored joint frames keep their meaning;
+    - an articulated asset without ArticulationRootAPI gets it on the one body no joint moves;
+    - revolute and prismatic limits are made hard in Newton (newton:limitStiffness = inf). UsdPhysics
+      limits are hard stops in PhysX; Newton otherwise imports them as a 1e4 spring with almost no
+      damping, which lets a 5 kg SimReady drawer pass its limit by ~0.1 m and bounce back;
+    - an asset without revolute or prismatic joints becomes one rigid body on the default prim, so
+      every object is dynamic: parts held by fixed joints or by nothing (a jar and its lid) are merged
+      (their joints deactivated, their summed mass authored on the new body; an articulation of fixed
+      joints only has no degrees of freedom, which Isaac Lab's OvPhysX articulation cannot hold), and
+      colliders without a rigid body get one.
+    Returns what was changed."""
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+    source, target = Path(source).resolve(), Path(target).resolve()
+    stage = Usd.Stage.Open(str(source))
+    top = stage.GetDefaultPrim()
+    if not top:
+        raise ValueError(f'{source}: no default prim')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateNew(str(target))
+    out = Usd.Stage.Open(layer)
+    UsdGeom.SetStageUpAxis(out, UsdGeom.GetStageUpAxis(stage))
+    UsdGeom.SetStageMetersPerUnit(out, UsdGeom.GetStageMetersPerUnit(stage))
+    wrapper = out.DefinePrim(top.GetPath(), top.GetTypeName() or 'Xform')
+    wrapper.GetReferences().AddReference(os.path.relpath(source, target.parent))
+    out.SetDefaultPrim(wrapper)
+    report = {'uninstanced': [], 'retargeted': [], 'articulation_root': None, 'hard_limits': []}
+    bodies = [prim for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+    colliders = [prim for prim in Usd.PrimRange(top, Usd.TraverseInstanceProxies())
+                 if prim.HasAPI(UsdPhysics.CollisionAPI) and prim.IsInstanceProxy()]
+    for prim in bodies + colliders:
+        for prefix in prim.GetPath().GetPrefixes():
+            if stage.GetPrimAtPath(prefix).IsInstanceable() and str(prefix) not in report['uninstanced']:
+                out.OverridePrim(prefix).SetInstanceable(False)
+                report['uninstanced'].append(str(prefix))
+    joints = [prim for prim in stage.Traverse() if prim.IsA(UsdPhysics.Joint)]
+    if not any(prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint) for prim in joints):
+        report.update(_simready_single_body(stage, out, wrapper, joints))
+        layer.Save()
+        return report
+    cache = UsdGeom.XformCache()
+    moved = set()
+    group = {body.GetPath(): body.GetPath() for body in bodies}  # union-find over the jointed bodies
+
+    def root(path):
+        while group[path] != path:
+            path = group[path]
+        return path
+    for prim in joints:
+        joint = UsdPhysics.Joint(prim)
+        ends = []
+        for index, relationship in enumerate((joint.GetBody0Rel(), joint.GetBody1Rel())):
+            targets = relationship.GetTargets()
+            if not targets:
+                continue
+            end = stage.GetPrimAtPath(targets[0])
+            body = _rigid_body_of(end)
+            if body is None:
+                raise ValueError(f'{prim.GetPath()}: body{index} {targets[0]} is not inside a rigid body')
+            ends.append(body.GetPath())
+            if index == 1:
+                moved.add(body.GetPath())
+            if body == end:
+                continue
+            offset = cache.GetLocalToWorldTransform(end) * cache.GetLocalToWorldTransform(body).GetInverse()
+            if not Gf.IsClose(offset, Gf.Matrix4d(1), 1e-6):
+                raise ValueError(f'{prim.GetPath()}: body{index} {end.GetPath()} is not at the frame of its rigid '
+                                 f'body {body.GetPath()}; retargeting would move the joint frame')
+            override = UsdPhysics.Joint(out.OverridePrim(prim.GetPath()))
+            (override.GetBody0Rel() if index == 0 else override.GetBody1Rel()).SetTargets([body.GetPath()])
+            report['retargeted'].append(f'{prim.GetName()}.body{index}')
+        if len(ends) == 2:
+            group[root(ends[0])] = root(ends[1])
+        if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
+            out.OverridePrim(prim.GetPath()).CreateAttribute(
+                'newton:limitStiffness', Sdf.ValueTypeNames.Float).Set(float('inf'))
+            report['hard_limits'].append(prim.GetName())
+    if joints and not any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in stage.Traverse()):
+        bases = [body for body in bodies if body.GetPath() not in moved]
+        parts = {root(body.GetPath()) for body in bodies}
+        if len(parts) > 1:
+            raise ValueError(f'{source}: {len(parts)} separate parts that no joint connects (e.g. a box and its '
+                             f'loose lid), with bases {[str(body.GetPath()) for body in bases]}; one USD object is '
+                             'one rigid body or one articulation, so this asset is not supported')
+        if len(bases) != 1:
+            raise ValueError(f'{source}: expected one rigid body that no joint moves, found '
+                             f'{[str(body.GetPath()) for body in bases]}')
+        UsdPhysics.ArticulationRootAPI.Apply(out.OverridePrim(bases[0].GetPath()))
+        report['articulation_root'] = str(bases[0].GetPath())
+    layer.Save()
+    return report
+
+
+def _editable(out, prim, root):
+    """Override ``prim`` in ``out`` after making its instanceable ancestors below ``root`` ordinary prims."""
+    for prefix in prim.GetPath().GetPrefixes():
+        if prefix.HasPrefix(root.GetPath()) and prefix != prim.GetPath() and prim.GetStage().GetPrimAtPath(prefix).IsInstanceable():
+            out.OverridePrim(prefix).SetInstanceable(False)
+    return out.OverridePrim(prim.GetPath())
+
+
+def _simready_single_body(stage, out, wrapper, joints):
+    """Make the default prim of a SimReady asset without movable joints its one rigid body (simready_layer)."""
+    from pxr import Usd, UsdPhysics
+    top = stage.GetDefaultPrim()
+    prims = list(Usd.PrimRange(top, Usd.TraverseInstanceProxies()))
+    bodies = [prim for prim in prims if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+    colliders = [prim for prim in prims if prim.HasAPI(UsdPhysics.CollisionAPI)]
+    report = {'merged_bodies': [], 'deactivated_joints': [], 'rigid_body': None, 'mass': None}
+    for prim in joints:
+        out.OverridePrim(prim.GetPath()).SetActive(False)
+        report['deactivated_joints'].append(prim.GetName())
+    for prim in prims:
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI) and prim != top:
+            _editable(out, prim, top).RemoveAPI(UsdPhysics.ArticulationRootAPI)
+    if len(bodies) == 1 and not joints:
+        report['rigid_body'] = str(bodies[0].GetPath())  # already one rigid body, kept where it is authored
+        return report
+    masses = []
+    for body in bodies:
+        mass = UsdPhysics.MassAPI(body).GetMassAttr().Get() if body.HasAPI(UsdPhysics.MassAPI) else None
+        if not mass:
+            parts = [UsdPhysics.MassAPI(prim).GetMassAttr().Get() for prim in Usd.PrimRange(body, Usd.TraverseInstanceProxies())
+                     if prim.HasAPI(UsdPhysics.CollisionAPI) and prim.HasAPI(UsdPhysics.MassAPI)]
+            mass = sum(parts) if parts and all(parts) else None
+        masses.append(mass)
+        if body != top:
+            override = _editable(out, body, top)
+            override.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            override.RemoveAPI(UsdPhysics.MassAPI)
+            report['merged_bodies'].append(str(body.GetPath()))
+    if not colliders:
+        raise ValueError(f'{top.GetPath()}: no collider to simulate')
+    UsdPhysics.RigidBodyAPI.Apply(wrapper)
+    report['rigid_body'] = str(top.GetPath())
+    if masses and all(masses):
+        report['mass'] = float(sum(masses))
+        UsdPhysics.MassAPI.Apply(wrapper).CreateMassAttr(report['mass'])
+    return report
+
+
+def simready_package(source):
+    """SimReady packaging metadata and mirror revision for a source inside <asset>/simready_usd/."""
+    source = Path(source).resolve()
+    package = source.parent.parent / 'com.nvidia.simready.packaging.json'
+    if source.parent.name != 'simready_usd' or not package.is_file():
+        raise ValueError(f'{source}: expected <asset>/simready_usd/<file> beside com.nvidia.simready.packaging.json')
+    metadata = json.loads(package.read_text())
+    record = {'asset': source.parent.parent.name, 'package_id': metadata['package_id'],
+              'license': metadata['license'], 'packaging': workspace_path(package)}
+    mirror = source.parent.parent.parent / '.mirror' / 'report.json'
+    if mirror.is_file():
+        report = json.loads(mirror.read_text())
+        record.update(repository=report['url'], revision=report['revision'])
+    else:  # a single asset downloaded by shared.simready: its pinned dataset
+        from shared.simready import SOURCES
+        pinned = SOURCES.get(source.parent.parent.parent.name)
+        if pinned:
+            record.update(repository=f"https://huggingface.co/datasets/{pinned['repo']}", revision=pinned['revision'])
+    return record
+
+
+def simready(source, output, name=None):
+    """Write OUTPUT/usd/NAME.usda wrapping a SimReady USD, and ASSET.json (no MJCF form)."""
+    source, output = Path(source).resolve(), Path(output).resolve()
+    package = simready_package(source)
+    name = name or package['asset']
+    if (output / 'ASSET.json').exists() or (output / 'usd').exists():
+        raise FileExistsError(f'{output} already has ASSET.json or usd/; remove them or choose another output')
+    from pxr import UsdUtils
+    missing = UsdUtils.ComputeAllDependencies(str(source))[2]
+    if missing:
+        raise FileNotFoundError(f'{source}: {len(missing)} referenced files are missing, e.g. {missing[0]}; '
+                                'complete the mirror by rerunning tools/simready_mirror.py')
+    target = output / 'usd' / f'{name}.usda'
+    report = simready_layer(source, target)
+    record = {
+        'source': workspace_path(source), 'source_format': 'usd', 'source_sha256': digest(source),
+        'source_layers_sha256': usd_layers(source), 'simready': package,
+        'formats': {'usd': workspace_path(target)},
+        'steps': [{'from': 'usd', 'to': 'usd', 'tool': 'shared.asset_formats.simready_layer', **report}],
+        'joint_order': usd_joint_order(target), 'alignment': None,
+        'sha256': {target.relative_to(output).as_posix(): digest(target)},
+    }
+    (output / 'ASSET.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
+    return record
+
+
+def _mesh_has_geometry(prim):
+    from pxr import UsdGeom
+    mesh = UsdGeom.Mesh(prim)
+    return bool(mesh.GetPointsAttr().Get() and mesh.GetFaceVertexIndicesAttr().Get()
+                and mesh.GetFaceVertexCountsAttr().Get())
+
+
+STUB_MARK = 'emptyStubForMissingUpstreamFile'
+
+
+def _write_stub(path, scene, replacement=None):
+    """Write the layer standing in for a missing upstream file: empty, or referencing `replacement`
+    rescaled to the units and up axis of the `scene` stage."""
+    from pxr import Gf, Sdf, Usd, UsdGeom
+    path.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.FindOrOpen(str(path)) if path.exists() else Sdf.Layer.CreateNew(str(path))
+    layer.Clear()
+    stage = Usd.Stage.Open(layer)
+    units, up = UsdGeom.GetStageMetersPerUnit(scene), UsdGeom.GetStageUpAxis(scene)
+    UsdGeom.SetStageUpAxis(stage, up)
+    UsdGeom.SetStageMetersPerUnit(stage, units)
+    prim = stage.DefinePrim('/missing', 'Xform')
+    stage.SetDefaultPrim(prim)
+    data = {STUB_MARK: True}
+    if replacement is not None:
+        data['substitute'] = os.path.relpath(replacement, path.parent)
+        # A child prim, since the referencing prim's own xformOpOrder overrides ops authored on the root.
+        child = stage.DefinePrim('/missing/substitute', 'Xform')
+        child.GetReferences().AddReference(data['substitute'])
+        other = Usd.Stage.Open(str(replacement))
+        xform = UsdGeom.Xformable(child)
+        if UsdGeom.GetStageUpAxis(other) != up:
+            xform.AddRotateXOp(opSuffix='upAxis').Set(90.0 if up == UsdGeom.Tokens.z else -90.0)
+        if (ratio := UsdGeom.GetStageMetersPerUnit(other) / units) != 1.0:
+            xform.AddScaleOp(opSuffix='unitsResolve').Set(Gf.Vec3f(ratio))
+    layer.customLayerData = data
+    layer.Save()
+
+
+def _footprint_boxes(triangles, cell=0.2, levels=(0.3, 0.9, 1.5)):
+    """Boxes covering where `triangles` ([T, 3, 3]) cross the planes `levels` above their lowest point,
+    rasterized on a `cell` grid turned to the dominant edge direction, enclosed space filled and runs
+    merged into rectangles: [(centre_x, centre_y, size_x, size_y)], the grid yaw (radians), bottom, top."""
+    import numpy as np
+    from scipy import ndimage
+    bottom, top = float(triangles[..., 2].min()), float(triangles[..., 2].max())
+    starts, ends = [], []
+    for level in levels:
+        if bottom + level >= top:
+            break
+        height = triangles[..., 2] - (bottom + level)
+        crossing = (height.min(1) < 0) & (height.max(1) > 0)
+        corners, height = triangles[crossing], height[crossing]
+        found, points = [], []
+        for i, j in ((0, 1), (1, 2), (2, 0)):
+            edge = (height[:, i] < 0) != (height[:, j] < 0)
+            t = (height[edge, i] / (height[edge, i] - height[edge, j]))[:, None]
+            found.append(np.nonzero(edge)[0])
+            points.append(corners[edge, i, :2] + t * (corners[edge, j, :2] - corners[edge, i, :2]))
+        # a triangle straddling the plane changes sign on exactly two edges
+        points = np.concatenate(points)[np.argsort(np.concatenate(found), kind='stable')]
+        starts.append(points[0::2])
+        ends.append(points[1::2])
+    if not starts or not sum(map(len, starts)):
+        return [], 0.0, bottom, top
+    start, end = np.concatenate(starts), np.concatenate(ends)
+    delta = end - start
+    degrees = np.round(np.degrees(np.arctan2(delta[:, 1], delta[:, 0]))).astype(int) % 90
+    yaw = np.radians(np.argmax(np.bincount(degrees, weights=np.linalg.norm(delta, axis=1), minlength=90)))
+    turn = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+    start, end = start @ turn, end @ turn
+    low = np.minimum(start.min(0), end.min(0))
+    shape = np.floor((np.maximum(start.max(0), end.max(0)) - low) / cell).astype(int) + 1
+    count = np.ceil(np.linalg.norm(end - start, axis=1) / (cell / 2)).astype(int) + 1
+    segment = np.repeat(np.arange(len(start)), count)
+    t = (np.arange(len(segment)) - np.repeat(np.cumsum(count) - count, count)) / np.repeat(
+        np.maximum(count - 1, 1), count)
+    samples = start[segment] + t[:, None] * (end - start)[segment]
+    index = np.clip(np.floor((samples - low) / cell).astype(int), 0, shape - 1)
+    grid = np.zeros(shape, bool)
+    grid[index[:, 0], index[:, 1]] = True
+    grid = ndimage.binary_fill_holes(grid)
+    boxes, open_runs = [], {}
+    for x in range(shape[0] + 1):
+        column = np.r_[False, grid[x], False] if x < shape[0] else np.zeros(shape[1] + 2, bool)
+        edges = np.nonzero(column[1:] != column[:-1])[0]
+        runs = set(zip(edges[0::2], edges[1::2]))
+        for run in [run for run in open_runs if run not in runs]:
+            first = open_runs.pop(run)
+            centre = low + cell * np.array([(first + x) / 2, (run[0] + run[1]) / 2])
+            boxes.append((*(turn @ centre), (x - first) * cell, (run[1] - run[0]) * cell))
+        for run in runs:
+            open_runs.setdefault(run, x)
+    return boxes, float(yaw), bottom, top
+
+
+def environment_layer(source, target, substitutes=None, footprint_colliders=()):
+    """Write `target`, a USD layer that references the scene `source` unchanged and makes it one static
+    environment for every simulated world:
+
+    - Newton rejects a stage with composition errors, while Kit only warns (Isaac's public Rivermark
+      misses 39 files): a missing file inside the vendored source/ gets an empty stub layer, so only
+      the missing part is lost, or one referencing `substitutes[file name]` (a USD path) when given;
+      other unresolved arcs deactivate their prim's parent (an inactive
+      prim still composes its own arcs, and arcs cannot be deleted across a reference);
+    - rigid bodies are removed, joints disabled and articulation roots removed, so props become static
+      colliders instead of objects shared by all environments;
+    - a Mesh without points or faces becomes an Xform (Newton's mesh import fails on it); a collider
+      on it or on any non-Gprim passes to the meshes below that have none, which PhysX collides in
+      its place (UsdPhysics defines colliders on Gprims only);
+    - meshes scaled to zero are deactivated and mirrored ones re-expressed with a positive scale
+      (MuJoCo, which Newton passes every shape to, rejects both);
+    - each child of a `footprint_colliders` prim without colliders (e.g. visual-only buildings, too
+      detailed for mesh colliders) gets an invisible collider mesh of boxes over its cross-sections
+      0.3-1.5 m above its base, from base to top;
+    - a Y-up or non-metre source is rotated and scaled on the wrapper prim to Z-up metres.
+    Prims inside instances are uninstanced where an override is needed. Returns what was changed."""
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+    source, target = Path(source).resolve(), Path(target).resolve()
+    stage = Usd.Stage.Open(str(source))
+    vendored = next((folder for folder in source.parents if (folder / 'SOURCE.json').is_file()), None)
+    absent = {Path(found.group(1)) for error in stage.GetCompositionErrors()
+              if (found := re.match(r'Could not open asset @([^@]+)@', str(error)))}
+    absent = {path for path in absent if vendored and path.resolve().is_relative_to(vendored)}
+    absent |= {Path(used.realPath) for used in stage.GetUsedLayers() if used.customLayerData.get(STUB_MARK)}
+    substitutes = {name: Path(path).resolve() for name, path in (substitutes or {}).items()}
+    if unknown := sorted(set(substitutes) - {path.name for path in absent}):
+        raise ValueError(f'substitutes for files that are not missing: {", ".join(unknown)}')
+    for path in sorted(absent):
+        _write_stub(path, stage, substitutes.get(path.name))
+    if absent:
+        stage = Usd.Stage.Open(str(source))
+    top = stage.GetDefaultPrim()
+    if not top:
+        raise ValueError(f'{source}: no default prim')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateNew(str(target))
+    out = Usd.Stage.Open(layer)
+    UsdGeom.SetStageUpAxis(out, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(out, 1.0)
+    wrapper = out.DefinePrim(top.GetPath(), top.GetTypeName() or 'Xform')
+    wrapper.GetReferences().AddReference(os.path.relpath(source, target.parent))
+    out.SetDefaultPrim(wrapper)
+    units, up = UsdGeom.GetStageMetersPerUnit(stage), UsdGeom.GetStageUpAxis(stage)
+    if units != 1.0 or up != UsdGeom.Tokens.z:
+        xform = UsdGeom.Xformable(wrapper)
+        xform.ClearXformOpOrder()
+        if up == UsdGeom.Tokens.y:
+            xform.AddRotateXOp(opSuffix='upAxis').Set(90.0)
+        if units != 1.0:
+            xform.AddScaleOp(opSuffix='unitsResolve').Set(Gf.Vec3f(units))
+    stubs = [used for used in stage.GetUsedLayers() if used.customLayerData.get(STUB_MARK)]
+    report = {'stubbed_missing': sorted(workspace_path(used.realPath) for used in stubs
+                                        if 'substitute' not in used.customLayerData),
+              'substituted_missing': {workspace_path(used.realPath): used.customLayerData['substitute']
+                                      for used in stubs if 'substitute' in used.customLayerData},
+              'deactivated_missing': [], 'moved_colliders': [], 'retyped_empty_meshes': 0, 'removed_bodies': 0,
+              'disabled_joints': 0, 'removed_articulation_roots': 0, 'uninstanced': [],
+              'source_units': units, 'source_up_axis': str(up)}
+
+    def editable(prim):
+        for prefix in prim.GetPath().GetPrefixes()[:-1]:
+            if stage.GetPrimAtPath(prefix).IsInstance() and str(prefix) not in report['uninstanced']:
+                out.OverridePrim(prefix).SetInstanceable(False)
+                report['uninstanced'].append(str(prefix))
+        return out.OverridePrim(prim.GetPath())
+
+    missing = sorted({str(error.rootSite.path.GetParentPath()) for error in stage.GetCompositionErrors()})
+    for path in missing:
+        if path in ('/', str(top.GetPath())):
+            raise ValueError(f'{source}: {path} itself has unresolved files; vendor them first')
+        if not any(path.startswith(f'{done}/') for done in report['deactivated_missing']):
+            editable(stage.GetPrimAtPath(path)).SetActive(False)
+            report['deactivated_missing'].append(path)
+    def hand_off_collider(prim, override):
+        override.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+        override.RemoveAPI(UsdPhysics.CollisionAPI)
+        approximation = UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Get() or 'none'
+        for child in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+            if child != prim and child.IsA(UsdGeom.Mesh) and _mesh_has_geometry(child) \
+                    and not child.HasAPI(UsdPhysics.CollisionAPI):
+                target_prim = editable(child)
+                UsdPhysics.CollisionAPI.Apply(target_prim)
+                UsdPhysics.MeshCollisionAPI.Apply(target_prim).CreateApproximationAttr(approximation)
+        report['moved_colliders'].append(str(prim.GetPath()))
+
+    gone = tuple(f'{path}/' for path in report['deactivated_missing'])
+    for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        if str(prim.GetPath()).startswith(gone) or str(prim.GetPath()) in report['deactivated_missing']:
+            continue
+        if prim.IsA(UsdGeom.Mesh) and not _mesh_has_geometry(prim):
+            # GRScenes groups parts under empty Meshes (some carrying the collider); Newton's mesh import
+            # fails on them, so they become Xforms and pass a collider to the meshes below.
+            override = editable(prim)
+            override.SetTypeName('Xform')
+            report['retyped_empty_meshes'] += 1
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                hand_off_collider(prim, override)
+            continue
+        if prim.HasAPI(UsdPhysics.CollisionAPI) and not prim.IsA(UsdGeom.Gprim):
+            # Kit PhysX collides the geometry under a collider Xform; UsdPhysics only defines Gprim colliders.
+            hand_off_collider(prim, editable(prim))
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            # Newton ignores physics:rigidBodyEnabled = false and still adds a free body.
+            editable(prim).RemoveAPI(UsdPhysics.RigidBodyAPI)
+            report['removed_bodies'] += 1
+        if prim.IsA(UsdPhysics.Joint) and UsdPhysics.Joint(prim).GetJointEnabledAttr().Get() is not False:
+            UsdPhysics.Joint(editable(prim)).CreateJointEnabledAttr(False)
+            report['disabled_joints'] += 1
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            editable(prim).RemoveAPI(UsdPhysics.ArticulationRootAPI)
+            report['removed_articulation_roots'] += 1
+    # Newton hands every shape, visual ones too, to MuJoCo, which rejects a mesh scaled to zero in some
+    # axis (hidden parts; deactivated) or mirrored by a negative scale; a mirrored mesh gets its local
+    # frame and points both negated, which leaves the surface where it was.
+    cache = UsdGeom.XformCache()
+    report['degenerate_meshes'], report['unmirrored_meshes'] = [], []
+    # Collected first: uninstancing while traversing invalidates the instance proxies being visited.
+    found = []
+    for prim in Usd.PrimRange(out.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        linear = cache.GetLocalToWorldTransform(prim).ExtractRotationMatrix()
+        if min(Gf.Vec3d(*row).GetLength() for row in linear) < 1e-9:
+            found.append((prim.GetPath(), None, None, None))
+        elif linear.GetDeterminant() < 0:
+            mesh = UsdGeom.Mesh(prim)
+            found.append((prim.GetPath(), UsdGeom.Xformable(prim).GetLocalTransformation(),
+                          mesh.GetPointsAttr().Get(), mesh.GetNormalsAttr().Get()))
+    for path, local, points, normals in found:
+        if local is None:
+            editable(stage.GetPrimAtPath(path)).SetActive(False)
+            report['degenerate_meshes'].append(str(path))
+            continue
+        flipped = Gf.Matrix4d(local)
+        for row in range(3):
+            flipped.SetRow(row, -local.GetRow(row))
+        mesh = UsdGeom.Mesh(editable(stage.GetPrimAtPath(path)))
+        mesh.ClearXformOpOrder()
+        mesh.AddTransformOp().Set(flipped)
+        mesh.GetPointsAttr().Set([-point for point in points])
+        if normals:
+            mesh.GetNormalsAttr().Set([-normal for normal in normals])
+        report['unmirrored_meshes'].append(str(path))
+    report['footprint_boxes'] = {}
+    if footprint_colliders:
+        import numpy as np
+        cache = UsdGeom.XformCache()
+        into_top = cache.GetLocalToWorldTransform(top).GetInverse()
+        holder = UsdGeom.Scope.Define(out, top.GetPath().AppendChild('footprint_colliders'))
+        UsdGeom.Imageable(holder).CreatePurposeAttr(UsdGeom.Tokens.guide)
+    for group in footprint_colliders:
+        if not (parent := stage.GetPrimAtPath(group)):
+            raise ValueError(f'{source}: no prim {group} for footprint colliders')
+        for child in parent.GetChildren():
+            meshes = [prim for prim in Usd.PrimRange(child, Usd.TraverseInstanceProxies())
+                      if prim.IsA(UsdGeom.Mesh) and _mesh_has_geometry(prim)]
+            if not meshes or any(prim.HasAPI(UsdPhysics.CollisionAPI)
+                                 for prim in Usd.PrimRange(child, Usd.TraverseInstanceProxies())):
+                continue
+            triangles = []
+            for prim in meshes:
+                mesh = UsdGeom.Mesh(prim)
+                matrix = np.array(cache.GetLocalToWorldTransform(prim) * into_top)
+                points = np.array(mesh.GetPointsAttr().Get(), float) @ matrix[:3, :3] + matrix[3, :3]
+                counts = np.array(mesh.GetFaceVertexCountsAttr().Get())
+                indices = np.array(mesh.GetFaceVertexIndicesAttr().Get())
+                fans = np.maximum(counts - 2, 0)
+                first = np.repeat(np.cumsum(counts) - counts, fans)
+                step = np.arange(fans.sum()) - np.repeat(np.cumsum(fans) - fans, fans)
+                triangles.append(points[indices[np.stack([first, first + step + 1, first + step + 2], 1)]])
+            boxes, yaw, bottom, top_z = _footprint_boxes(np.concatenate(triangles))
+            if not boxes:
+                continue
+            # One mesh per prim: Newton's MuJoCo conversion grows quadratically with the static shape count.
+            corner = np.array([(-1, -1), (1, -1), (1, 1), (-1, 1)]) / 2
+            turn = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+            points, faces = [], []
+            for index, (x, y, size_x, size_y) in enumerate(boxes):
+                ring = (corner * (size_x, size_y)) @ turn.T + (x, y)
+                points += [(*xy, z) for z in (bottom, top_z) for xy in ring]
+                low, high = list(range(8 * index, 8 * index + 4)), list(range(8 * index + 4, 8 * index + 8))
+                faces += [low[::-1], high] + [[low[i], low[(i + 1) % 4], high[(i + 1) % 4], high[i]] for i in range(4)]
+            mesh = UsdGeom.Mesh.Define(out, holder.GetPath().AppendChild(child.GetName()))
+            mesh.CreatePointsAttr([Gf.Vec3f(*point) for point in points])
+            mesh.CreateFaceVertexCountsAttr([4] * len(faces))
+            mesh.CreateFaceVertexIndicesAttr([index for face in faces for index in face])
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+            UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr(UsdPhysics.Tokens.none)
+            report['footprint_boxes'][str(child.GetPath())] = len(boxes)
+    layer.Save()
+    check = Usd.Stage.Open(str(target))
+    if check.GetCompositionErrors():
+        raise ValueError(f'{target}: composition errors remain, e.g. {check.GetCompositionErrors()[0].rootSite}')
+    colliders = [prim for prim in Usd.PrimRange(check.GetPseudoRoot(), Usd.TraverseInstanceProxies())
+                 if prim.HasAPI(UsdPhysics.CollisionAPI)]
+    if not colliders:
+        raise ValueError(f'{source}: the scene has no colliders; robots would fall through it')
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render,
+                                                       UsdGeom.Tokens.proxy])
+    bounds = Gf.Range3d()
+    for prim in colliders:
+        bounds.UnionWith(cache.ComputeWorldBound(prim).ComputeAlignedRange())
+    report.update(colliders=len(colliders),
+                  collider_bounds=[[round(v, 3) for v in bounds.GetMin()], [round(v, 3) for v in bounds.GetMax()]])
+    return report
+
+
+def environment(source, output, name=None, substitutes=None, footprint_colliders=()):
+    """Write OUTPUT/usd/NAME.usda wrapping a scene USD as a static environment, and ASSET.json (no MJCF form).
+    `substitutes` is a JSON file mapping missing file names to replacement USD paths (relative to it)."""
+    source, output = Path(source).resolve(), Path(output).resolve()
+    if substitutes:
+        mapping = Path(substitutes).resolve()
+        substitutes = {name: mapping.parent / path for name, path in json.loads(mapping.read_text()).items()}
+    name = name or source.stem
+    if (output / 'ASSET.json').exists() or (output / 'usd').exists():
+        raise FileExistsError(f'{output} already has ASSET.json or usd/; remove them or choose another output')
+    target = output / 'usd' / f'{name}.usda'
+    report = environment_layer(source, target, substitutes, footprint_colliders)
+    record = {
+        'source': workspace_path(source), 'source_format': 'usd', 'source_sha256': digest(source),
+        'source_layers_sha256': usd_layers(source),
+        'formats': {'usd': workspace_path(target)},
+        'steps': [{'from': 'usd', 'to': 'usd', 'tool': 'shared.asset_formats.environment_layer', **report}],
+        'environment': {'collider_bounds': report['collider_bounds'],
+                        'note': 'static environment: place it with scope: global; bounds are in the wrapper frame'},
+        'joint_order': [], 'alignment': None,
+        'sha256': {target.relative_to(output).as_posix(): digest(target)},
+    }
+    (output / 'ASSET.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
+    return record
+
+
+def changed_sources(record):
+    """Source layers whose content differs from ASSET.json (missing layers included)."""
+    current = usd_layers(ROOT / record['source']) if record['source_format'] == 'usd' else {
+        record['source']: digest(ROOT / record['source'])}
+    recorded = record.get('source_layers_sha256') or {record['source']: record['source_sha256']}
+    return sorted(path for path in recorded.keys() | current.keys() if recorded.get(path) != current.get(path))
+
 
 def summary(report):
     lines = [f"aligned: {report['aligned']}  bodies {report['bodies_compared']}  joints {len(report['joints'])}",
@@ -1290,8 +1910,25 @@ def main(argv=None):
     copy.add_argument('source', help='USD, URDF or MJCF file inside a git checkout, or an http(s) URL')
     copy.add_argument('output', type=Path, help='Asset directory; writes source/<upstream path> and SOURCE.json')
     copy.add_argument('--base', help='URL source: root recorded in SOURCE.json; files keep their path below it')
+    copy.add_argument('--threads', type=int, default=16, help='URL source: parallel downloads')
     copy.add_argument('--package', action='append', default=[], metavar='NAME=PATH',
                       help='URDF package:// root (default: nearest package.xml with that name)')
+    wrap = commands.add_parser('simready', help='Wrap a SimReady USD for Isaac Lab (USD only, no MJCF)')
+    wrap.add_argument('source', help='<asset>/simready_usd/sm_<asset>_01.usd of a mirrored SimReady asset, or an asset '
+                                     'name (PUBLISHER/ASSET or ASSET, e.g. food_produce_apple_m01): taken from '
+                                     'assets/simready/ when present, else downloaded there at the pinned revision')
+    wrap.add_argument('output', type=Path, nargs='?',
+                      help='Asset directory; writes usd/NAME.usda and ASSET.json (default: assets/<asset>)')
+    wrap.add_argument('--name', help='File name of the wrapper (default: SimReady asset name)')
+    scene = commands.add_parser('environment', help='Wrap a scene USD as a static environment for Isaac Lab (USD only)')
+    scene.add_argument('source', type=Path, help='Scene USD, e.g. a vendored Isaac environment')
+    scene.add_argument('output', type=Path, help='Asset directory; writes usd/NAME.usda and ASSET.json')
+    scene.add_argument('--name', help='File name of the wrapper (default: source file name)')
+    scene.add_argument('--substitutes', type=Path,
+                       help='JSON mapping missing upstream file names to replacement USDs (paths relative to it)')
+    scene.add_argument('--footprint-colliders', action='append', default=[], metavar='PRIM',
+                       help='Give each child of PRIM without colliders (e.g. visual-only buildings) invisible '
+                            'boxes over its footprint')
     verify = commands.add_parser('check', help='Verify vendored sources and compare the USD and MJCF forms')
     verify.add_argument('asset', type=Path, help='Asset directory with ASSET.json and/or source/SOURCE.json, '
                                                  'or a USD file')
@@ -1332,7 +1969,7 @@ def main(argv=None):
         packages[key] = value
     if options.command == 'vendor':
         if '://' in options.source:
-            record, copied, unresolved = vendor_url(options.source, options.output, options.base)
+            record, copied, unresolved = vendor_url(options.source, options.output, options.base, options.threads)
             origin = record['url']
         else:
             record, copied, unresolved = vendor(options.source, options.output, packages)
@@ -1340,6 +1977,40 @@ def main(argv=None):
         print(f"{origin}: {len(record['sha256'])} files; model at {copied}")
         if unresolved:
             print('unresolved (not copied):', ', '.join(map(str, unresolved)))
+        return 0
+    if options.command == 'environment':
+        record = environment(options.source, options.output, options.name, options.substitutes,
+                             options.footprint_colliders)
+        step = record['steps'][0]
+        print(json.dumps({**record['formats'], **record['environment']}, indent=2))
+        print(f"{step['colliders']} colliders; substituted {len(step['substituted_missing'])} and stubbed "
+              f"{len(step['stubbed_missing'])} missing files, deactivated "
+              f"{len(step['deactivated_missing'])} prims with unresolved arcs, "
+              f"added {sum(step['footprint_boxes'].values())} footprint boxes for "
+              f"{len(step['footprint_boxes'])} prims, "
+              f"removed {step['removed_bodies']} rigid bodies, disabled {step['disabled_joints']} joints")
+        return 0
+    if options.command == 'simready':
+        source = Path(options.source)
+        if not source.exists():
+            from shared import simready as catalog
+            publisher, asset = catalog.resolve(options.source)
+            source = catalog.download(publisher, asset, progress=lambda done, total: print(
+                f'\r{publisher}/{asset}: {done / 1e6:.1f}/{total / 1e6:.1f} MB', end='', flush=True))
+            print()
+        output = options.output or ROOT / 'assets' / simready_package(source)['asset']
+        record = simready(source, output, options.name)
+        step = record['steps'][0]
+        print(json.dumps({**record['formats'], **record['simready']}, indent=2))
+        if step.get('rigid_body'):
+            mass = f"{step['mass']:.4g} kg" if step['mass'] else 'mass as authored'
+            print(f"one rigid body at {step['rigid_body']} ({mass}), uninstanced {len(step['uninstanced'])} prims, "
+                  f"merged {len(step['merged_bodies'])} bodies, deactivated {len(step['deactivated_joints'])} joints")
+        else:
+            print(f"uninstanced {len(step['uninstanced'])} prims, retargeted {len(step['retargeted'])} joint ends, "
+                  f"articulation root {step['articulation_root'] or 'as authored'}, "
+                  f"hard limits on {len(step['hard_limits'])} joints")
+        print('joint order:', ', '.join(record['joint_order']) or 'no movable joints')
         return 0
     if options.command == 'convert':
         record = convert(options.source, options.output, options.name, packages, options.root,
@@ -1365,6 +2036,15 @@ def main(argv=None):
             print('joint order problems:', *order, sep='\n  ')
         else:
             print('joint order:', ', '.join(record.get('joint_order', [])) or 'no movable joints')
+        if 'mjcf' not in record['formats']:
+            changed = changed_sources(record) + [
+                f'{options.asset}/{name}' for name, hash_ in record['sha256'].items()
+                if not (options.asset / name).is_file() or digest(options.asset / name) != hash_]
+            if changed:
+                print('changed since ASSET.json was written:', *changed, sep='\n  ')
+            else:
+                print('source layers and generated files match ASSET.json; USD only, no MJCF comparison')
+            return 1 if changed or order else 0
         usd, mjcf = ROOT / record['formats']['usd'], ROOT / record['formats']['mjcf']
     else:
         usd, mjcf, order = options.asset, options.mjcf, []

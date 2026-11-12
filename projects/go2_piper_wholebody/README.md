@@ -42,14 +42,18 @@ Go2 背 Piper X 的全身控制：跟踪随机的机身速度命令和末端目�
 - 训练：2048 环境 × 24 步/轮，update_epoch 5，4 个 minibatch，entropy 0.005，回合 1000 步（20 s），
   lr 1.5e-4 cosine 衰减到 3e-5（参考为 4096 环境、5e-4 加自适应 KL；RLinf 原生 PPO 无自适应 KL，
   固定 5e-4 时约 1430 轮发散）。
+- 域随机化（`train.yaml` `env.train.init_params.randomization`，评估默认跟随）：机身质量 +[-1, 2] kg、
+  机器人摩擦 [0.6, 1.0]、每 10–15 s 推一次（水平速度 ±0.5 m/s）。不需要时删掉这一段。
 
 与参考的差异：粗糙地块代替平地；机身高度改为相对足端；末端目标 z ∈ [0, 0.5]（参考 [-0.2, 0.5]）；
 actor 不堆叠 3 帧历史；腿用各后端原生 Go2 DC 电机（参考为带延迟的 PD）。
 
 ## 权重
 
-`weights/wholebody.pt` 随项目一起进 git，哈希与来源见 `weights/WEIGHTS.json`：本工作区 2026-10-23 在 **mjlab**
-后端训练 6000 轮的 `global_step_6000`（运行 `outputs/go2_piper_wholebody/runs/20261023_185843_d8380ea45fb3`）。
+`weights/wholebody.pt` 随项目一起进 git，哈希与来源见 `weights/WEIGHTS.json`：本工作区 2026-11-02 在 **IL3 Newton**
+上带域随机化从头训练 6000 轮的 `global_step_6000`（种子 42，运行 `outputs/go2_piper_wholebody/runs/20261102_075914_a56abadb3214`）。
+此前的版本是 2026-10-23 在 mjlab 上训练的权重（运行 `20261023_185843_d8380ea45fb3`，无随机化），仍可从 git 历史取回；
+两者输入输出约定相同。
 scene.yaml `executor.parameters.weights` 让 `build_executor` 默认加载它；写 `null` 则随机初始化（从头训练时改成
 `null`，否则 train 是在它之上继续训练）。文件缺失时直接报错。evaluate/view 若另给 checkpoint，在此之上加载。
 
@@ -68,12 +72,34 @@ bash run.sh evaluate go2_piper_wholebody --snapshot $RUN \
 ```
 
 - 换 OvPhysX：加 `env.train.init_params.physics=ovphysx`。评估、预览自动跟随训练的选择。
+- 多条件评估：`train.yaml` 的 `evaluation.conditions` 列出原始（无随机化）、训练范围、重机身 +[2.5, 3.5] kg、
+  低摩擦 [0.4, 0.5]、强推扰（每 3–5 s，±1 m/s）。在 evaluate 命令后加 `--conditions all`，每个条件单独评估，
+  汇总成表并写 `summary.json`（跟踪误差等 `task/*` 指标也在其中）。
 - OvPhysX 下固定连接由后端写 PhysX FixedJoint 并整 env 克隆，2048 环境主机内存比 Newton 多约 3 GB（见
   `docs/SCENE_BACKENDS.md`）。
 
 ## 验证状态
 
-2026-10-28，`wholebody.pt`，`bash run.sh evaluate go2_piper_wholebody`（确定性动作，16 环境，每轮 1000 步）：
+2026-11-02，IL3 Newton 带域随机化从头训练 6000 轮（`weights` 设为 `null`，种子 42，
+运行 `outputs/go2_piper_wholebody/runs/20261102_075914_a56abadb3214`，`global_step_6000`），
+`--conditions all`，每个条件 16 环境 × 1000 步（确定性动作，一个完整回合）：
+
+| 条件 | Newton 失败 | 末端误差 | 线速度误差 | OvPhysX 失败 | 末端误差 | 线速度误差 | mjlab 失败 | 末端误差 | 线速度误差 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 原始 | 0/16 | 4.9 cm | 0.09 m/s | 0/16 | 4.9 cm | 0.10 m/s | 0/16 | 5.5 cm | 0.09 m/s |
+| 训练范围 | 0/16 | 4.8 cm | 0.09 m/s | 0/16 | 5.4 cm | 0.09 m/s | 0/16 | 4.6 cm | 0.07 m/s |
+| 重机身 +2.5–3.5 kg | 0/16 | 4.0 cm | 0.08 m/s | 0/16 | 5.2 cm | 0.10 m/s | 0/16 | 6.4 cm | 0.18 m/s |
+| 低摩擦 0.4–0.5 | 0/16 | 4.5 cm | 0.10 m/s | 0/16 | 5.9 cm | 0.11 m/s | 0/16 | 5.5 cm | 0.11 m/s |
+| 强推扰 3–5 s、±1 m/s | 1/16 | 5.8 cm | 0.14 m/s | 0/16 | 6.4 cm | 0.26 m/s | 0/16 | 4.8 cm | 0.16 m/s |
+
+- Newton 训练的权重在三个后端、五个条件下跑完完整回合，只有 Newton 强推扰下 1 条轨迹翻倒；末端误差
+  4–6.4 cm，与此前 mjlab 训练的权重在其训练后端上的 5.2 cm 相当。
+- 只用一个种子、每个条件 16 条轨迹、一块地形和随机命令，没有 success 定义；可称“这些条件下完整回合成功”，
+  还不能称为多条件可靠成功。评估在训练后改过共享代码，加了 `--allow-shared-change`；结果在运行的 `evaluations/` 下。
+- 2026-11-05 起该权重即项目默认的 `weights/wholebody.pt`；替换后 `bash run.sh evaluate go2_piper_wholebody`（Newton，
+  默认配方含随机化）16 条轨迹 0 失败、1000 步、末端误差 5.1 cm、线速度误差 0.09 m/s。
+
+2026-10-28，此前项目自带的 mjlab 权重（已被上面的 Newton 权重替换），`bash run.sh evaluate go2_piper_wholebody`（确定性动作，16 环境，每轮 1000 步）：
 
 | 后端 | 轨迹数 | 失败 | 平均回合步数 | 末端位置误差 | 线速度误差 | 机身高度 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -84,11 +110,9 @@ bash run.sh evaluate go2_piper_wholebody --snapshot $RUN \
 - OvPhysX：mjlab 权重直接跑完完整回合，跟踪误差与 mjlab 相当。
 - Newton：大部分回合能走一段，但会翻倒（倾斜 >1 rad，机身未触地）；同一种子 16 环境 1000 步录像中
   Newton 失败 18 次、OvPhysX 1 次。Newton 上机身平均低约 4 cm，接触与 weld 连接比 PhysX 软（连接旋转偏差约
-  10°），策略未在其上训练。要在 Newton 上可靠运行需在 Newton 上继续训练，目前未做。
-- IL3 短训练（3 轮，2048 环境，17/17 张量变化）只说明接口跑通、权重更新。
+  10°），策略未在其上训练。改在 Newton 上训练后（上表）不再出现这种翻倒。
 - 各后端 Go2 原生电机预设不同（IL3 小腿 45.4 N·m，mjlab 全部 23.5 N·m）；IL3 全部走 Isaac Lab 的显式
   Python 执行器（见 `docs/SCENE_BACKENDS.md`），Newton 原生隐式 DC 电机上平均约 64 步就失败。
-- 只在这一块地形和随机命令下评估，没有 success 定义；不能称为多条件可靠成功。
 
 ## 未接入
 

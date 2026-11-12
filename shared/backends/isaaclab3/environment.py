@@ -23,8 +23,8 @@ def renderer_name(parameters):
 def physics_config(simulation, engine='newton'):
     """Isaac Lab 3's own locomotion physics preset for the selected engine, with scene overrides.
 
-    ``newton`` (default): MuJoCo-Warp; ``simulation.newton`` sets NewtonCfg fields and its
-    ``solver`` mapping MJWarpSolverCfg fields. ``ovphysx``: kitless PhysX; ``simulation.physx``
+    ``newton`` (default): MuJoCo-Warp with contact capacity sized from the model (contacts.py);
+    ``simulation.newton`` sets NewtonCfg fields and its ``solver`` mapping MJWarpSolverCfg fields. ``ovphysx``: kitless PhysX; ``simulation.physx``
     sets the OvPhysxCfg fields (GPU buffers), as it sets PhysxCfg on the isaac backend. Each
     engine ignores the other's block, as mjlab ignores ``physx``."""
     from copy import deepcopy
@@ -35,7 +35,10 @@ def physics_config(simulation, engine='newton'):
         physics = deepcopy(RoughPhysicsCfg().ovphysx)
         targets = ((physics, dict(simulation.get('physx', {}))),)
     else:
+        from .contacts import NewtonSizedMJWarpManager
         physics = deepcopy(RoughPhysicsCfg().newton_mjwarp)
+        physics.class_type = physics.solver_cfg.class_type = NewtonSizedMJWarpManager
+        physics.solver_cfg.nconmax = physics.solver_cfg.njmax = None
         overrides = dict(simulation.get('newton', {}))
         targets = ((physics.solver_cfg, overrides.pop('solver', {})), (physics, overrides))
     for owner, values in targets:
@@ -56,6 +59,7 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
     from isaaclab.sim import SimulationCfg
     from .abstract_terms import attach_abstract
     from .assets import use_renderer
+    from .kinematic import attach_kinematic
     from .python_task import attach_task
     from .scene import authored_reset_assets, build_scene_config, event_configuration, reset_authored_assets
     settings = prepared.settings
@@ -91,7 +95,10 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
         events['assembly_defaults'] = EventTermCfg(func=reset_authored_assets, mode='reset',
                                                    params={'asset_names': asset_names})
     from shared.backends.isaac.contact_materials import events as material_events
+    from .randomization import events as randomization_events
     scene_events = {**material_events(settings.get('world', {}).get('contact_materials', {})),
+                    **randomization_events(settings.get('_randomization', ()), settings,
+                                           parameters.get('physics', 'newton')),
                     **event_configuration(prepared.description)}
     for name, term in scene_events.items():
         if name in events:
@@ -102,6 +109,7 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
     output['terminations']['workspace_time_limit'] = TerminationTermCfg(func=mdp.time_out, time_out=True)
     commands = {}
     attach_abstract(commands, settings, visualize=visualize)
+    attach_kinematic(commands, settings)
     decimation = settings['world']['decimation']
     # Managers set attributes such as debug_vis on their cfg, so terms go in attribute containers.
     terms = lambda entries: SimpleNamespace(**entries)
@@ -221,6 +229,7 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
 
         class NativeEnv(TerminalObservationMixin, ManagerBasedRLEnv):
             backend_name = 'isaaclab3'
+            physics_name = parameters.get('physics', 'newton')
 
             def _init_sim(self):
                 with physx_connections(self, prepared.description):

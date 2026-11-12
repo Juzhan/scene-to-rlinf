@@ -114,6 +114,9 @@ bash run.sh train go2_chase                     # 从 flat.pt 出发 PPO 微调�
 
 注意：
 
+- 微调配方：`lr: 1e-5`（预训练 actor 上用 3e-4 时一步就使 approx_kl 达到数百，策略崩溃）、`value_lr: 3e-4`、
+  `critic_warmup_steps: 200`（新建价值头先单独训练约 10 轮），需要 `fsdp_config.use_orig_params: true` 才能按名字找到价值头。
+  原因与实测见 `projects/go2_crowd/README.md`。
 - `env.train.total_num_envs × max_steps_per_rollout_epoch` 必须能被 `actor.global_batch_size`（8192）整除。
 - 评估每轮最多 `max_episode_steps`（300 步）；碰到球即结束回合，所以一轮有多条轨迹。
 - 训练后评估/录像用 `--snapshot <运行>` 里的冻结源码。

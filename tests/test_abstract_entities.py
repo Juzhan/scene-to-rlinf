@@ -65,7 +65,7 @@ def test_reset_region_must_be_a_static_abstract_area(tmp_path):
         world({**cube, "reset": {"region": "world/area", "inset": .5}}, area(), tmp_path=tmp_path)
     with pytest.raises(ValueError, match="only available on abstract"):
         world({**cube, "reset": {"region": "world/area", "interval": 2.}}, area(), tmp_path=tmp_path)
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="at most one"):
         RootReset(region="world/area", pose_range={"x": [0, 1]})
 
 

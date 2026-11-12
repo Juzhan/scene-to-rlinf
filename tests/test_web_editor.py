@@ -104,7 +104,7 @@ assert W.observation_group('robot.target.linear_velocity', {{'group_label': 'rob
 assert W.observation_group('planner.output', {{}}, {{'planner': {{}}}}) == ('planner · 组件接口', 'output')
 W.LIBRARY, W.THUMBNAILS = W.Path({str(tmp_path)!r}) / 'library.json', W.Path({str(tmp_path)!r}) / 'thumbs'
 editor.start_thumbnails = lambda keys=None: None
-assert editor.gallery_cards and editor.asset_choice in editor.gallery_cards
+assert editor.shelf_items and editor.asset_choice is None  # nothing chosen until a card is picked
 editor.import_path.value = 'projects/piper_phone_sim/assets/piper_x.urdf'
 editor._import_asset()
 library = W.load_library()
@@ -113,11 +113,11 @@ assert editor.asset_choice == 'library:piper_x', editor.asset_choice
 editor._add_asset()
 assert any(item.get('factory') == 'urdf_robot' for item in SceneDocument(editor.scene).snapshot()['entities'])
 assert open(scene).read() == saved and editor.unsaved(), 'adding an entity wrote scene.yaml before save'
-assert {{'abstract:point', 'abstract:box'}} <= set(editor.gallery_cards)
+assert {{'abstract:point', 'abstract:box'}} <= {{item['id'] for item in editor.shelf_items}}
 editor._choose_asset('abstract:box')
 assert editor.asset_size.visible and not editor.asset_parameters.visible
 editor.asset_position.value, editor.asset_size.value = (0.5, 0.0, 0.1), (0.2, 0.3, 0.4)
-name = editor.asset_name.value
+name = editor.entity_name
 editor._add_asset()
 added = SceneDocument(editor.scene).entities['world/' + name]
 assert added['kind'] == 'abstract' and added['shape'] == 'box' and added['size'] == [0.2, 0.3, 0.4], added

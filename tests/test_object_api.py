@@ -204,14 +204,14 @@ def test_task_set_is_taken_once_in_the_step_it_was_returned(monkeypatch):
 
 
 @pytest.mark.parametrize('value, match',[
-    ({'missing':torch.zeros(2,3)},"'missing'.*not an abstract entity"),
+    ({'missing':torch.zeros(2,3)},"'missing'.*neither an abstract entity nor declared kinematic"),
     ({'tip':torch.zeros(2,3)},"'tip'.*mounted"),
     ({'area':torch.zeros(2,3)},"'area'.*reset region"),
     ({'ball':torch.zeros(2,4)},"'ball'.*shape"),
     ({'ball':torch.zeros(2,3,dtype=torch.long)},"'ball'.*float"),
     ({'ball':torch.full((2,3),float('nan'))},"'ball'.*non-finite"),
     ({'ball':torch.zeros(2,7)},"'ball'.*zero quaternion"),
-    (['ball'],'map abstract entity names'),
+    (['ball'],'map abstract or kinematic entity names'),
 ])
 def test_task_set_rejects_bad_entries_naming_the_entity(monkeypatch,value,match):
     runtime,_=_set_runtime(monkeypatch,value)
