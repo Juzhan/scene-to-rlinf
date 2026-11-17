@@ -35,6 +35,7 @@ wrapper layer that references them unchanged and authors what Isaac Lab needs (s
         assets/cabinet_file_a01
 """
 import argparse
+import contextlib
 import functools
 from collections import Counter
 import hashlib
@@ -1288,6 +1289,75 @@ def mjcf_for(source, *, packages=None, root=None):
                 shutil.rmtree(staging)
     return output / 'mjcf' / f'{source.stem}.xml'
 
+def joint_spring_layer(path, springs):
+    """A cached USD layer over ``path`` whose named joints get these drive springs (``usd_object.springs``).
+
+    ``springs`` maps joint names to ``{stiffness, damping, target}`` in SI units (N/m, N s/m, m for
+    prismatic joints; N m/rad, N m s/rad, rad for revolute joints). The joint's own UsdPhysics drive is
+    edited (or added, force type, unlimited force) and its target is always written: ``target``, default
+    0 (the asset's rest pose), within the joint limits. SimReady buttons author their target just beyond
+    the rest limit as a preload, which Newton replaces with the middle of the range (ModelBuilder:
+    out-of-limit targets), leaving them half pressed, and their stiffness is too weak to hold the cap
+    up. Returns the layer path."""
+    import math
+    from pxr import Sdf, Usd, UsdPhysics
+    path = Path(path).resolve()
+    if not isinstance(springs, dict) or not springs:
+        raise ValueError(f'{workspace_path(path)}: springs maps joint names to {{stiffness, damping, target}}')
+    stage = Usd.Stage.Open(str(path))
+    joints = {prim.GetName(): prim for prim in stage.Traverse()
+              if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint)}
+    edits = {}
+    for name, spring in springs.items():
+        if name not in joints:
+            raise ValueError(f'{workspace_path(path)}: springs names unknown joint {name!r}; movable joints: '
+                             f'{", ".join(sorted(joints))}')
+        if not isinstance(spring, dict) or set(spring) - {'stiffness', 'damping', 'target'} or 'stiffness' not in spring:
+            raise ValueError(f'{workspace_path(path)}: springs.{name} is {{stiffness, damping, target}}')
+        values = {key: spring.get(key, None if key == 'stiffness' else 0.) for key in ('stiffness', 'damping', 'target')}
+        for key, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or (
+                    key != 'target' and value < 0):
+                raise ValueError(f'{workspace_path(path)}: springs.{name}.{key} must be a finite '
+                                 f'{"" if key == "target" else "non-negative "}number')
+        edits[name] = {key: float(value) for key, value in values.items()}
+        joint = UsdPhysics.RevoluteJoint(joints[name]) if joints[name].IsA(UsdPhysics.RevoluteJoint) else \
+            UsdPhysics.PrismaticJoint(joints[name])
+        lower, upper = joint.GetLowerLimitAttr().Get(), joint.GetUpperLimitAttr().Get()
+        target = math.degrees(edits[name]['target']) if joints[name].IsA(UsdPhysics.RevoluteJoint) else edits[name]['target']
+        if lower is not None and upper is not None and math.isfinite(lower) and math.isfinite(upper) and \
+                not lower - 1e-9 <= target <= upper + 1e-9:
+            raise ValueError(f'{workspace_path(path)}: springs.{name}.target {edits[name]["target"]} lies outside the '
+                             f'joint limits [{lower}, {upper}]{" deg" if joints[name].IsA(UsdPhysics.RevoluteJoint) else ""}')
+    key = hashlib.sha256(json.dumps({'source': source_hashes(path), 'springs': edits,
+                                     'writer': digest(__file__)}, sort_keys=True).encode()).hexdigest()[:12]
+    output = ROOT / '.cache/usd_springs' / f'{path.stem}_{key}.usda'
+    if output.is_file():
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateAnonymous('.usda')
+    out = Usd.Stage.Open(layer)
+    out.GetRootLayer().subLayerPaths.append(os.path.relpath(path, output.parent))
+    if stage.GetDefaultPrim():
+        out.SetDefaultPrim(out.OverridePrim(stage.GetDefaultPrim().GetPath()))
+    for name, edit in edits.items():
+        prim = joints[name]
+        angular = prim.IsA(UsdPhysics.RevoluteJoint)
+        token = 'angular' if angular else 'linear'
+        scale = math.pi / 180 if angular else 1.  # UsdPhysics angular drives are per degree
+        drive = UsdPhysics.DriveAPI.Apply(_editable(out, prim, stage.GetPseudoRoot()), token)
+        drive.CreateStiffnessAttr(edit['stiffness'] * scale)
+        drive.CreateDampingAttr(edit['damping'] * scale)
+        drive.CreateTargetPositionAttr(math.degrees(edit['target']) if angular else edit['target'])
+        if not prim.HasAPI(UsdPhysics.DriveAPI, token):
+            drive.CreateTypeAttr('force')
+            drive.CreateMaxForceAttr(float('inf'))
+    staging = output.with_suffix(f'.{os.getpid()}.usda')
+    layer.Export(str(staging))
+    staging.replace(output)
+    return output
+
+
 # SimReady USD -> wrapper USD ---------------------------------------------------
 
 def _rigid_body_of(prim):
@@ -1304,6 +1374,38 @@ def usd_authored_mass(path):
     return any(prim.HasAPI(UsdPhysics.MassAPI) and (UsdPhysics.MassAPI(prim).GetMassAttr().Get()
                                                    or UsdPhysics.MassAPI(prim).GetDensityAttr().Get())
                for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()))
+
+
+def usd_bounds(path):
+    """``(minimum, maximum)`` corners (m) of the drawn geometry of a USD file's default prim, in that
+    prim's own frame (the frame a spawned asset is placed by), or None without drawable geometry. Cheap:
+    authored extents, no simulator; editors size a placeholder with it while the native mesh is made. A
+    static environment (``run.py asset environment``) gives its recorded collider bounds: its drawn ones may
+    include a sky dome kilometres wide."""
+    path = Path(path).resolve()
+    record = path.parent.parent / 'ASSET.json'
+    if record.is_file():
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            low, high = json.loads(record.read_text())['environment']['collider_bounds']
+            if all(math.isfinite(value) and abs(value) < 1e6 for value in low + high) and \
+                    all(a <= b for a, b in zip(low, high)):
+                return list(low), list(high)
+    return _usd_bounds(str(path), path.stat().st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=None)
+def _usd_bounds(path, _mtime):
+    from pxr import Usd, UsdGeom
+    stage = Usd.Stage.Open(path)
+    prim = stage.GetDefaultPrim() or next(iter(stage.GetPseudoRoot().GetChildren()), None)
+    if not prim:
+        return None
+    box = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                            useExtentsHint=True).ComputeUntransformedBound(prim).ComputeAlignedRange()
+    if box.IsEmpty():
+        return None
+    unit = UsdGeom.GetStageMetersPerUnit(stage) or 1.
+    return [float(v) * unit for v in box.GetMin()], [float(v) * unit for v in box.GetMax()]
 
 
 def usd_body_structure(path):
@@ -1323,6 +1425,7 @@ def _usd_body_structure(path, _mtime):
     bodies = [prim for prim in prims if prim.HasAPI(UsdPhysics.RigidBodyAPI)
               and UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Get() is not False]
     joints = [prim for prim in prims if prim.IsA(UsdPhysics.Joint)
+              and UsdPhysics.Joint(prim).GetJointEnabledAttr().Get() is not False
               and any(UsdPhysics.Joint(prim).GetBody0Rel().GetTargets() + UsdPhysics.Joint(prim).GetBody1Rel().GetTargets())]
     if joints or any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in prims):
         if not any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in prims):
@@ -1344,7 +1447,10 @@ def simready_layer(source, target):
       SimReady apple weighed 0.087 kg);
     - joint body0/body1 targets naming a collider mesh are retargeted to the rigid body containing it,
       only where the mesh frame equals the body frame, so the authored joint frames keep their meaning;
-    - an articulated asset without ArticulationRootAPI gets it on the one body no joint moves;
+    - an articulated asset without ArticulationRootAPI, or with it on a prim that is no rigid body, gets it
+      on the one body no joint moves;
+    - the root body (articulation root or single rigid body) takes the asset frame (``_reroot``): Isaac Lab
+      places that body where the scene places the asset;
     - revolute and prismatic limits are made hard in Newton (newton:limitStiffness = inf). UsdPhysics
       limits are hard stops in PhysX; Newton otherwise imports them as a 1e4 spring with almost no
       damping, which lets a 5 kg SimReady drawer pass its limit by ~0.1 m and bounce back;
@@ -1380,6 +1486,7 @@ def simready_layer(source, target):
     joints = [prim for prim in stage.Traverse() if prim.IsA(UsdPhysics.Joint)]
     if not any(prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint) for prim in joints):
         report.update(_simready_single_body(stage, out, wrapper, joints))
+        report.update(_reroot(out, wrapper, out.GetPrimAtPath(report['rigid_body'])))
         layer.Save()
         return report
     cache = UsdGeom.XformCache()
@@ -1419,7 +1526,12 @@ def simready_layer(source, target):
             out.OverridePrim(prim.GetPath()).CreateAttribute(
                 'newton:limitStiffness', Sdf.ValueTypeNames.Float).Set(float('inf'))
             report['hard_limits'].append(prim.GetName())
-    if joints and not any(prim.HasAPI(UsdPhysics.ArticulationRootAPI) for prim in stage.Traverse()):
+    authored = [prim for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.ArticulationRootAPI)]
+    if joints and not any(prim.HasAPI(UsdPhysics.RigidBodyAPI) for prim in authored):
+        # A root authored on a plain Xform above the bodies (e.g. the default prim) leaves Isaac Lab no
+        # link to fix (fix_root_link raises): it moves to the base body, like a missing root.
+        for prim in authored:
+            _editable(out, prim, top).RemoveAPI(UsdPhysics.ArticulationRootAPI)
         bases = [body for body in bodies if body.GetPath() not in moved]
         parts = {root(body.GetPath()) for body in bodies}
         if len(parts) > 1:
@@ -1431,8 +1543,100 @@ def simready_layer(source, target):
                              f'{[str(body.GetPath()) for body in bases]}')
         UsdPhysics.ArticulationRootAPI.Apply(out.OverridePrim(bases[0].GetPath()))
         report['articulation_root'] = str(bases[0].GetPath())
+    root = next(prim for prim in Usd.PrimRange(out.GetPrimAtPath(top.GetPath()), Usd.TraverseInstanceProxies())
+                if prim.HasAPI(UsdPhysics.ArticulationRootAPI))
+    report.update(_reroot(out, wrapper, root))
     layer.Save()
     return report
+
+
+def _transform(prim, matrix):
+    """Author ``matrix`` as the prim's whole local transform (one op, in the wrapper layer)."""
+    from pxr import UsdGeom
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    xformable.AddTransformOp().Set(matrix)
+
+
+def _reroot(out, top, root):
+    """Put the root body's frame on the default prim (the asset frame), keeping every world pose.
+
+    Isaac Lab places an asset by writing its root body pose: a root body away from the asset origin
+    (a SimReady ladder's frame is 2.2 m up, a cardboard box's 0.41 m) would start that far below where
+    the scene puts it and be pushed out of the ground. The root body's children take its old transform;
+    joint frames and mass properties authored in its frame are re-expressed."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    cache = UsdGeom.XformCache()
+    origin = cache.GetLocalToWorldTransform(top).GetInverse()
+    relative = cache.GetLocalToWorldTransform(root) * origin
+    if Gf.IsClose(relative, Gf.Matrix4d(1), 1e-9):
+        return {}
+    if not Gf.IsClose(Gf.Transform(relative).GetScale(), Gf.Vec3d(1, 1, 1), 1e-6):
+        raise ValueError(f'{root.GetPath()}: the root body is scaled relative to the asset; cannot move its frame')
+    for child in root.GetChildren():
+        stack = [child]
+        while stack:
+            prim = stack.pop()
+            if prim.IsA(UsdGeom.Xformable):
+                local = UsdGeom.Xformable(prim).GetLocalTransformation()
+                _transform(_editable(out, prim, top), local * relative)
+            else:  # e.g. a Scope: its children inherit the body frame directly
+                stack.extend(prim.GetChildren())
+    parent = cache.GetLocalToWorldTransform(root.GetParent()) * origin
+    _transform(_editable(out, root, top), parent.GetInverse())
+    for prim in out.Traverse():
+        if not prim.IsA(UsdPhysics.Joint):
+            continue
+        joint = UsdPhysics.Joint(prim)
+        for relationship, position, rotation in ((joint.GetBody0Rel(), joint.GetLocalPos0Attr(), joint.GetLocalRot0Attr()),
+                                                 (joint.GetBody1Rel(), joint.GetLocalPos1Attr(), joint.GetLocalRot1Attr())):
+            if relationship.GetTargets()[:1] != [root.GetPath()]:
+                continue
+            frame = Gf.Matrix4d().SetRotate(Gf.Quatd(rotation.Get() or Gf.Quatf(1))) * \
+                Gf.Matrix4d().SetTranslate(Gf.Vec3d(position.Get() or Gf.Vec3f(0))) * relative
+            override = UsdPhysics.Joint(out.OverridePrim(prim.GetPath()))
+            target = (override.GetLocalPos0Attr(), override.GetLocalRot0Attr()) if relationship == joint.GetBody0Rel() \
+                else (override.GetLocalPos1Attr(), override.GetLocalRot1Attr())
+            target[0].Set(Gf.Vec3f(frame.ExtractTranslation()))
+            target[1].Set(Gf.Quatf(frame.ExtractRotationQuat()))
+    if root.HasAPI(UsdPhysics.MassAPI):
+        mass, editable = UsdPhysics.MassAPI(root), UsdPhysics.MassAPI(_editable(out, root, top))
+        centre = mass.GetCenterOfMassAttr().Get()
+        if centre is not None and all(abs(v) < 1e30 for v in centre):
+            editable.GetCenterOfMassAttr().Set(Gf.Vec3f(relative.Transform(Gf.Vec3d(centre))))
+        axes = mass.GetPrincipalAxesAttr().Get()
+        if axes is not None and mass.GetPrincipalAxesAttr().HasAuthoredValue():
+            turned = Gf.Matrix4d().SetRotate(Gf.Quatd(axes)) * Gf.Matrix4d().SetRotate(relative.ExtractRotationQuat())
+            editable.GetPrincipalAxesAttr().Set(Gf.Quatf(turned.ExtractRotationQuat()))
+    return {'rerooted': {'body': str(root.GetPath()), 'offset': [round(v, 6) for v in relative.ExtractTranslation()]}}
+
+
+def usd_root_offset(path):
+    """Translation (m) of an asset's root body (articulation root, else its single rigid body) from the asset
+    frame, or None when they coincide or there is no body. Isaac Lab places that body where the scene places
+    the asset; ``simready_layer`` puts them together."""
+    path = Path(path).resolve()
+    return _usd_root_offset(str(path), path.stat().st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=None)
+def _usd_root_offset(path, _mtime):
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    stage = Usd.Stage.Open(path)
+    top = stage.GetDefaultPrim()
+    if not top:
+        return None
+    prims = list(Usd.PrimRange(top, Usd.TraverseInstanceProxies()))
+    roots = [prim for prim in prims if prim.HasAPI(UsdPhysics.ArticulationRootAPI)]
+    bodies = [prim for prim in prims if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+    root = roots[0] if roots else bodies[0] if len(bodies) == 1 else None
+    if root is None:
+        return None
+    cache = UsdGeom.XformCache()
+    relative = cache.GetLocalToWorldTransform(root) * cache.GetLocalToWorldTransform(top).GetInverse()
+    if Gf.IsClose(relative, Gf.Matrix4d(1), 1e-6):
+        return None
+    return [float(v) * (UsdGeom.GetStageMetersPerUnit(stage) or 1.) for v in relative.ExtractTranslation()]
 
 
 def _editable(out, prim, root):
@@ -1626,7 +1830,233 @@ def _footprint_boxes(triangles, cell=0.2, levels=(0.3, 0.9, 1.5)):
     return boxes, float(yaw), bottom, top
 
 
-def environment_layer(source, target, substitutes=None, footprint_colliders=()):
+def _mesh_triangles(prim, matrix):
+    """(points [N, 3] transformed by `matrix`, fan-triangulated faces [T, 3]) of a Mesh prim."""
+    import numpy as np
+    from pxr import UsdGeom
+    mesh, matrix = UsdGeom.Mesh(prim), np.array(matrix)
+    points = np.array(mesh.GetPointsAttr().Get(), float) @ matrix[:3, :3] + matrix[3, :3]
+    counts = np.array(mesh.GetFaceVertexCountsAttr().Get())
+    indices = np.array(mesh.GetFaceVertexIndicesAttr().Get())
+    fans = np.maximum(counts - 2, 0)
+    first = np.repeat(np.cumsum(counts) - counts, fans)
+    step = np.arange(fans.sum()) - np.repeat(np.cumsum(fans) - fans, fans)
+    return points, indices[np.stack([first, first + step + 1, first + step + 2], 1)]
+
+
+def _simplify_colliders(out, top, cell, editable, source, units, tile=8.0):
+    """Replace every collider Mesh below `top` by its vertices snapped to a `cell` m grid (degenerate and
+    repeated triangles dropped), merged into one invisible collider per `tile` m square: Newton holds static
+    triangle meshes per shape and per triangle, and a furnished GRScenes home has 4400 collider meshes of
+    35 M triangles (beyond 20 GB at MuJoCo conversion). The original meshes stay as visuals. Geometry is in
+    the frame of `top`, whose length unit is `units` m."""
+    import numpy as np
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    report = {'cell': cell, 'tile': tile}
+    cell, tile = cell / units, tile / units
+    cache = UsdGeom.XformCache()
+    into_top = cache.GetLocalToWorldTransform(out.GetPrimAtPath(top.GetPath())).GetInverse()
+    footprints = top.GetPath().AppendChild('footprint_colliders')
+    tiles, found, before = {}, [], 0
+    for prim in Usd.PrimRange(out.GetPrimAtPath(top.GetPath()), Usd.TraverseInstanceProxies()):
+        if prim.GetPath().HasPrefix(footprints) or not prim.IsA(UsdGeom.Mesh) or \
+                not prim.HasAPI(UsdPhysics.CollisionAPI) or not _mesh_has_geometry(prim):
+            continue
+        points, triangles = _mesh_triangles(prim, cache.GetLocalToWorldTransform(prim) * into_top)
+        before += len(triangles)
+        found.append(prim.GetPath())
+        cells, inverse = np.unique(np.round(points / cell).astype(np.int64), axis=0, return_inverse=True)
+        triangles = inverse.reshape(-1)[triangles]
+        triangles = triangles[(triangles[:, 0] != triangles[:, 1]) & (triangles[:, 1] != triangles[:, 2])
+                              & (triangles[:, 0] != triangles[:, 2])]
+        triangles = triangles[np.unique(np.sort(triangles, axis=1), axis=0, return_index=True)[1]]
+        if not len(triangles):
+            continue
+        vertices = cells * cell
+        keys = np.floor(vertices[triangles].mean(1)[:, :2] / tile).astype(np.int64)
+        for key in np.unique(keys, axis=0):
+            tiles.setdefault(tuple(key), []).append((vertices, triangles[np.all(keys == key, axis=1)]))
+    for path in found:  # collected first: uninstancing while traversing invalidates the instance proxies
+        prim = editable(source.GetPrimAtPath(path))
+        prim.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+        prim.RemoveAPI(UsdPhysics.CollisionAPI)
+    holder = UsdGeom.Scope.Define(out, top.GetPath().AppendChild('simplified_colliders'))
+    UsdGeom.Imageable(holder).CreatePurposeAttr(UsdGeom.Tokens.guide)
+    after = 0
+    for (x, y), parts in sorted(tiles.items()):
+        used = [np.unique(triangles) for _, triangles in parts]
+        offsets = np.cumsum([0] + [len(index) for index in used])
+        points = np.concatenate([vertices[index] for (vertices, _), index in zip(parts, used)])
+        faces = np.concatenate([np.searchsorted(index, triangles) + offset
+                                for (_, triangles), index, offset in zip(parts, used, offsets)])
+        mesh = UsdGeom.Mesh.Define(out, holder.GetPath().AppendChild(f'tile_{x}_{y}'.replace('-', 'm')))
+        mesh.CreatePointsAttr([Gf.Vec3f(*point) for point in points.tolist()])
+        mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+        mesh.CreateFaceVertexIndicesAttr(faces.reshape(-1).tolist())
+        UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr(UsdPhysics.Tokens.none)
+        after += len(faces)
+    return {**report, 'meshes': len(found), 'triangles_before': before, 'triangles_after': after,
+            'tiles': len(tiles)}
+
+
+def _cluster_triangles(points, triangles, cap):
+    """Merge the vertices of a triangle mesh on the finest grid that leaves at most `cap` distinct,
+    non-degenerate triangles. Returns (kept triangle indices, their faces over the merged vertices,
+    merged vertex positions, one original vertex per merged vertex)."""
+    import numpy as np
+    low = points.min(0)
+    size = max(float((points.max(0) - low).max()), 1e-9)
+
+    def cluster(cell):
+        keys = np.floor((points - low) / cell).astype(np.int64)
+        span = keys.max(0) + 1
+        _, label = np.unique((keys[:, 0] * span[1] + keys[:, 1]) * span[2] + keys[:, 2], return_inverse=True)
+        faces = label.reshape(-1)[triangles]
+        ok = np.nonzero((faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2]))[0]
+        _, first = np.unique(np.sort(faces[ok], axis=1), axis=0, return_index=True)
+        return ok[np.sort(first)], label.reshape(-1)
+
+    fine, coarse = size / 2 ** 14, size / 2
+    kept, label = cluster(fine)
+    if len(kept) > cap:
+        for _ in range(14):
+            middle = (fine * coarse) ** .5
+            found = cluster(middle)
+            if len(found[0]) > cap:
+                fine = middle
+            else:
+                coarse, (kept, label) = middle, found
+        if len(kept) > cap:
+            kept, label = cluster(coarse)
+    used, faces = np.unique(label[triangles[kept]], return_inverse=True)
+    count = np.bincount(label, minlength=label.max() + 1)[used]
+    merged = np.stack([np.bincount(label, points[:, axis], minlength=label.max() + 1)[used] for axis in range(3)], 1)
+    first = np.full(label.max() + 1, len(label))
+    np.minimum.at(first, label, np.arange(len(label)))
+    return kept, faces.reshape(-1, 3), merged / count[:, None], first[used]
+
+
+def _simplify_visuals(out, top, budget, editable, source):
+    """Bring the visible meshes below `top` to about `budget` triangles in all: every mesh above a common
+    cap is clustered to it (_cluster_triangles). Newton loads every visual triangle onto the GPU for its
+    viewer and cameras; a furnished GRScenes shop has 37 M, beyond 16 GB. Clustering keeps a subset of the
+    original triangles, so face-varying and uniform primvars, normals and GeomSubsets (material bindings)
+    carry over; vertex primvars take one merged vertex's value. Colliders are left alone."""
+    import numpy as np
+    from pxr import Usd, UsdGeom, UsdPhysics, Vt
+    meshes = []
+    for prim in Usd.PrimRange(out.GetPrimAtPath(top.GetPath()), Usd.TraverseInstanceProxies()):
+        if not prim.IsA(UsdGeom.Mesh) or prim.HasAPI(UsdPhysics.CollisionAPI) or not _mesh_has_geometry(prim):
+            continue
+        mesh = UsdGeom.Mesh(prim)
+        if mesh.ComputePurpose() == UsdGeom.Tokens.guide or mesh.ComputeVisibility() == UsdGeom.Tokens.invisible:
+            continue
+        meshes.append((prim.GetPath(), int(np.maximum(np.asarray(mesh.GetFaceVertexCountsAttr().Get()) - 2, 0).sum())))
+    sizes = np.array([size for _, size in meshes] or [0])
+    report = {'budget': budget, 'meshes': len(meshes), 'triangles_before': int(sizes.sum())}
+    low, high = 1, int(sizes.max())
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if np.minimum(sizes, middle).sum() <= budget else (low, middle - 1)
+    cap, after, simplified = low, 0, 0
+    for path, size in meshes:
+        if size <= cap:
+            after += size
+            continue
+        mesh = UsdGeom.Mesh(out.GetPrimAtPath(path))
+        counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get())
+        indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get())
+        fans = np.maximum(counts - 2, 0)
+        first = np.repeat(np.cumsum(counts) - counts, fans)
+        step = np.arange(fans.sum()) - np.repeat(np.cumsum(fans) - fans, fans)
+        corners = np.stack([first, first + step + 1, first + step + 2], 1)
+        face = np.repeat(np.arange(len(counts)), fans)
+        points = np.asarray(mesh.GetPointsAttr().Get(), np.float64)
+        kept, faces, merged, vertex = _cluster_triangles(points, indices[corners], cap)
+        select = {UsdGeom.Tokens.vertex: vertex, UsdGeom.Tokens.varying: vertex,
+                  UsdGeom.Tokens.faceVarying: corners[kept].reshape(-1), UsdGeom.Tokens.uniform: face[kept]}
+        expected = {UsdGeom.Tokens.vertex: len(points), UsdGeom.Tokens.varying: len(points),
+                    UsdGeom.Tokens.faceVarying: len(indices), UsdGeom.Tokens.uniform: len(counts)}
+        target = UsdGeom.Mesh(editable(source.GetPrimAtPath(path)))
+        target.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(merged.astype(np.float32)))
+        target.GetFaceVertexCountsAttr().Set(Vt.IntArray.FromNumpy(np.full(len(faces), 3, np.int32)))
+        target.GetFaceVertexIndicesAttr().Set(Vt.IntArray.FromNumpy(faces.reshape(-1).astype(np.int32)))
+        target.GetExtentAttr().Set(Vt.Vec3fArray.FromNumpy(
+            np.stack([merged.min(0), merged.max(0)]).astype(np.float32)))
+        for name in ('cornerIndices', 'cornerSharpnesses', 'creaseIndices', 'creaseLengths', 'creaseSharpnesses',
+                     'holeIndices'):
+            if mesh.GetPrim().GetAttribute(name).HasAuthoredValue():
+                target.GetPrim().GetAttribute(name).Block()
+        values = [(mesh.GetNormalsAttr(), mesh.GetNormalsInterpolation(), mesh.GetNormalsAttr().Get(), None)]
+        values += [(primvar.GetAttr(), primvar.GetInterpolation(), primvar.ComputeFlattened(), primvar)
+                   for primvar in UsdGeom.PrimvarsAPI(mesh).GetAuthoredPrimvars()]
+        for attribute, interpolation, value, primvar in values:
+            if value is None or interpolation == UsdGeom.Tokens.constant or not attribute.HasAuthoredValue():
+                continue
+            override = target.GetPrim().GetAttribute(attribute.GetName())
+            if interpolation not in select or len(value) != expected[interpolation]:
+                override.Block()
+                continue
+            array = np.asarray(value)
+            type_class = attribute.GetTypeName().type.pythonClass
+            chosen = array[select[interpolation]]
+            override.Set(type_class.FromNumpy(chosen) if array.dtype != object else type_class(chosen.tolist()))
+            if primvar is not None and primvar.IsIndexed():
+                UsdGeom.Primvar(override).BlockIndices()
+        for subset in UsdGeom.Subset.GetAllGeomSubsets(mesh):
+            members = np.asarray(subset.GetIndicesAttr().Get() or [], np.int64)
+            UsdGeom.Subset(editable(source.GetPrimAtPath(subset.GetPath()))).GetIndicesAttr().Set(
+                Vt.IntArray.FromNumpy(np.nonzero(np.isin(face[kept], members))[0].astype(np.int32)))
+        after += len(faces)
+        simplified += 1
+    return {**report, 'cap': cap, 'simplified': simplified, 'triangles_after': after}
+
+
+def _shrink_textures(out, top, size, editable, source, folder):
+    """Point every image file used below `top` at a copy in `folder` at most `size` pixels on a side.
+    Newton's GL viewer uploads a texture with mipmaps per mesh, shared or not: the 20 k meshes of a
+    GRScenes shop, each textured at about 600 x 600, would need 36 GB of GPU memory."""
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+    from pxr import Sdf, Usd
+    uses = {}
+    for prim in Usd.PrimRange(out.GetPrimAtPath(top.GetPath()), Usd.TraverseInstanceProxies()):
+        for attribute in prim.GetAttributes():
+            if attribute.GetTypeName() != Sdf.ValueTypeNames.Asset:
+                continue
+            value = attribute.Get()
+            path = value.resolvedPath if value else ''
+            if path and Path(path).suffix.lower() in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.tif', '.tiff'):
+                uses.setdefault(path, []).append((prim.GetPath(), attribute.GetName()))
+    folder.mkdir(parents=True, exist_ok=True)
+
+    def shrink(path):
+        try:
+            with Image.open(path) as image:
+                if max(image.size) <= size:
+                    return None
+                image.thumbnail((size, size))
+                name = hashlib.sha1(path.encode()).hexdigest()[:20] + '.png'
+                (image if image.mode in ('RGB', 'RGBA', 'L', 'LA') else image.convert('RGBA')).save(folder / name)
+                return name
+        except OSError:
+            return None  # unreadable (e.g. a format PIL lacks): left as it is
+
+    with ThreadPoolExecutor(8) as pool:
+        copies = dict(zip(uses, pool.map(shrink, uses)))
+    for path, name in copies.items():
+        if name is None:
+            continue
+        for prim_path, attribute in uses[path]:
+            editable(source.GetPrimAtPath(prim_path)).GetAttribute(attribute).Set(
+                Sdf.AssetPath(f'./{folder.name}/{name}'))
+    return {'size': size, 'files': len(uses), 'shrunk': sum(name is not None for name in copies.values())}
+
+
+def environment_layer(source, target, substitutes=None, footprint_colliders=(), simplify_colliders=None,
+                      deactivate=(), simplify_visuals=None, texture_size=None):
     """Write `target`, a USD layer that references the scene `source` unchanged and makes it one static
     environment for every simulated world:
 
@@ -1645,6 +2075,9 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
     - each child of a `footprint_colliders` prim without colliders (e.g. visual-only buildings, too
       detailed for mesh colliders) gets an invisible collider mesh of boxes over its cross-sections
       0.3-1.5 m above its base, from base to top;
+    - `simplify_colliders`, `simplify_visuals` and `texture_size` (_simplify_colliders, _simplify_visuals,
+      _shrink_textures) lighten scenes too heavy for Newton; the visual changes go to a binary
+      `<target>.visuals.usdc` sublayer, shrunk image copies to `<target stem>.textures/`;
     - a Y-up or non-metre source is rotated and scaled on the wrapper prim to Z-up metres.
     Prims inside instances are uninstanced where an override is needed. Returns what was changed."""
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
@@ -1704,6 +2137,12 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
         if not any(path.startswith(f'{done}/') for done in report['deactivated_missing']):
             editable(stage.GetPrimAtPath(path)).SetActive(False)
             report['deactivated_missing'].append(path)
+    report['deactivated'] = []
+    for path in deactivate:
+        if not stage.GetPrimAtPath(path):
+            raise ValueError(f'{source}: no prim {path} to deactivate')
+        editable(stage.GetPrimAtPath(path)).SetActive(False)
+        report['deactivated'].append(path)
     def hand_off_collider(prim, override):
         override.RemoveAPI(UsdPhysics.MeshCollisionAPI)
         override.RemoveAPI(UsdPhysics.CollisionAPI)
@@ -1716,9 +2155,10 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
                 UsdPhysics.MeshCollisionAPI.Apply(target_prim).CreateApproximationAttr(approximation)
         report['moved_colliders'].append(str(prim.GetPath()))
 
-    gone = tuple(f'{path}/' for path in report['deactivated_missing'])
+    off = report['deactivated_missing'] + report['deactivated']
+    gone = tuple(f'{path}/' for path in off)
     for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
-        if str(prim.GetPath()).startswith(gone) or str(prim.GetPath()) in report['deactivated_missing']:
+        if str(prim.GetPath()).startswith(gone) or str(prim.GetPath()) in off:
             continue
         if prim.IsA(UsdGeom.Mesh) and not _mesh_has_geometry(prim):
             # GRScenes groups parts under empty Meshes (some carrying the collider); Newton's mesh import
@@ -1792,15 +2232,8 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
                 continue
             triangles = []
             for prim in meshes:
-                mesh = UsdGeom.Mesh(prim)
-                matrix = np.array(cache.GetLocalToWorldTransform(prim) * into_top)
-                points = np.array(mesh.GetPointsAttr().Get(), float) @ matrix[:3, :3] + matrix[3, :3]
-                counts = np.array(mesh.GetFaceVertexCountsAttr().Get())
-                indices = np.array(mesh.GetFaceVertexIndicesAttr().Get())
-                fans = np.maximum(counts - 2, 0)
-                first = np.repeat(np.cumsum(counts) - counts, fans)
-                step = np.arange(fans.sum()) - np.repeat(np.cumsum(fans) - fans, fans)
-                triangles.append(points[indices[np.stack([first, first + step + 1, first + step + 2], 1)]])
+                points, faces = _mesh_triangles(prim, cache.GetLocalToWorldTransform(prim) * into_top)
+                triangles.append(points[faces])
             boxes, yaw, bottom, top_z = _footprint_boxes(np.concatenate(triangles))
             if not boxes:
                 continue
@@ -1820,6 +2253,19 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
             UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
             UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr(UsdPhysics.Tokens.none)
             report['footprint_boxes'][str(child.GetPath())] = len(boxes)
+    if simplify_colliders:
+        report['simplified_colliders'] = _simplify_colliders(out, top, simplify_colliders, editable, stage, units)
+    if simplify_visuals or texture_size:
+        visuals = Sdf.Layer.CreateNew(str(target.with_suffix('.visuals.usdc')))
+        layer.subLayerPaths.append(f'./{Path(visuals.identifier).name}')
+        out.SetEditTarget(Usd.EditTarget(visuals))
+        if simplify_visuals:
+            report['simplified_visuals'] = _simplify_visuals(out, top, int(simplify_visuals), editable, stage)
+        if texture_size:
+            report['shrunk_textures'] = _shrink_textures(out, top, int(texture_size), editable, stage,
+                                                         target.parent / f'{target.stem}.textures')
+        out.SetEditTarget(Usd.EditTarget(layer))
+        visuals.Save()
     layer.Save()
     check = Usd.Stage.Open(str(target))
     if check.GetCompositionErrors():
@@ -1829,7 +2275,7 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
     if not colliders:
         raise ValueError(f'{source}: the scene has no colliders; robots would fall through it')
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render,
-                                                       UsdGeom.Tokens.proxy])
+                                                       UsdGeom.Tokens.proxy, UsdGeom.Tokens.guide])
     bounds = Gf.Range3d()
     for prim in colliders:
         bounds.UnionWith(cache.ComputeWorldBound(prim).ComputeAlignedRange())
@@ -1838,27 +2284,31 @@ def environment_layer(source, target, substitutes=None, footprint_colliders=()):
     return report
 
 
-def environment(source, output, name=None, substitutes=None, footprint_colliders=()):
+def environment(source, output, name=None, substitutes=None, footprint_colliders=(), catalog=None,
+                simplify_colliders=None, deactivate=(), simplify_visuals=None, texture_size=None):
     """Write OUTPUT/usd/NAME.usda wrapping a scene USD as a static environment, and ASSET.json (no MJCF form).
-    `substitutes` is a JSON file mapping missing file names to replacement USD paths (relative to it)."""
+    `substitutes` maps missing file names to replacement USD paths, or is a JSON file of that mapping (paths
+    relative to it); `catalog` (shared.environments: key, label, pose, license, options) joins the record."""
     source, output = Path(source).resolve(), Path(output).resolve()
-    if substitutes:
+    if substitutes and not isinstance(substitutes, dict):
         mapping = Path(substitutes).resolve()
         substitutes = {name: mapping.parent / path for name, path in json.loads(mapping.read_text()).items()}
     name = name or source.stem
     if (output / 'ASSET.json').exists() or (output / 'usd').exists():
         raise FileExistsError(f'{output} already has ASSET.json or usd/; remove them or choose another output')
     target = output / 'usd' / f'{name}.usda'
-    report = environment_layer(source, target, substitutes, footprint_colliders)
+    report = environment_layer(source, target, substitutes, footprint_colliders, simplify_colliders, deactivate,
+                               simplify_visuals, texture_size)
+    written = [target] + ([target.with_suffix('.visuals.usdc')] if simplify_visuals or texture_size else [])
     record = {
         'source': workspace_path(source), 'source_format': 'usd', 'source_sha256': digest(source),
         'source_layers_sha256': usd_layers(source),
         'formats': {'usd': workspace_path(target)},
         'steps': [{'from': 'usd', 'to': 'usd', 'tool': 'shared.asset_formats.environment_layer', **report}],
-        'environment': {'collider_bounds': report['collider_bounds'],
+        'environment': {'collider_bounds': report['collider_bounds'], **(catalog or {}),
                         'note': 'static environment: place it with scope: global; bounds are in the wrapper frame'},
         'joint_order': [], 'alignment': None,
-        'sha256': {target.relative_to(output).as_posix(): digest(target)},
+        'sha256': {path.relative_to(output).as_posix(): digest(path) for path in written},
     }
     (output / 'ASSET.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
     return record
@@ -1921,14 +2371,26 @@ def main(argv=None):
                       help='Asset directory; writes usd/NAME.usda and ASSET.json (default: assets/<asset>)')
     wrap.add_argument('--name', help='File name of the wrapper (default: SimReady asset name)')
     scene = commands.add_parser('environment', help='Wrap a scene USD as a static environment for Isaac Lab (USD only)')
-    scene.add_argument('source', type=Path, help='Scene USD, e.g. a vendored Isaac environment')
-    scene.add_argument('output', type=Path, help='Asset directory; writes usd/NAME.usda and ASSET.json')
+    scene.add_argument('source', nargs='?',
+                       help='Scene USD, or a catalog scene (shared/environments.py: e.g. rivermark, isaac/office, '
+                            'grscenes/home/<id>), downloaded when missing; grscenes/<part> downloads that whole part')
+    scene.add_argument('output', type=Path, nargs='?', help='Asset directory; writes usd/NAME.usda and ASSET.json')
+    scene.add_argument('--list', action='store_true', help='List the catalog scenes')
     scene.add_argument('--name', help='File name of the wrapper (default: source file name)')
     scene.add_argument('--substitutes', type=Path,
                        help='JSON mapping missing upstream file names to replacement USDs (paths relative to it)')
     scene.add_argument('--footprint-colliders', action='append', default=[], metavar='PRIM',
                        help='Give each child of PRIM without colliders (e.g. visual-only buildings) invisible '
                             'boxes over its footprint')
+    scene.add_argument('--simplify-colliders', type=float, metavar='CELL',
+                       help='Snap collider vertices to a CELL m grid and merge them into a few invisible '
+                            'colliders (scenes with millions of collider triangles)')
+    scene.add_argument('--simplify-visuals', type=int, metavar='TRIANGLES',
+                       help='Cluster the largest visible meshes until the scene shows about TRIANGLES in all '
+                            '(Newton views and cameras hold every visible triangle on the GPU)')
+    scene.add_argument('--texture-size', type=int, metavar='PIXELS',
+                       help='Use copies of the images at most PIXELS on a side (Newton\'s viewer uploads a '
+                            'texture per mesh)')
     verify = commands.add_parser('check', help='Verify vendored sources and compare the USD and MJCF forms')
     verify.add_argument('asset', type=Path, help='Asset directory with ASSET.json and/or source/SOURCE.json, '
                                                  'or a USD file')
@@ -1979,8 +2441,30 @@ def main(argv=None):
             print('unresolved (not copied):', ', '.join(map(str, unresolved)))
         return 0
     if options.command == 'environment':
-        record = environment(options.source, options.output, options.name, options.substitutes,
-                             options.footprint_colliders)
+        from shared import environments
+        if options.list or options.source is None:
+            for item in environments.catalog():
+                state = '已包装' if item['wrapped'] else '本地' if item['local'] else '在线'
+                print(f"{item['key']:44s} {state:4s} {'' if item['verified'] else '未验证 '}{item['label']}"
+                      f"{' · ' + item['note'] if item['note'] else ''}")
+            return 0
+        if not Path(options.source).is_file():
+            key = options.source.strip('/')
+            if key.startswith('grscenes/') and key.count('/') == 1:
+                scenes = environments.download_grscenes(key.split('/')[1], progress=print)
+                print(f'{len(scenes)} 个场景；用 run.py asset environment {key}/<场景 id> 包装')
+                return 0
+            if options.output or options.name or options.substitutes or options.footprint_colliders \
+                    or options.simplify_colliders or options.simplify_visuals or options.texture_size:
+                parser.error('a catalog scene takes no output, --name, --substitutes, --footprint-colliders, '
+                             '--simplify-colliders, --simplify-visuals or --texture-size')
+            record = environments.prepare(environments.resolve(key), progress=print)
+        else:
+            if options.output is None:
+                parser.error('a USD source needs an output directory')
+            record = environment(options.source, options.output, options.name, options.substitutes,
+                                 options.footprint_colliders, simplify_colliders=options.simplify_colliders,
+                                 simplify_visuals=options.simplify_visuals, texture_size=options.texture_size)
         step = record['steps'][0]
         print(json.dumps({**record['formats'], **record['environment']}, indent=2))
         print(f"{step['colliders']} colliders; substituted {len(step['substituted_missing'])} and stubbed "

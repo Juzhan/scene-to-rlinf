@@ -66,15 +66,16 @@ def geometry_only(description, cached):
             if not children:
                 return None
             return replace(node, factory=None, parameters={}, initial_state={}, frames=(),
-                           connections=(), reset=None, children=children)
-        return replace(node, connections=(), reset=None, children=children)
+                           connections=(), reset=None, motion=None, children=children)
+        # Placement rules play no part in geometry; a hidden asset (visible: false) is still drawn.
+        return replace(node, connections=(), reset=None, motion=None, visible=True, children=children)
     return replace(description, root=keep(description.root), connections=())
 
 
 def _export(scene, visuals, prepared, revision, *, force=False):
     """One geometry snapshot in the backend's running SDK (``visuals``), on a fresh stage."""
     from shared.assembly.interfaces import source_revision
-    from shared.assembly.visuals import SceneChanged, cache_path, geometry_keys, load_visuals
+    from shared.assembly.visuals import SceneChanged, cache_path, geometry_keys, load_visuals, report_progress
     from shared.assembly.mesh_preview import MESH_SOURCE_SUFFIX, write_mesh_source
     keys = geometry_keys(scene)
     existing = {} if force else load_visuals(scene)
@@ -90,6 +91,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
         output = cache_path(scene)
         output.parent.mkdir(parents=True, exist_ok=True)
         entities = dict(existing)
+        report_progress([path for path, (node, _) in prepared.description.index().items() if node.factory], .45)
         for path, (node, _) in prepared.description.index().items():
             if not node.factory:
                 continue
@@ -108,6 +110,11 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                 entities[path] = record
                 continue
             root_transform = transforms.GetLocalToWorldTransform(prim)
+            # Vertices are relative to the root's pose but keep its scale (a `scale` parameter, a centimetre
+            # scene's unit conversion): the editor places meshes by pose only.
+            unscaled = Gf.Transform(root_transform)
+            unscaled.SetScale(Gf.Vec3d(1, 1, 1))
+            root_transform = unscaled.GetMatrix()
             if node.factory == 'terrain':
                 root_transform = Gf.Matrix4d(1).SetTranslate(Gf.Vec3d(*origin))
                 record['note'] = 'Native generated terrain, seed42/env0; coordinates relative to the selected terrain origin'
@@ -206,6 +213,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                 record.update(path=str(filename), mesh_count=len(parts),
                               vertex_count=sum(len(p['vertices']) for p in parts))
             entities[path] = record
+            report_progress([path], .6)
     for path, key in keys.items():
         entities.setdefault(path, {'key': key, 'path': None, 'exact': False,
                                   'note': 'Sensor helper; sensors are not started for geometry export'})
@@ -243,8 +251,14 @@ def serve(reply, idle):
     """
     import select
     import traceback
+    from shared.assembly import visuals as shared_visuals
     from shared.assembly.visuals import SceneChanged, ensure_visuals
     owner, options, sources = None, None, {}
+
+    def progress(values):
+        reply.write(json.dumps({'progress': values}) + '\n')
+        reply.flush()
+    shared_visuals.PROGRESS = progress
 
     def start(visuals, prepared):
         nonlocal owner, options

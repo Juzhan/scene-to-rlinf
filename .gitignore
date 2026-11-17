@@ -28,6 +28,7 @@ events.out.tfevents.*
 !/projects/go2_chase/
 !/projects/go2_piper_wholebody/
 !/projects/box_stack_diffsim/
+!/projects/act_lerobot/
 # The web editor's unsaved working copy (.scene.yaml.<pid>.editing).
 /projects/*/.*.editing
 

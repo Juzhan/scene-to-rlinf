@@ -2,7 +2,8 @@
 
 The root becomes a UsdPhysics kinematic rigid body, which Newton imports as a kinematic body (a
 MuJoCo-Warp mocap-like free joint) and PhysX as a kinematic actor. One native command term per
-entity writes the pose the Task set, in the command update after resets and before observations.
+entity writes the pose the Task set, else the pose of its scene ``motion`` (``shared/assembly/motion.py``),
+in the command update after resets and before observations.
 """
 from functools import lru_cache
 from .frames import wxyz, xyzw
@@ -47,16 +48,21 @@ def _config_type():
     from isaaclab.utils.math import quat_box_minus
 
     class KinematicPose(CommandTerm):
-        """Writes the Task-set root pose of one kinematic entity, with velocity = displacement / step_dt.
+        """Writes the Task-set (else scene-motion) root pose of one kinematic entity, with velocity =
+        displacement / step_dt.
 
-        Environments reset since the last update keep the pose reset gave them. Without a Task
-        move the entity stays put, with zero velocity."""
+        Environments reset since the last update keep the pose reset gave them (a path motion's start).
+        Without a Task move or motion the entity stays put, with zero velocity."""
 
         def __init__(self, cfg, env):
             super().__init__(cfg, env)
             self.asset = env.scene[cfg.name]
             self.fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
             self.moving = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self.motion = None
+            if cfg.motion is not None:
+                from shared.assembly.motion import Motion
+                self.motion = Motion(cfg.motion, cfg.base, cfg.areas, self.num_envs, self.device)
 
         @property
         def command(self):
@@ -67,10 +73,22 @@ def _config_type():
         def _resample_command(self, env_ids):
             self.fresh[env_ids] = True
             self.moving[env_ids] = False
+            if self.motion is None:
+                return
+            self.motion.reset(env_ids)
+            start = self.motion.start(env_ids)
+            if start is not None:  # a path: the reset pose is on it
+                rows = torch.arange(self.num_envs, device=self.device)[env_ids]
+                pose = torch.cat((start[:, :3] + self._env.scene.env_origins[rows], xyzw(start[:, 3:7])), -1)
+                self.asset.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=rows)
+                self.asset.write_root_link_velocity_to_sim_index(root_velocity=torch.zeros(len(rows), 6, device=self.device),
+                                                                 env_ids=rows)
 
         def _update_command(self):
             from .python_task import task_set
             value = task_set(self._env, self.cfg.name)
+            if value is None and self.motion is not None:
+                value = self.motion.step(self.command, self._env.step_dt, ~self.fresh)
             fresh, self.fresh[:] = self.fresh.clone(), False
             if value is None:
                 # Stop: write zero velocity once where the entity was moving.
@@ -103,15 +121,22 @@ def _config_type():
     class KinematicPoseCfg(CommandTermCfg):
         class_type: type = KinematicPose
         name: str = None
+        motion: dict = None
+        base: dict = None
+        areas: dict = None
     return KinematicPoseCfg
 
 
 def attach_kinematic(commands, settings):
     """One command term per kinematic entity; its native scene key is the Task's ``set`` name."""
-    from shared.assembly.kinematic import kinematic_entities
+    from shared.assembly.abstract import reset_areas
+    from shared.assembly.kinematic import kinematic_entities, kinematic_poses
+    from shared.assembly.motion import entity_motions
+    motions, poses, areas = entity_motions(settings), kinematic_poses(settings), reset_areas(settings)
     for key in kinematic_entities(settings):
         term = 'kinematic_' + key
         if term in commands:
             raise ValueError('Reserved kinematic command name: ' + term)
         # Resampled only on reset: the episode never reaches this interval.
-        commands[term] = _config_type()(name=key, resampling_time_range=(1e9, 1e9), debug_vis=False)
+        commands[term] = _config_type()(name=key, motion=motions.get(key), base=poses[key], areas=areas,
+                                        resampling_time_range=(1e9, 1e9), debug_vis=False)

@@ -149,6 +149,8 @@ def build_scene_config(description, settings, factories):
             raise NotImplementedError(f'{path}: joint reset (reset.joint_positions) is only bound on isaaclab3')
         if node.kinematic:
             raise NotImplementedError(f'{path}: kinematic entities are only bound on isaaclab3')
+        if not node.visible:
+            raise NotImplementedError(f'{path}: visible: false (hidden from rendering) is only bound on isaaclab3')
         if node.reset is not None and not any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in cfg.spec_fn().joints):
             raise ValueError(f'{path}: reset cannot move a fixed-base entity')
         entities[key] = cfg

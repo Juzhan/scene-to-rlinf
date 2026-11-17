@@ -49,7 +49,8 @@ def abstract_entities(settings):
 
 
 def region_sources(settings):
-    """Names of abstract entities used as some entity's ``reset.region``; regions stay static."""
+    """Names of abstract entities used as some entity's ``reset.region`` or wander ``motion`` region;
+    regions stay static."""
     root = settings.get('name', 'world') + '/'
     found = set()
 
@@ -64,7 +65,8 @@ def region_sources(settings):
             for item in value:
                 visit(item)
     visit(settings.get('entities', ()))
-    return found
+    from .motion import motion_regions
+    return found | motion_regions(settings)
 
 
 def commanded(settings):
@@ -235,8 +237,12 @@ def reset_areas(settings):
 def commanded_entity(settings, node):
     """Serializable description of one abstract entity held by a backend command term."""
     from dataclasses import asdict
+    from .motion import check
     return {'name': node.name, 'shape': node.shape, 'size': list(node.size), 'pose': asdict(node.pose),
             'reset': None if node.reset is None else asdict(node.reset),
+            'motion': None if node.motion is None else check(node.name, node.motion,
+                                                             reset_region=node.reset.region if node.reset else None,
+                                                             has_reset=node.reset is not None),
             'mount': None if node.mount is None else entity_key(settings, node.mount.entity)}
 
 
@@ -245,9 +251,9 @@ class AbstractState:
 
     Both backends' command terms hold one: ``resample`` runs on episode reset and every
     ``reset.interval``, ``advance`` in the native command update after Task evaluation and
-    resets, before observations. ``advance`` applies the pose the Task set this step to rows
-    not resampled since the last update; velocity is always displacement / step_dt, so it is
-    zero when the Task does not move the entity and right after any reset.
+    resets, before observations. ``advance`` applies the pose the Task set this step (else the
+    entity's scene ``motion``) to rows not resampled since the last update; velocity is always
+    displacement / step_dt, so it is zero when nothing moves the entity and right after any reset.
     """
 
     def __init__(self, entity, areas, num_envs, device):
@@ -257,6 +263,11 @@ class AbstractState:
         self.pose = torch.tensor([*base['position'], *base['orientation']], device=device).repeat(num_envs, 1)
         self.velocity = torch.zeros((num_envs, 3), device=device)
         self.fresh = torch.ones(num_envs, dtype=torch.bool, device=device)
+        motion = entity.get('motion')
+        if motion is not None:
+            from .motion import Motion
+            motion = Motion(motion, base, areas, num_envs, device)
+        self.motion = motion
 
     def resample(self, env_ids):
         import torch
@@ -266,12 +277,20 @@ class AbstractState:
             self.pose[env_ids] = sample_poses(rule, base, self.areas, count, device=self.pose.device)
         else:
             self.pose[env_ids] = torch.tensor([*base['position'], *base['orientation']], device=self.pose.device)
+        if self.motion is not None:
+            self.motion.reset(env_ids)
+            start = self.motion.start(env_ids)
+            if start is not None:
+                self.pose[env_ids] = start.to(self.pose.dtype)
         self.velocity[env_ids] = 0.
         self.fresh[env_ids] = True
 
     def advance(self, dt, value=None):
-        """Apply a Task-set (N, 3) position or (N, 7) xyz + wxyz pose, validated by the Task runtime."""
+        """Apply a Task-set (N, 3) position or (N, 7) xyz + wxyz pose, validated by the Task runtime;
+        without one the entity's scene motion, if any, moves it."""
         import torch
+        if value is None and self.motion is not None:
+            value = self.motion.step(self.pose, dt, ~self.fresh)
         pose = self.pose.clone()
         if value is not None:
             if value.shape[1] == 3:

@@ -56,7 +56,7 @@ def _plain(value):
 
 def _merge(target, patch):
     for key, value in patch.items():
-        if key in ("reset", "initial_state"):
+        if key in ("reset", "initial_state", "motion"):
             target[key] = deepcopy(value)
         elif isinstance(value, dict) and isinstance(target.get(key), dict):
             # Detach YAML aliases: one instance's edit must not edit another.
@@ -206,9 +206,10 @@ class SceneDocument:
             raise ValueError("Entity edits require parent-local poses; mounted sensors require body-local poses")
         if path not in self.targets:
             raise ValueError(f"Unknown entity: {path}")
-        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes", "kinematic"}
+        allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes", "kinematic",
+                   "motion", "visible"}
         if self.entities[path].get("kind") == "abstract":
-            allowed = {"pose", "tags", "reset", "mount", "shape", "size"}
+            allowed = {"pose", "tags", "reset", "mount", "shape", "size", "motion"}
         if changes.keys() - allowed:
             raise ValueError(f"Unsupported entity edits: {sorted(changes.keys() - allowed)}")
         changes = deepcopy(changes)
@@ -240,8 +241,20 @@ class SceneDocument:
                 raise ValueError("kinematic is true or false")
             if not changes["kinematic"]:  # The default: written only when true.
                 changes["kinematic"] = None
-        for key in ("reset", "mount", "meshes", "kinematic"):
-            # None clears an optional rule (static, unmounted entity, no ray targets, dynamic body).
+        if "motion" in changes and changes["motion"] is not None:
+            from .motion import check
+            reset = changes.get("reset", self.entities[path].get("reset")) or None
+            check(path, changes["motion"], reset_region=(reset or {}).get("region"), has_reset=reset is not None)
+        if "visible" in changes:
+            if self.targets[path][1] is not None:
+                raise ValueError(f"{path}: visible is set on scene-owned entities, not on assembly parts")
+            if not isinstance(changes["visible"], bool):
+                raise ValueError("visible is true or false")
+            if changes["visible"]:  # The default: written only when false.
+                changes["visible"] = None
+        for key in ("reset", "mount", "meshes", "kinematic", "motion", "visible"):
+            # None clears an optional rule (static, unmounted entity, no ray targets, dynamic body, no motion,
+            # rendered).
             if key in changes and changes[key] is None and self.targets[path][1] is None:
                 self.targets[path][0].pop(key, None)
                 del changes[key]
@@ -633,7 +646,7 @@ class SceneDocument:
                 del self.data["visualization"]
 
     def add_entity(self, name, factory=None, *, parameters=None, pose=None, kind="entity", shape=None, size=None,
-                   mount=None, meshes=None):
+                   mount=None, meshes=None, scope=None):
         _check_name(name)
         if any(node["name"] == name for node in self.data["entities"]):
             raise ValueError(f"Entity already exists: {name}")
@@ -654,6 +667,10 @@ class SceneDocument:
         if shape is not None or size is not None:
             raise ValueError("shape and size belong to abstract entities")
         node = {"name": name, "factory": factory, "kind": kind}
+        if scope is not None:
+            if scope not in ("environment", "global"):
+                raise ValueError(f"Entity {name}: scope must be environment or global")
+            node["scope"] = scope
         if factory == 'camera':
             node['camera_only'] = True
         if parameters:
@@ -730,6 +747,7 @@ class SceneDocument:
                              "reset": _plain(node.get("reset", {})),
                              "camera_only": node.get("camera_only", False),
                              "kinematic": bool(node.get("kinematic", False)), "scope": meta.get("scope"),
+                             "motion": _plain(node.get("motion")), "visible": node.get("visible", True) is not False,
                              "display_pose": display_pose,
                              "pose_authored": "pose" in node, "parameters": node.get("parameters", {}),
                              "tags": node.get("tags", []), "mount": mount, "meshes": list(node.get("meshes", [])),
@@ -900,3 +918,60 @@ def apply_edits(path, payload):
     validate_task_settings(_plain(document.data), term_registry=terms, task_presets=tasks, require_training=False)
     changed = document.save(expected=payload["revision"])
     return {"changed": changed, "snapshot": document.snapshot()}
+
+
+def simulation_settings(scene):
+    """``(backend, choices, current)`` of the run-time choices of a project's train.yaml: the backend's
+    ``project.SIMULATION_CHOICES`` and the values ``env.train.init_params`` names (else each default)."""
+    from omegaconf import OmegaConf
+    from .assets import backend_module
+    from .visuals import geometry_backend
+    backend = geometry_backend(scene)
+    choices = backend_module(backend, 'project').SIMULATION_CHOICES
+    recipe = Path(scene).resolve().parent / 'train.yaml'
+    parameters = {}
+    if recipe.is_file():
+        parameters = OmegaConf.select(OmegaConf.load(recipe), 'env.train.init_params', default=None) or {}
+    current = {name: str(parameters.get(name) or next(iter(options))) for name, options in choices.items()}
+    return backend, choices, current
+
+
+def write_simulation_settings(scene, values):
+    """Write ``values`` (e.g. ``{'physics': 'ovphysx'}``) into train.yaml ``env.train.init_params``; evaluation
+    follows training (``env.eval: ${env.train}``). Only those lines change: an existing key's value is
+    replaced in place, a new key is added after the block's last key at the same indentation."""
+    _, choices, _ = simulation_settings(scene)
+    for name, value in values.items():
+        if name not in choices or value not in choices[name]:
+            raise ValueError(f'{name} must be one of {list(choices.get(name, ()))}, got {value!r}')
+    recipe = Path(scene).resolve().parent / 'train.yaml'
+    if not recipe.is_file():
+        raise ValueError(f'{recipe} is missing; the run-time choices live in the project\'s train.yaml')
+    text = recipe.read_text()
+    node = YAML().load(text)
+    for key in ('env', 'train', 'init_params'):
+        node = node.get(key) if hasattr(node, 'get') else None
+        if not hasattr(node, 'lc'):
+            raise ValueError(f'{recipe}: add an env.train.init_params block (with backend) before choosing '
+                             'the physics engine or renderer')
+    lines = text.splitlines(keepends=True)
+    for name, value in values.items():
+        if name in node:
+            row, column = node.lc.value(name)
+            line = lines[row]
+            # keep what follows the old scalar (spacing, comment, newline)
+            rest = re.match(r'("[^"]*"|\'[^\']*\'|[^\s#]+)?(.*)$', line[column:], re.S).group(2)
+            lines[row] = line[:column] + str(value) + rest
+        else:
+            last = list(node)[-1]
+            row, column = node.lc.key(last)
+            # after the last key and anything nested under it
+            after = row + 1
+            while after < len(lines) and (not lines[after].strip() or len(lines[after]) - len(lines[after].lstrip()) > column):
+                after += 1
+            lines.insert(after, ' ' * column + f'{name}: {value}\n')
+            node[name] = value
+            node.lc.data[name] = [after, column, after, column + len(name) + 2]
+    temporary = recipe.with_name(f'.{recipe.name}.save')
+    temporary.write_text(''.join(lines))
+    os.replace(temporary, recipe)

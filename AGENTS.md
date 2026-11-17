@@ -94,11 +94,16 @@
   抽象体可用 `reset`（region/yaw_range/interval）随机放置；任何实体的 `reset.region` 引用静态矩形/长方体
   抽象体的场景路径 `world/<名>`。`mount` 只让抽象体读数跟随实体根部，不是物理约束，且不能再随机复位。
   相对量在模型或 Task 代码计算；仿真显示开关为 `visualization.abstract: [名称]`，两后端形状尺寸共用一份规格，仅在项目预览 view/record 画出（显式 --backend 的物理查看器不画）。
-  回合内移动抽象体是任务设定，不写进 scene.yaml：evaluate 返回 `set: {名: [B,3] 位置或 [B,7] xyz+wxyz}`，
-  由后端原生 command 项在复位之后、观察之前生效；刚复位的环境保持采样位姿，Task 看到的是策略上一步观察到的位置。
-  可移动的是未跟随、且不被任何 `reset.region` 引用的抽象体，它们另有 `<名>.linear_velocity`（位移/step_dt，复位后为 0）；
-  区域保持静态常量，非法 set 运行时报错并写明实体名。决策步长用 obs.simulation.step_dt。物理实体只有声明 `kinematic: true` 的（仅 isaaclab3）能由同一 `set` 移动，见 docs/SCENE_BACKENDS.md；动力学实体的 Task 事件尚未接入。
-  两后端同样支持静态、随机复位、Task 移动和跟随读数。
+  回合内移动分两种来源，经同一后端写入口：场景本身的运动（宠物游走、车沿路径、移动的木箱）写成实体的
+  `motion`（`wander` 区域内游走 / `path` 沿路径，`shared/assembly/motion.py`，编辑器“运动”栏可设、可预览），
+  不进 Task；与任务语义相关的事件由 evaluate 返回 `set: {名: [B,3] 位置或 [B,7] xyz+wxyz}`，同一步 set 优先。
+  两者都由后端原生 command 项在复位之后、观察之前生效；刚复位的环境保持采样位姿（path 的复位位置在路径上），
+  Task 看到的是策略上一步观察到的位置。
+  可移动的是未跟随、且不被任何 `reset.region` 或游走区域引用的抽象体，它们另有 `<名>.linear_velocity`（位移/step_dt，复位后为 0）；
+  区域保持静态常量，非法 set/motion 报错并写明实体名。决策步长用 obs.simulation.step_dt。物理实体只有声明 `kinematic: true` 的（仅 isaaclab3）能由 motion 或 set 移动，见 docs/SCENE_BACKENDS.md；动力学实体的 Task 事件尚未接入。
+  两后端同样支持静态、随机复位、Task 移动和跟随读数；scene motion、`visible: false` 只接入 isaaclab3，其他后端明确报错。
+- 是否受力（动态 / 运动学 / 固定根部）、是否出现在渲染画面（`visible`，抽象体为 `visualization.abstract`）
+  是实体属性，编辑器场景列表行尾直接切换，写回同一份 scene.yaml；“编辑器中隐藏”只影响网页，不保存。
 - 统一入口负责评估/录像/汇总。MuJoCo/VLA 专用项目尚未自动迁移到这套 Python Task 运行接入。
 
 ## 7. 历史、数据与权重兼容

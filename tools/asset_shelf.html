@@ -61,6 +61,19 @@ footer { flex: none; display: grid; gap: 7px; padding: 8px; background: #fff; bo
 .field { display: grid; grid-template-columns: 52px 1fr; gap: 6px; align-items: center; font-size: 11.5px; color: var(--muted); }
 .field input, .field select { min-width: 0; width: 100%; padding: 4px 7px; border: 1px solid #cfd4da; border-radius: 6px; font-size: 12px;
                               background: #fff; color: #1f2328; }
+/* In-page dropdowns (enhance): a native <select> pops up at the system UI scale, not the page's. */
+.menu-button { width: 100%; min-width: 0; padding: 4px 24px 4px 8px; border: 1px solid #cfd4da; border-radius: 7px; background: #fff
+               url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%236b7280' stroke-width='1.4'/%3E%3C/svg%3E")
+               no-repeat right 8px center / 9px; color: inherit; font-size: 12px; text-align: left; cursor: pointer;
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .menu-button { flex: 1; }
+.menu-button:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.menu-pop { position: fixed; z-index: 50; overflow: auto; padding: 4px 0; background: #fff; border: 1px solid var(--line);
+            border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.14); scrollbar-width: thin; }
+.menu-group { padding: 6px 10px 2px; font-size: 10.5px; font-weight: 600; color: var(--muted); }
+.menu-item { padding: 4px 12px 4px 16px; font-size: 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.menu-item:hover { background: #eef3fd; }
+.menu-item.sel { color: var(--accent); font-weight: 600; }
 .xyz { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
 .actions { display: flex; gap: 6px; align-items: center; }
 button.place { flex: 1; padding: 6px 10px; border: 0; border-radius: 7px; background: #1f883d; color: #fff; font-size: 13px;
@@ -275,6 +288,7 @@ function controls(server, previous) {
           `<input type="number" step="0.01" min="0.001" value="${+value.toFixed(4)}" data-index="${index}">`).join('')}</span></label>` : '');
     $('options').style.display = $('options').innerHTML ? 'grid' : 'none';
     $('options').style.gap = '6px';
+    for (const select of $('options').querySelectorAll('select')) enhance(select);
     if ($('mount')) $('mount').onchange = () => post('option', {mount: $('mount').value});
     if ($('body')) $('body').onchange = () => post('option', {body: $('body').value});
     for (const input of $('options').querySelectorAll('.xyz input')) input.onchange = () =>
@@ -329,6 +343,57 @@ function installDrop() {
   for (const [type, handler] of view.__rlinfShelfDrop) doc.addEventListener(type, handler, true);
 }
 
+// The <select> keeps the value and its change events; a button and a list in the page stand in for it.
+const menus = new Set();
+let openMenu = null;
+function enhance(select) {
+  select.style.display = 'none';
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'menu-button';
+  select.after(button);
+  select.menuButton = button;
+  menus.add(select);
+  syncMenus();
+  button.addEventListener('click', () => { const again = openMenu && openMenu.select === select; closeMenu(); if (!again) showMenu(select); });
+}
+function syncMenus() {
+  for (const select of menus) {
+    if (!select.isConnected) { menus.delete(select); continue; }
+    const option = select.options[select.selectedIndex], text = option ? option.textContent : '';
+    if (select.menuButton.textContent !== text) select.menuButton.textContent = text;
+  }
+}
+function closeMenu() { if (openMenu) { openMenu.pop.remove(); openMenu = null; } }
+function showMenu(select) {
+  const item = option => `<div class="menu-item${option.value === select.value ? ' sel' : ''}" data-value="${esc(option.value)}">${esc(option.textContent)}</div>`;
+  const pop = document.createElement('div');
+  pop.className = 'menu-pop';
+  pop.innerHTML = [...select.children].map(child => child.tagName === 'OPTGROUP'
+    ? `<div class="menu-group">${esc(child.label)}</div>` + [...child.children].map(item).join('') : item(child)).join('');
+  document.body.appendChild(pop);
+  const box = select.menuButton.getBoundingClientRect(), below = innerHeight - box.bottom - 6, above = box.top - 6;
+  const down = below >= Math.min(240, pop.scrollHeight) || below >= above;
+  pop.style.left = Math.max(4, Math.min(box.left, innerWidth - Math.max(box.width, 170) - 4)) + 'px';
+  pop.style.width = Math.max(box.width, 170) + 'px';
+  pop.style.maxHeight = Math.max(80, down ? below : above) + 'px';
+  if (down) pop.style.top = box.bottom + 2 + 'px'; else pop.style.bottom = innerHeight - box.top + 2 + 'px';
+  const chosen = pop.querySelector('.sel');
+  if (chosen) chosen.scrollIntoView({block: 'nearest'});
+  pop.addEventListener('click', event => {
+    const row = event.target.closest('.menu-item');
+    if (!row) return;
+    closeMenu();
+    if (select.value !== row.dataset.value) { select.value = row.dataset.value; syncMenus(); select.dispatchEvent(new Event('change')); }
+  });
+  openMenu = {select, pop};
+}
+document.addEventListener('mousedown', event => {
+  if (openMenu && !openMenu.pop.contains(event.target) && event.target !== openMenu.select.menuButton) closeMenu();
+}, true);
+addEventListener('blur', closeMenu);
+setInterval(syncMenus, 250);  // values set from code (category reveal, server options)
+enhance($('category'));
+
 $('full').href = API;
 $('search').value = remembered.query || '';
 state.firstScroll = remembered.scroll;
@@ -338,6 +403,7 @@ $('results').addEventListener('scroll', () => { clearTimeout(state.saving); stat
 document.addEventListener('keydown', event => {
   const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
   if (event.key === '/' && !typing) { event.preventDefault(); $('search').focus(); $('search').select(); }
+  else if (event.key === 'Escape' && openMenu) closeMenu();
   else if (event.key === 'Escape') { if (typing) document.activeElement.blur(); if (state.server && state.server.placing) post('cancel', {}); }
 });
 installDrop();

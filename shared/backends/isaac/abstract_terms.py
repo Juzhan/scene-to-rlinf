@@ -127,6 +127,9 @@ def attach_abstract(output, settings, *, visualize=True):
     from shared.assembly.targets import visualization
     shown, areas = set(visualization(settings)) if visualize else set(), reset_areas(settings)
     held = commanded(settings)
+    moving = [node.name for node in abstract_entities(settings).values() if node.motion is not None]
+    if moving:
+        raise NotImplementedError(f'Abstract entities {moving}: scene motion is only bound on isaaclab3')
     for node in abstract_entities(settings).values():
         if node.name not in held and node.name not in shown:
             continue

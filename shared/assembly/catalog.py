@@ -149,7 +149,8 @@ _PARAMETER_LABELS = {
                "depth_clipping": "超出远裁剪面的深度"},
     "box": {"size": "边长 xyz（m）", "mass": "质量（kg，空为静态）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
     "ball": {"radius": "半径（m）", "mass": "质量（kg）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
-    "usd_object": {"usd_path": "USD 文件", "mass": "质量（kg，空则取 USD）", "scale": "缩放", "fix_root_link": "固定根部"},
+    "usd_object": {"usd_path": "USD 文件", "mass": "质量（kg，空则取 USD）", "scale": "缩放", "fix_root_link": "固定根部",
+                   "springs": "关节弹簧（关节名 → {stiffness, damping, target}，SI 单位）"},
 }
 # Starting values the editor fills in for required parameters when an asset is added from the shelf.
 _PARAMETER_EXAMPLES = {

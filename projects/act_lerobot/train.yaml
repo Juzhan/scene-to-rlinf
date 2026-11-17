@@ -1,0 +1,36 @@
+# 通用 RLinf 监督训练设置来自 configs/supervised.yaml；这里只写 ACT 与数据集相关的参数。
+defaults:
+  - supervised
+  - _self_
+runner:
+  task_type: sft
+  max_epochs: -1
+  max_steps: 20000          # 优化步数（每步一个 global batch）
+  val_check_interval: 500   # 每隔多少步在验证回合上算一次损失，并保存 act_last.pt / act_best.pt
+  save_interval: 5000       # RLinf 完整检查点
+experiment:
+  output: runs/first_training   # 相对本项目；每次训练必须是新目录
+  initial_weights: null         # 微调起点：LeRobot pretrained_model 目录或本项目的 act_*.pt（仅权重）
+data:
+  # LeRobot 数据集目录（含 meta/info.json）。换成自己采集的数据集。
+  train_data_paths: /home/jz/Desktop/recordings/20261008_141506_ebbba4/dataset_stacking_corrected
+  validation_episodes: 1    # 最后 N 个回合做验证；也可写回合编号列表
+  num_workers: 8            # 视频解码进程
+  video_backend: pyav
+actor:
+  micro_batch_size: 8
+  global_batch_size: 8
+  eval_batch_size: 8
+  model:
+    precision: fp32
+    cameras: null           # null = 数据集里全部相机；或写 [observation.images.front_left, ...]
+    chunk_size: 20          # 一次预测的动作步数（10 fps 下 2 秒）
+    n_action_steps: 10      # 部署时每次推理执行的步数
+    vision_backbone: resnet18
+    dim_model: 512
+    use_vae: true
+    kl_weight: 10.0
+  optim:
+    lr: 0.00001
+    weight_decay: 0.0001
+    clip_grad: 10.0

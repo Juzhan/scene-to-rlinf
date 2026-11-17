@@ -7,6 +7,9 @@ from .scene import validate
 # project assets reach mjlab through BACKEND_FACTORIES['mjlab'].
 PROJECT_TERMS = False
 UNKEYED_FACTORIES = False
+
+# Run-time choices the editor offers (see isaaclab3): mjlab runs MuJoCo-Warp with its own viewer only.
+SIMULATION_CHOICES = {}
 validate_scene = validate
 
 

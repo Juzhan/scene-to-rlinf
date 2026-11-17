@@ -8,11 +8,15 @@ from importlib import import_module
 
 class SupervisedWorker(FSDPSftWorker):
     def build_dataloader(self, data_paths, eval_dataset=False):
-        datasets, _ = import_module(self.cfg.sft_project.package + '.data').load_dataset(data_paths)
+        from .sft_project import load_project_dataset
+        datasets, _ = load_project_dataset(import_module(self.cfg.sft_project.package + '.data'), data_paths, self.cfg)
+        # Samples decoded from video (LeRobot datasets) need loader processes; arrays in memory do not.
+        workers = int(self.cfg.data.get('num_workers', 0))
         loader = torch.utils.data.DataLoader(
             datasets['validation' if eval_dataset else 'train'],
             batch_size=self.eval_batch_size if eval_dataset else self.micro_batch_size,
-            shuffle=not eval_dataset, generator=torch.Generator().manual_seed(self.cfg.actor.seed))
+            shuffle=not eval_dataset, generator=torch.Generator().manual_seed(self.cfg.actor.seed),
+            num_workers=workers, persistent_workers=workers > 0, pin_memory=workers > 0)
         return loader, None
 
     def model_provider_func(self):

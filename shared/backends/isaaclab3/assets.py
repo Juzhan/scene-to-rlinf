@@ -86,24 +86,49 @@ def franka_panda(fix_root_link=True, tracking: FrankaTracking = 'native'):
     return config
 
 
-def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False):
+def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False, springs: dict | None = None):
     """Imported USD object, simulated as its UsdPhysics schemas say (``usd_body_structure``).
 
     One rigid body is a dynamic rigid object; jointed bodies are an articulation without actuators,
     whose joints move only under contact and the drives, limits and friction authored in the USD.
+    ``springs`` (joint name -> ``{stiffness, damping, target}``) sets those joints' USD drive springs in a
+    cached layer over the file (``joint_spring_layer``), e.g. for buttons: SimReady authors 0.1-10 N/m on
+    about 1 mm of travel, far below the weight of the cap, so its buttons rest pressed in. Newton's
+    MuJoCo-Warp solver integrates a stiff spring on a light part explicitly: keep stiffness / moving mass
+    below about 1 / substep^2 (4e4 at 5 ms), else the joint diverges.
     ``fix_root_link`` fixes the object in place: the articulation root, or the rigid body made
     kinematic. A USD without rigid bodies stays static geometry (terrain tiles); with a ``mass`` its
     root becomes the rigid body. ``mass`` replaces the authored mass of a single body and is required
     when the USD authors none."""
     import isaaclab.sim as sim
     from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
-    from shared.asset_formats import (recorded_joint_order, usd_authored_mass, usd_body_structure,
-                                      usd_joint_order)
+    from shared.asset_formats import (joint_spring_layer, recorded_joint_order, usd_authored_mass,
+                                      usd_body_structure, usd_joint_order, usd_root_offset)
 
     path = workspace_file(usd_path)
     structure = usd_body_structure(path)
+    offset = usd_root_offset(path) if structure != 'static' else None
+    if offset is not None:
+        # Isaac Lab writes the scene pose to the root body: the asset would start displaced by this offset.
+        raise ValueError(f'{usd_path}: its root body sits at {[round(v, 3) for v in offset]} m from the asset origin; '
+                         'Isaac Lab would place that body, not the asset, at the scene pose. Wrap it with '
+                         '`run.py asset simready` (which moves the body frame onto the asset origin)')
     scale = tuple(scale) if isinstance(scale, (list, tuple)) else (float(scale),) * 3
-    spawn = sim.UsdFileCfg(usd_path=str(path), scale=scale)
+    # Isaac Lab replaces the top prim's scale with the spawn scale; keep the one the file authors
+    # (e.g. the 0.01 unit conversion of a centimetre environment wrapper).
+    from pxr import Sdf
+    layer = Sdf.Layer.FindOrOpen(str(path))
+    top = layer.GetPrimAtPath(layer.defaultPrim) if layer and layer.defaultPrim else None
+    if top:
+        order = top.attributes.get('xformOpOrder')
+        for name in (order.default or []) if order else []:
+            if name.startswith('xformOp:scale') and (op := top.attributes.get(name)) and op.default is not None:
+                authored = op.default
+                authored = tuple(authored) if hasattr(authored, '__len__') else (authored,) * 3
+                scale = tuple(a * float(b) for a, b in zip(scale, authored))
+    if springs and structure != 'articulation':
+        raise ValueError(f'{usd_path}: springs act on movable joints; this object has none')
+    spawn = sim.UsdFileCfg(usd_path=str(joint_spring_layer(path, springs) if springs else path), scale=scale)
     if structure == 'articulation':
         if mass is not None:
             raise ValueError(f'{usd_path}: an articulated object takes its link masses from the USD')

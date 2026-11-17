@@ -550,3 +550,65 @@ def test_environment_layer_substitutes_a_missing_vendored_file(tmp_path):
     # without the substitute, the same missing file becomes an empty stub again
     report = environment_layer(tmp_path / 'source/scene.usda', tmp_path / 'usd2/scene.usda')
     assert report['stubbed_missing'] and not report['substituted_missing']
+
+
+def test_joint_springs_are_written_as_drives_with_a_target_inside_the_limits(tmp_path, monkeypatch):
+    import math
+    from pxr import Usd, UsdPhysics
+    import shared.asset_formats as formats
+    monkeypatch.setattr(formats, 'ROOT', tmp_path)
+    source = write_usd(tmp_path / 'robot.usda')  # hinge limited to +-1 rad
+    layer = formats.joint_spring_layer(source, {'hinge': {'stiffness': 2., 'damping': .1}})
+    assert layer.parent == tmp_path / '.cache/usd_springs'
+    stage = Usd.Stage.Open(str(layer))
+    drive = UsdPhysics.DriveAPI(stage.GetPrimAtPath('/robot/hinge'), 'angular')
+    # UsdPhysics angular drives are per degree; Newton replaces a target outside the limits by their middle.
+    assert drive.GetStiffnessAttr().Get() == pytest.approx(2 * math.pi / 180)
+    assert drive.GetDampingAttr().Get() == pytest.approx(.1 * math.pi / 180)
+    assert drive.GetTargetPositionAttr().Get() == 0
+    assert formats.joint_spring_layer(source, {'hinge': {'stiffness': 2., 'damping': .1}}) == layer
+    with pytest.raises(ValueError, match='outside the joint limits'):
+        formats.joint_spring_layer(source, {'hinge': {'stiffness': 2., 'target': 1.5}})
+    with pytest.raises(ValueError, match="unknown joint 'elbow'"):
+        formats.joint_spring_layer(source, {'elbow': {'stiffness': 2.}})
+    with pytest.raises(ValueError, match='non-negative'):
+        formats.joint_spring_layer(source, {'hinge': {'stiffness': -1.}})
+
+
+def test_simready_layer_puts_the_root_body_on_the_asset_origin(tmp_path):
+    """Isaac Lab places the root body at the scene pose: a body 2 m up would start 2 m under the ground."""
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+    from shared.asset_formats import simready_layer, usd_bounds, usd_root_offset
+    source = tmp_path / 'ladder.usda'
+    stage = Usd.Stage.CreateNew(str(source))
+    UsdGeom.SetStageMetersPerUnit(stage, 1.)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, '/ladder').GetPrim())
+    for name, translate in (('frame', (0, .2, 2.)), ('wheel', (.3, .5, .05))):
+        body = UsdGeom.Xform.Define(stage, f'/ladder/{name}')
+        body.AddTranslateOp().Set(Gf.Vec3d(*translate))
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        cube = UsdGeom.Cube.Define(stage, f'/ladder/{name}/collider')
+        cube.CreateSizeAttr(.1)
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    UsdPhysics.ArticulationRootAPI.Apply(stage.GetPrimAtPath('/ladder/frame'))
+    joint = UsdPhysics.RevoluteJoint.Define(stage, '/ladder/axle')
+    joint.CreateBody0Rel().SetTargets(['/ladder/frame'])
+    joint.CreateBody1Rel().SetTargets(['/ladder/wheel'])
+    joint.CreateLocalPos0Attr(Gf.Vec3f(.3, .3, -1.95))
+    joint.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
+    joint.CreateLowerLimitAttr(-10)
+    joint.CreateUpperLimitAttr(10)
+    stage.Save()
+    assert usd_root_offset(source) == pytest.approx([0, .2, 2.])
+    report = simready_layer(source, tmp_path / 'wrapped.usda')
+    assert report['rerooted']['offset'] == pytest.approx([0, .2, 2.])
+    wrapped = tmp_path / 'wrapped.usda'
+    assert usd_root_offset(wrapped) is None
+    assert [v for corner in usd_bounds(wrapped) for v in corner] == pytest.approx([v for c in usd_bounds(source) for v in c])
+    out, cache = Usd.Stage.Open(str(wrapped)), UsdGeom.XformCache()
+    # The joint frame keeps its world pose: (0.3, 0.5, 0.05), the wheel's centre.
+    axle = UsdPhysics.Joint(out.GetPrimAtPath('/ladder/axle'))
+    world = Gf.Matrix4d().SetTranslate(Gf.Vec3d(axle.GetLocalPos0Attr().Get())) * \
+        cache.GetLocalToWorldTransform(out.GetPrimAtPath('/ladder/frame'))
+    assert list(world.ExtractTranslation()) == pytest.approx([.3, .5, .05], abs=1e-6)

@@ -81,12 +81,13 @@ def test_abstract_mount_follows_an_entity_root_and_cannot_be_randomized(tmp_path
         world(area(reset={"region": "world/area"}), tmp_path=tmp_path)
 
 
-def test_scene_has_no_motion_field_the_task_moves_entities(tmp_path):
+def test_scene_motion_is_a_declared_mapping_not_task_code(tmp_path):
     robot = {"name": "robot", "factory": "dex_cube"}
     ball = {"name": "ball", "kind": "abstract", "shape": "point"}
     world(robot, ball, tmp_path=tmp_path)
     with pytest.raises(ValueError, match="motion"):
         world(robot, {**ball, "motion": ".task:move_ball"}, tmp_path=tmp_path)
+    world(robot, {**ball, "motion": {"type": "path", "points": [[0, 0, 0], [1, 0, 0]], "speed": .5}}, tmp_path=tmp_path)
 
 
 def test_unmounted_non_region_entities_are_commanded_with_linear_velocity():

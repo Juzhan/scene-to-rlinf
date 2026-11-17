@@ -183,6 +183,11 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
         if func is not None and (func if isinstance(func, str) else f'{func.__module__}:{func.__name__}') == NATIVE:
             spawn.func = SPAWN_FROM_USD
         compensate_gravity(spawn, path)
+        if not node.visible:
+            if spawn is None or not hasattr(spawn, 'visible'):
+                raise ValueError(f'Entity {path}: visible: false needs an asset Isaac Lab spawns from a config')
+            # Invisible in USD: RTX and Newton's renderers skip it; colliders stay (Newton imports them).
+            spawn.visible = False
         if node.kinematic:
             from .kinematic import make_kinematic
             if metadata.scopes[path] != 'environment':

@@ -74,6 +74,10 @@ class Entity:
     pose_authored: bool = True  # Loader distinguishes omitted poses from an explicit identity pose.
     # Collides but ignores forces and gravity; it stays where reset placed it unless the Task moves it (``set``).
     kinematic: bool = False
+    # How a kinematic or abstract entity moves by itself (``motion.py``); the Task's ``set`` wins.
+    motion: dict | None = None
+    # False: absent from rendered images (cameras, previews, videos); it still collides.
+    visible: bool = True
     kind: ClassVar[str] = "entity"
 
 
@@ -284,6 +288,12 @@ class WorldSpec:
             if node.kinematic is not False and (node.kinematic is not True or not node.factory
                                                 or isinstance(node, Sensor) or node.scope == "global"):
                 raise ValueError(f"Entity {path}: kinematic is true or false, on a per-environment physical asset")
+            if node.visible is not True and (node.visible is not False or not node.factory or isinstance(node, Sensor)):
+                raise ValueError(f"Entity {path}: visible is true or false, on a physical asset")
+            if node.motion is not None:
+                if node.kinematic is not True:
+                    raise ValueError(f"Entity {path}: motion moves kinematic entities; declare kinematic: true")
+                self._check_motion(path, node, result)
             if node.frames and (not node.factory or isinstance(node, Sensor)):
                 raise ValueError(f"Body frames require a concrete non-sensor asset: {path}")
             frame_names = set()
@@ -345,6 +355,18 @@ class WorldSpec:
                 current = incoming[current]
         return result
 
+    def _check_motion(self, path, node, result):
+        from .motion import check
+        motion = check(path, node.motion, reset_region=node.reset.region if node.reset else None,
+                       has_reset=node.reset is not None)
+        if motion['type'] == 'wander':
+            area = result.get(self.resolve_mount(path, Mount(motion['region'])).entity, (None,))[0]
+            if not isinstance(area, Abstract) or area.shape not in ("rectangle", "box"):
+                raise ValueError(f"Entity {path}: motion region must be an abstract rectangle or box: {motion['region']}")
+            if area.mount is not None or area.reset is not None or area.motion is not None:
+                raise ValueError(f"Entity {path}: motion region {motion['region']} must be static "
+                                 "(not mounted, randomized or moving itself)")
+
     def _check_reset_region(self, path, node, result):
         if node.reset is None or node.reset.region is None:
             return
@@ -379,6 +401,10 @@ class WorldSpec:
             if node.reset.joint_positions:
                 raise ValueError(f"Abstract entity {path} has no joints to reset")
             self._check_reset_region(path, node, result)
+        if node.motion is not None:
+            if node.mount is not None:
+                raise ValueError(f"Abstract entity {path}: a mounted abstract entity follows its entity; remove motion")
+            self._check_motion(path, node, result)
 
     def ordered_connections(self):
         index = self.index()

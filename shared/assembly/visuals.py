@@ -10,6 +10,16 @@ ROOT = Path(__file__).resolve().parents[2]
 SHARED_CACHE = ROOT / '.cache' / 'assembly_visuals'
 
 
+# Set by the long-lived exporter (export_scene_visuals.py --serve): receives {entity path: fraction}.
+PROGRESS = None
+
+
+def report_progress(paths, fraction):
+    """How far the mesh of each entity path has come (0-1); a no-op outside the editor's exporter."""
+    if PROGRESS is not None and paths:
+        PROGRESS({path: fraction for path in paths})
+
+
 class SceneChanged(ValueError):
     """The scene file changed while its geometry was exported; export the new revision instead."""
 
@@ -78,13 +88,14 @@ def exporter_python(backend):
     return ROOT / (getattr(package, 'INTERPRETER', None) or '.venv/bin/python')
 
 
-def geometry_keys(scene, document=None):
+def geometry_keys(scene, document=None, *, content=False):
     """Per-entity cache keys; equal assets share geometry across projects and the gallery.
 
     Pose edits reuse root-local geometry. A key changes with the exporting backend's
     factory, its parameters and initial state, the files those parameters name, the
     backend's asset code (its ``visuals.SOURCES``), and, for project-defined factories,
-    the project's code and assets.
+    the project's code and assets. ``content=True`` leaves the code out: equal for the same asset
+    before and after a code change, it finds the last mesh to show until the export catches up.
     """
     from .assets import backend_module, factories_for
     from .editing import SceneDocument, _plain
@@ -101,9 +112,9 @@ def geometry_keys(scene, document=None):
     for path, node in document.entities.items():
         if not node.get('factory'):
             continue
-        dependencies = dict(common)
+        dependencies = {} if content else dict(common)
         # A project assets.py may add factories or override a shared name.
-        if node['factory'] not in native or (directory / 'assets.py').is_file():
+        if not content and (node['factory'] not in native or (directory / 'assets.py').is_file()):
             if project is None:
                 project = {str(p): _digest(p) for p in sorted(directory.rglob('*'))
                            if p.is_file() and (p.suffix == '.py' and p.name not in NON_GEOMETRY or p.suffix in ASSET_SUFFIXES)
@@ -139,12 +150,33 @@ def load_visuals(scene, document=None):
         return {}
 
 
+def previous_visuals(scene, document=None):
+    """Last exported mesh of each entity's asset whatever code exported it (``geometry_keys(content=True)``),
+    to show, marked stale, while a code change re-exports it."""
+    try:
+        result = {}
+        for name, key in geometry_keys(scene, document, content=True).items():
+            index = SHARED_CACHE / 'content' / (key + '.json')
+            if index.is_file():
+                item = json.loads(index.read_text())
+                if item.get('path') and Path(item['path']).is_file():
+                    result[name] = item
+        return result
+    except (ValueError, KeyError, OSError):
+        return {}
+
+
 def _ensure_lightweight(path):
-    from .mesh_preview import merge_partials, pending
-    if not pending(json.loads(path.read_text())):
+    from .mesh_preview import MAX_PARTS, merge_partials, part_count, pending
+    data = json.loads(path.read_text())
+    if not pending(data):
         return
+    report_progress([name for name, record in data['entities'].items()
+                     if any(record is item for item, _ in pending(data))], .75)
     blender = shutil.which(os.environ.get('BLENDER', 'blender'))
-    if not blender or os.environ.get('RLINF_PREVIEW_SIMPLIFIER') == 'numpy':
+    # Whole scenes (thousands of parts) are merged per body first, which only the numpy path does.
+    huge = any(part_count(source) > MAX_PARTS for _, source in pending(data))
+    if not blender or huge or os.environ.get('RLINF_PREVIEW_SIMPLIFIER') == 'numpy':
         # The web editor and headless machines need no Blender installation.
         from .mesh_preview import simplify_manifest
         simplify_manifest(path)
@@ -202,6 +234,8 @@ def ensure_visuals(scene, *, force=False, exporter=None):
                 raise RuntimeError(f'Native geometry export failed; see {logfile}\n{logfile.read_text()[-2500:]}')
     _ensure_lightweight(path)
     SHARED_CACHE.mkdir(parents=True, exist_ok=True)
+    (SHARED_CACHE / 'content').mkdir(exist_ok=True)
+    contents = {keys[name]: key for name, key in geometry_keys(scene, content=True).items() if name in keys}
     for record in json.loads(path.read_text())['entities'].values():
         record = dict(record)
         if record.get('path'):
@@ -214,6 +248,11 @@ def ensure_visuals(scene, *, force=False, exporter=None):
         temporary = target.with_suffix(f'.{os.getpid()}.tmp')
         temporary.write_text(json.dumps(record))
         temporary.replace(target)
+        if record['key'] in contents and record.get('path'):
+            index = SHARED_CACHE / 'content' / (contents[record['key']] + '.json')
+            temporary = index.with_suffix(f'.{os.getpid()}.tmp')
+            temporary.write_text(json.dumps(record))
+            temporary.replace(index)
     return {'cached': cached, 'entities': len(keys), 'manifest': str(path), 'quality': 'lightweight'}
 
 
@@ -253,8 +292,8 @@ class ExportWorker:
             self.replies.close()
         self.process = self.replies = None
 
-    def request(self, scene, *, force=False, timeout=600):
-        """Lightweight visuals of ``scene`` (``ensure_visuals``)."""
+    def request(self, scene, *, force=False, timeout=600, progress=None):
+        """Lightweight visuals of ``scene`` (``ensure_visuals``); ``progress({path: fraction})`` on the way."""
         import select
         message = {'scene': str(Path(scene).resolve()), 'force': force}
         for _ in range(2):
@@ -267,12 +306,17 @@ class ExportWorker:
             except BrokenPipeError:  # exited while idle; start a new one
                 self.close()
                 continue
-            if not select.select([self.replies], [], [], timeout)[0]:
-                self.process.kill()
-                self.close()
-                raise RuntimeError(f'Native geometry export timed out after {timeout}s; see {self.log}')
-            line = self.replies.readline()
-            reply = json.loads(line) if line else {'restart': 'exited'}
+            while True:
+                if not select.select([self.replies], [], [], timeout)[0]:
+                    self.process.kill()
+                    self.close()
+                    raise RuntimeError(f'Native geometry export timed out after {timeout}s; see {self.log}')
+                line = self.replies.readline()
+                reply = json.loads(line) if line else {'restart': 'exited'}
+                if 'progress' not in reply:
+                    break
+                if progress is not None:
+                    progress(reply['progress'])
             if 'restart' in reply:
                 self.close()
                 continue

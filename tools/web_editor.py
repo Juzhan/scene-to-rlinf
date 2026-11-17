@@ -17,6 +17,7 @@ import copy
 import functools
 import gzip
 import hashlib
+import warnings
 import html
 import io
 import json
@@ -25,6 +26,7 @@ from pathlib import Path
 import posixpath
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -37,15 +39,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from shared import simready  # noqa: E402
+from shared import environments, simready  # noqa: E402
 from shared.assembly import frames as F  # noqa: E402
 from shared.assembly.editing import SceneDocument, apply_edits, editing_copy  # noqa: E402
 from shared.assembly.mesh_preview import triangles  # noqa: E402
 from shared.assembly.visuals import (ExportWorker, SceneChanged, cache_path, ensure_visuals, exporter_available,  # noqa: E402
-                                    exporter_python, geometry_backend, geometry_keys, load_visuals)
+                                    exporter_python, geometry_backend, geometry_keys, load_visuals,
+                                     previous_visuals)
 
 CATEGORY_LABELS = {'robot': '机器人', 'object': '物体 / 设备', 'terrain': '地面 / 地形',
-                   'sensor': '传感器', 'light': '照明', 'group': '组合', 'abstract': '抽象体'}
+                   'sensor': '传感器', 'light': '照明', 'group': '组合', 'abstract': '抽象体', 'environment': '场景环境'}
 CONTROL_TYPES = {'joint_position': '关节位置 (rad / m)', 'joint_velocity': '关节速度 (rad/s / m/s)',
                  'joint_effort': '关节力矩 / 力 (N·m / N)'}
 ABSTRACT_SHAPES = {'point': '点', 'direction': '方向', 'rectangle': '矩形', 'box': '长方体'}
@@ -82,6 +85,13 @@ GIZMO_SCALE = .35
 # so dragging across them still orbits the camera.
 DRAGGABLE = ('object', 'abstract')
 SHELF_PAGE = Path(__file__).with_name('asset_shelf.html')  # the add tab's asset shelf (an iframe)
+OUTLINER_PAGE = Path(__file__).with_name('scene_outliner.html')  # the scene tab's outliner (an iframe)
+# Physics of an object row (outliner toggle and inspector): label, outliner hint.
+PHYSICS = {'dynamic': ('受力运动', '动态：受重力和接触力'),
+           'kinematic': ('不受力', '运动学：位置由场景运动或 Task 给出，能推动别的物体'),
+           'fixed': ('固定', '根部固定在原处（fix_root_link）'),
+           'static': ('静态', '静态几何：没有刚体；填写质量后才受力运动')}
+MOTIONS = {None: '不自行运动', 'wander': '区域内游走', 'path': '沿路径'}
 SKETCH_BACKGROUND = (243, 245, 248)  # canvas of the editor's flat-shaded asset sketches
 
 
@@ -163,6 +173,20 @@ OBSERVATION_GROUP_CSS = ('._3o7djo0:has({checked}){{border-color:#a5d8ff!importa
                          '._3o7djo0:has({checked}) > ._3o7djo1{{background:#e7f5ff!important;color:#1864ab!important;'
                          'box-shadow:inset 3px 0 0 #339af0}}'
                          '._3o7djo0:has({checked}) > ._3o7djo1:hover{{background:#d0ebff!important}}')
+# The view command under the save button. A srcdoc page so its copy button runs (viser HTML runs no
+# scripts); the clipboard API needs a secure origin, so a remote http editor falls back to execCommand.
+COMMAND_PAGE = '''<!doctype html><html><head><meta charset="utf-8"><style>
+body{margin:0;font:12px/1.4 system-ui,sans-serif;background:transparent;overflow:hidden}
+.c{display:flex;align-items:center;gap:6px;height:30px;padding:0 4px 0 9px;border:1px solid #e3e6ea;border-radius:7px;background:#f6f7f9}
+code{flex:1;min-width:0;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#1f2328;white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis;user-select:all}
+button{flex:none;height:22px;padding:0 8px;border:1px solid #cfd4da;border-radius:5px;background:#fff;color:#495057;font:inherit;cursor:pointer}
+button:hover{background:#eef3fd}</style></head><body><div class="c" title="在终端运行：用仿真器打开已保存的场景（未保存的修改不包含在内）">
+<code id="c" title="__COMMAND__">__COMMAND__</code><button id="b">复制</button></div><script>
+const b=document.getElementById('b'),text=document.getElementById('c').textContent;
+b.onclick=async()=>{try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');
+t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}
+b.textContent='已复制';setTimeout(()=>b.textContent='复制',1200)};</script></body></html>'''
 ROLE_PURPOSE = {'planner': '生成目标', 'executor': '输出控制动作'}
 # A button group used as a two-way switch: one button per module, its role and state written
 # under the name, the trained one filled. Viser gives the group no id; its (hidden) row label
@@ -216,6 +240,16 @@ def simready_preview_url(entry):
 def simready_thumbnail(publisher, name):
     """Asset-shelf card image of a SimReady wrapper: the official white-background preview."""
     return THUMBNAILS / f'simready-light_{publisher}_{name}.png'
+
+
+def environment_thumbnail(key):
+    """Asset-shelf card image of a catalog environment (shared.environments): its publisher's render."""
+    return THUMBNAILS / f'environment_{key.replace("/", "_")}.png'
+
+
+def _spawn_text(spawn, shown=3):
+    places = '；'.join(f"({', '.join(f'{value:g}' for value in item['position'])})" for item in spawn[:shown])
+    return f'可放机器人的空地（场景坐标，地面高度）：{places}' + (f' 等 {len(spawn)} 处' if len(spawn) > shown else '')
 
 
 def _resolve(owner, reference):
@@ -390,6 +424,25 @@ def load_mesh(filename):
     return _MESHES[signature]
 
 
+def usd_placeholder(item):
+    """``(low, high)`` root-frame corners of an imported USD entity (``usd_path`` and ``scale``), or None."""
+    from shared.asset_formats import usd_bounds
+    from shared.assembly.assets import workspace_file
+    parameters = item.get('parameters') or {}
+    if not isinstance(parameters.get('usd_path'), str):
+        return None
+    try:
+        bounds = usd_bounds(workspace_file(parameters['usd_path']))
+    except Exception:  # noqa: BLE001 - a missing or unreadable file keeps the generic placeholder
+        return None
+    if bounds is None:
+        return None
+    scale = parameters.get('scale', 1.)
+    scale = np.asarray(scale if isinstance(scale, (list, tuple)) else [scale] * 3, float)
+    low, high = np.asarray(bounds[0]) * scale, np.asarray(bounds[1]) * scale
+    return np.minimum(low, high), np.maximum(low, high)
+
+
 def thumbnail_key(factory, parameters):
     """Default-parameter assets share the factory name; anything else is keyed by its parameters."""
     if not parameters:
@@ -533,6 +586,11 @@ class Editor:
         self.open_section = None
         self.hidden = set()
         self.inspector_items, self.tree_rows = [], {}
+        self.outliner_page, self.outliner_revision, self.tree_changed = False, 0, set()
+        self.motion_preview, self.path_marker, self.motion_drafts = None, None, {}
+        # Entities waiting for their native mesh: {path: {'target', 'shown', 'start', 'handle'}}; the placeholder
+        # box fills up from the bottom as the exporter reports progress (_animate_loading).
+        self.loading = {}
         self.shown = (None, None)
         self.camera_image, self.render_wanted = None, threading.Event()
         self.undo, self.redo, self.undo_tag, self.history_scene = [], [], None, None
@@ -545,8 +603,10 @@ class Editor:
         threading.Thread(target=self._watch_changes, daemon=True).start()
         threading.Thread(target=self._camera_renderer, daemon=True).start()
         threading.Thread(target=self._drag_worker, daemon=True).start()
+        threading.Thread(target=self._animate_loading, daemon=True).start()
         self._start_library(host, library_port or self.server.get_port() + 1)
         threading.Thread(target=self._load_simready, daemon=True).start()
+        threading.Thread(target=self._load_environments, args=(True,), daemon=True).start()
 
     def guarded(self, function):
         def wrapper(*args, **kwargs):
@@ -583,13 +643,19 @@ class Editor:
                 self.manifest = json.loads(cache_path(self.scene).read_text())['entities']
             except (OSError, ValueError, KeyError):
                 self.manifest = {}
+            # The same asset exported by other code (e.g. after a backend change), anywhere in the workspace.
+            self.previous = previous_visuals(self.scene)
             self.preview_restore = None  # Previews refer to the nodes being replaced.
             self.pending = {'actions': {}, 'resets': {}, 'meshes': {}, 'shapes': {}, 'kinematic': {}, 'shown': None,
-                            'components': {}}
+                            'components': {}, 'motion': {}, 'visible': {}, 'simulation': {}}
+            self.motion_drafts = {}  # motions being edited, not yet complete (e.g. a path of one point)
+            self._show_command()
+            self._show_simulation()
             self.labels, self.parameters = {}, {}
             self._build_tree()
             if state:
                 self._overlay(state)
+                self._show_simulation()  # an undone engine or renderer choice
             self._emit()
             self._init_observations()
             if state:
@@ -633,10 +699,10 @@ class Editor:
         preview = item.get('preview') or {}
         if str(preview.get('path') or '').endswith('.mesh.json.gz') and preview.get('preview_version'):
             return preview, False
-        stale = self.manifest.get(item['path']) or {}
-        path = stale.get('path') or ''
-        if path.endswith('.mesh.json.gz') and stale.get('preview_version') and Path(path).is_file():
-            return stale, True
+        for stale in (self.manifest.get(item['path']) or {}, self.previous.get(item['path']) or {}):
+            path = stale.get('path') or ''
+            if path.endswith('.mesh.json.gz') and stale.get('preview_version') and Path(path).is_file():
+                return stale, True
         return None, False
 
     def initial_display(self, path):
@@ -767,6 +833,9 @@ class Editor:
                 color=tuple(round(255 * c) for c in color) if color else COLORS['proxy'])
         elif factory in ('terrain', 'ground_plane'):
             node.shape = {'type': 'grid', 'size': 4.0 if factory == 'terrain' else 2.0}
+        elif usd_placeholder(item) is not None:  # an imported USD: a box of its authored extent
+            low, high = usd_placeholder(item)
+            box(tuple(np.maximum(high - low, .005)), tuple((low + high) / 2))
         elif factory == 'camera':
             fov, aspect = camera_intrinsics(*self.camera_optics(item))
             node.shape = {'type': 'frustum', 'fov': fov, 'aspect': aspect}
@@ -871,15 +940,20 @@ class Editor:
 
     # ----------------------------------------------------------------- drawing
     def _emit(self):
+        """Draw the node tree in the view, reusing what an earlier load drew.
+
+        Names follow node keys (an entity path, its links and mesh parts), so a reload after a save, undo
+        or export updates poses in place and redraws only shapes that changed; clearing the view and
+        sending every mesh again made the scene flash."""
         scene = self.server.scene
-        scene.reset()
-        scene.add_grid('/floor_grid', width=10, height=10, cell_size=.5, section_size=1.0,
-                       cell_color=(220, 220, 220), section_color=(170, 170, 170))
+        if not hasattr(self, 'emitted'):
+            scene.reset()
+            scene.add_grid('/floor_grid', width=10, height=10, cell_size=.5, section_size=1.0,
+                           cell_color=(220, 220, 220), section_color=(170, 170, 170))
+            self.gizmo = scene.add_transform_controls('/gizmo', scale=GIZMO_SCALE, depth_test=False, visible=False)
+            self.gizmo.on_update(self._gizmo_moved)
+            self.emitted = {}
         self.handles = {}
-        # Fresh names per load: the client keeps per-name state across a reset,
-        # so reusing '/scene/n12' under a new parent would draw stale transforms.
-        self.generation = getattr(self, 'generation', 0) + 1
-        self.root = f'/scene{self.generation}'
         order, seen = [], set()
 
         def visit(node):
@@ -891,16 +965,56 @@ class Editor:
             order.append(node)
         for node in self.nodes:
             visit(node)
-        for index, node in enumerate(order):
-            node.name = (node.parent.name if node.parent is not None else self.root) + f'/n{index}'
-            self.handles[id(node)] = scene.add_frame(node.name, show_axes=False, position=_xyz(node.local),
-                                                     wxyz=_wxyz(node.local))
-            self._draw_shape(node)
-        self.gizmo = scene.add_transform_controls('/gizmo', scale=GIZMO_SCALE, depth_test=False, visible=False)
-        self.gizmo.on_update(self._gizmo_moved)
         self.hidden = {owner for owner in self.hidden if self._node_of(owner) is not None}
-        for owner in self.hidden:
-            self.handles[id(self._node_of(owner))].visible = False
+        hidden = {id(self._node_of(owner)) for owner in self.hidden}
+        previous, self.emitted = self.emitted, {}
+        for node in order:
+            token = re.sub(r'[^A-Za-z0-9_]', '_', node.key)[-40:] + '_' + hashlib.sha1(node.key.encode()).hexdigest()[:6]
+            node.name = (node.parent.name if node.parent is not None else '/scene') + '/' + token
+            old = previous.pop(node.name, None)
+            if old is not None:
+                frame = old['frame']
+                frame.position, frame.wxyz = _xyz(node.local), _wxyz(node.local)
+            else:
+                frame = scene.add_frame(node.name, show_axes=False, position=_xyz(node.local), wxyz=_wxyz(node.local))
+            if frame.visible == (id(node) in hidden):
+                frame.visible = id(node) not in hidden
+            self.handles[id(node)] = frame
+            signature = self._shape_signature(node)
+            self.emitted[node.name] = {'frame': frame, 'shape': None, 'signature': signature}
+            if old is not None and old['shape'] is not None and old['signature'] == signature:
+                node.handle = old['shape']
+                self.emitted[node.name]['shape'] = node.handle
+                if old.get('highlighted'):  # drop the earlier selection's colour; select() sets it again
+                    if self._solid(node):
+                        node.handle.color = node.shape.get('color')
+                    else:
+                        self._draw_shape(node)
+            else:
+                if old is not None and old['shape'] is not None:
+                    with contextlib.suppress(Exception):
+                        old['shape'].remove()
+                self._draw_shape(node)
+        # Deepest first: a parent's removal already takes its children.
+        for name in sorted(previous, key=len, reverse=True):
+            with contextlib.suppress(Exception), warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                previous[name]['frame'].remove()
+
+    @staticmethod
+    def _solid(node):
+        return (node.shape['type'] in ('mesh', 'sphere', 'box') and not node.shape.get('region')
+                and node.handle is not None and node.shape.get('color') is not None)
+
+    def _shape_signature(self, node):
+        """What _draw_shape draws for a node; equal signatures reuse the drawn handle."""
+        shape = node.shape
+        if not shape:
+            return None
+        faint = bool(node.owner and node.owner[0] == 'entity' and node.owner[1] in self.items
+                     and not self.render_visible(node.owner[1]))
+        return faint, tuple(sorted((key, id(value) if isinstance(value, np.ndarray) else repr(value))
+                                   for key, value in shape.items()))
 
     def _draw_shape(self, node, highlight=False):
         shape, scene = node.shape, self.server.scene
@@ -908,8 +1022,11 @@ class Editor:
             return
         name, color = node.name + '/v', COLORS['selected'] if highlight else shape.get('color')
         kind = shape['type']
+        # Hidden from rendering (visible: false): drawn faint, it still collides.
+        faint = {'opacity': .3} if node.owner and node.owner[0] == 'entity' and node.owner[1] in self.items \
+            and not self.render_visible(node.owner[1]) else {}
         if kind == 'mesh':
-            handle = scene.add_mesh_simple(name, shape['vertices'], shape['faces'], color=color, side='double')
+            handle = scene.add_mesh_simple(name, shape['vertices'], shape['faces'], color=color, side='double', **faint)
         elif kind == 'box' and shape.get('region'):
             # Abstract rectangle/box: a translucent body plus screen-width edges, so it
             # stays visible inside robots or on the ground. A flat rectangle is lifted
@@ -923,9 +1040,9 @@ class Editor:
             scene.add_line_segments(name + '/edges', corners[np.array(edges)], color,
                                     thickness=4. if highlight else 2.5, thickness_units='screen')
         elif kind == 'box':
-            handle = scene.add_box(name, color=color, dimensions=shape['size'], opacity=.85)
+            handle = scene.add_box(name, color=color, dimensions=shape['size'], opacity=faint.get('opacity', .85))
         elif kind == 'sphere':
-            handle = scene.add_icosphere(name, radius=shape['radius'], color=color)
+            handle = scene.add_icosphere(name, radius=shape['radius'], color=color, **faint)
         elif kind == 'arrow':
             # Local +X: a shaft and a two-line head, as in Isaac's arrow marker.
             length, head = shape['length'], shape['length'] * .25
@@ -945,6 +1062,9 @@ class Editor:
         else:
             handle = scene.add_frame(name, show_axes=True, axes_length=shape['length'] * (1.6 if highlight else 1),
                                      axes_radius=shape['length'] * .04)
+        entry = getattr(self, 'emitted', {}).get(node.name)
+        if entry is not None:
+            entry.update(shape=handle, highlighted=highlight)
         # No per-node click handlers: viser outlines hovered clickable nodes and
         # lets them swallow pointer events meant for the transform gizmo. Bodies that can be
         # moved get a drag handler instead: pressing on one and dragging slides it (see _drag).
@@ -969,10 +1089,12 @@ class Editor:
         for shaped in [node, *shapes]:
             if not (shaped.shape and shaped.name):
                 continue
-            solid = shaped.shape['type'] in ('mesh', 'sphere', 'box') and not shaped.shape.get('region')
-            if solid and shaped.handle is not None and shaped.shape.get('color') is not None:
+            if self._solid(shaped):
                 # Recolour in place: re-adding the node would end a drag that is selecting it.
                 shaped.handle.color = COLORS['selected'] if on else shaped.shape.get('color')
+                entry = self.emitted.get(shaped.name)
+                if entry is not None:
+                    entry['highlighted'] = on
             else:
                 self._draw_shape(shaped, highlight=on)
 
@@ -1077,6 +1199,7 @@ class Editor:
         self._place_gizmo()
         self._rebuild_inspector()
         self._style_tree()
+        self._draw_motion_path()
 
     @action
     def escape(self):
@@ -1098,6 +1221,7 @@ class Editor:
             return
         self.hidden ^= {owner}
         self.handles[id(node)].visible = owner not in self.hidden
+        self.outliner_revision += 1
         self._label_tree()
         if owner == self.selected and self.hidden_box is not None and self.hidden_box.value != (owner in self.hidden):
             self.syncing += 1
@@ -1105,6 +1229,174 @@ class Editor:
                 self.hidden_box.value = owner in self.hidden
             finally:
                 self.syncing -= 1
+
+    # -------------------------------------------------- outliner toggles (scene_outliner.html)
+    def render_visible(self, path):
+        """Whether an entity appears in rendered images: ``visible`` for assets, ``visualization.abstract``
+        for abstract entities (drawn only in previews)."""
+        item = self.items[path]
+        if item['category'] == 'abstract':
+            shown = self.pending['shown'] if self.pending['shown'] is not None else \
+                self.snapshot.get('visualization', {}).get('abstract', [])
+            return item['name'] in shown
+        return self.pending['visible'].get(path, item.get('visible', True))
+
+    def physics_state(self, path):
+        """``(mode, jointed)`` of an object (see PHYSICS), or None for entities without that switch:
+        robots, sensors, terrain, lights, attached or mounted parts and shared (global) props."""
+        from shared.assembly.catalog import asset_capabilities, factory_capabilities
+        item, info = self.items[path], self.info[path]
+        if item['category'] != 'object' or not item.get('factory') or item.get('scope') == 'global' \
+                or info['fixed'] or item.get('mount') or item.get('instance_component') is not None:
+            return None
+        parameters = self.parameter_values(item)
+        key = (item['factory'], json.dumps(parameters, sort_keys=True, default=str))
+        cache = self.__dict__.setdefault('capability_cache', {})
+        if key not in cache:  # a usd_object opens its USD file
+            try:
+                cache[key] = asset_capabilities(item['factory'], factory_capabilities(item['factory']), parameters)
+            except Exception:  # noqa: BLE001 - an unreadable USD has no physics switch until it is fixed
+                cache[key] = None
+        capabilities = cache[key]
+        if capabilities is None:
+            return None
+        jointed = 'joint_state' in capabilities
+        if self.pending['kinematic'].get(path, item.get('kinematic', False)):
+            return 'kinematic', jointed
+        if parameters.get('fix_root_link'):
+            return 'fixed', jointed
+        return ('dynamic' if 'rigid_body' in capabilities else 'static'), jointed
+
+    def current_motion(self, path):
+        return self.pending['motion'][path] if path in self.pending['motion'] else self.items[path].get('motion')
+
+    def _set_parameter(self, path, name, value):
+        item = self.items[path]
+        try:
+            current = json.loads(self.parameters[path]) if path in self.parameters else dict(item.get('parameters', {}))
+        except ValueError:
+            current = dict(item.get('parameters', {}))
+        if value is None:
+            current.pop(name, None)
+        else:
+            current[name] = value
+        self.parameters[path] = json.dumps(current, ensure_ascii=False)
+
+    def toggle_physics(self, path):
+        """Outliner switch: an object either moves under forces or not (kinematic, or a fixed root when
+        it has joints, which cannot be kinematic)."""
+        state = self.physics_state(path)
+        if state is None:
+            raise ValueError(f'{path} 没有物理开关（机器人、传感器、地形、已安装或固定连接的部件）')
+        mode, jointed = state
+        if mode == 'static':
+            raise ValueError(f'{path} 是静态几何（没有刚体）；在参数里填写质量后才会受力运动')
+        self.checkpoint()
+        if mode == 'dynamic' and jointed:
+            self._set_parameter(path, 'fix_root_link', True)
+        elif mode == 'dynamic':
+            self.pending['kinematic'][path] = True
+        elif mode == 'fixed':
+            self._set_parameter(path, 'fix_root_link', None if 'fix_root_link' not in self.items[path].get('parameters', {})
+                                else False)
+        else:
+            self.pending['kinematic'][path] = False
+            if self.current_motion(path):
+                self.pending['motion'][path] = None
+                self.report(f'{path} 改为受力运动，其场景运动已移除')
+        mode = self.physics_state(path)[0]
+        self.outliner_revision += 1
+        if self.selected == ('entity', path):
+            self._rebuild_inspector()
+        self.report(f'{path}：{PHYSICS[mode][0]}；保存后写入 scene.yaml')
+
+    def toggle_render(self, path):
+        """Outliner switch: an asset's ``visible``, or whether an abstract entity is drawn in previews."""
+        item = self.items[path]
+        if item['category'] in ('sensor', 'light', 'group') or (item['category'] != 'abstract' and not item.get('factory')):
+            raise ValueError(f'{path} 不出现在渲染画面中，没有该开关')
+        self.checkpoint()
+        shown = not self.render_visible(path)
+        if item['category'] == 'abstract':
+            current = self.pending['shown'] if self.pending['shown'] is not None else \
+                list(self.snapshot.get('visualization', {}).get('abstract', []))
+            self.pending['shown'] = [n for n in current if n != item['name']] + ([item['name']] if shown else [])
+        else:
+            if item.get('instance_component') is not None:
+                raise ValueError(f'{path} 是模板内部部件；渲染可见性在模板中设置')
+            self.pending['visible'][path] = shown
+            for node in [self.info[path]['node'], *self.info[path]['meshes']]:
+                if node.shape and node.name:
+                    self._draw_shape(node, highlight=self.selected == ('entity', path))
+        self.outliner_revision += 1
+        if self.selected == ('entity', path):
+            self._rebuild_inspector()
+        what = '仿真中显示标记' if item['category'] == 'abstract' else '出现在相机与录像中'
+        self.report(f'{path}：{"" if shown else "不"}{what}；保存后写入 scene.yaml')
+
+    def outliner_get(self, name, query):
+        with self.lock:
+            if name != 'state':
+                raise KeyError(f'未知的场景列表请求 {name}')
+            if query.get('revision') == str(self.outliner_revision):
+                return {'revision': self.outliner_revision}
+            rows = []
+            for owner, depth in self.tree_entries():
+                kind, path = owner
+                row = {'id': f'{kind}:{path}', 'depth': depth, 'icon': self._row_icon(owner), 'changed': owner in self.tree_changed,
+                       'hidden': owner in self.hidden, 'selected': owner == self.selected, 'render': None,
+                       'physics': None, 'motion': None}
+                if kind == 'entity':
+                    item, info = self.items[path], self.info[path]
+                    row['label'] = (self.labels.get(path) or item['label']).strip() or item['name']
+                    row['note'] = '固定' if info['fixed'] else '安装' if item.get('mount') else \
+                        '布局' if info['layout_parent'] else ''
+                    row['hint'] = f'{path} · {item["category_label"]}'
+                    if item['category'] == 'abstract' or (item.get('factory') and item['category'] not in ('sensor', 'light')):
+                        row['render'] = self.render_visible(path)
+                        row['render_hint'] = (('仿真预览中画出标记' if row['render'] else '仿真预览中不画标记（只是读数）')
+                                              if item['category'] == 'abstract' else
+                                              '出现在相机与录像中' if row['render'] else '不出现在相机与录像中（仍参与碰撞）') \
+                            + '；点击切换'
+                    state = self.physics_state(path)
+                    if state is not None:
+                        row['physics'] = {'mode': state[0], 'label': PHYSICS[state[0]][0], 'hint': PHYSICS[state[0]][1]}
+                    motion = self.current_motion(path)
+                    if motion:
+                        row['motion'] = MOTIONS[motion['type']]
+                else:
+                    row.update(label=path, note='', hint='布局组合（仅摆放）')
+                rows.append(row)
+            return {'revision': self.outliner_revision, 'rows': rows}
+
+    def outliner_post(self, name, request):
+        with self.lock:
+            try:
+                kind, _, path = str(request.get('id', '')).partition(':')
+                owner = (kind, path)
+                if self._node_of(owner) is None:
+                    raise ValueError(f'场景中没有 {path}')
+                if name == 'select':
+                    self.select.__wrapped__(self, owner)
+                elif name == 'toggle':
+                    what = request.get('what')
+                    if what == 'hidden':
+                        self.toggle_hidden.__wrapped__(self, owner)
+                    elif what == 'render' and kind == 'entity':
+                        self.toggle_render(path)
+                    elif what == 'physics' and kind == 'entity':
+                        self.toggle_physics(path)
+                    else:
+                        raise KeyError(f'未知的开关 {what}')
+                elif name == 'focus':
+                    self.select.__wrapped__(self, owner)
+                    self.focus_selection.__wrapped__(self)
+                else:
+                    raise KeyError(f'未知的场景列表请求 {name}')
+            except Exception as error:
+                self.report(f'⚠️ {error}', error=True)
+                raise
+            return self.outliner_get('state', {})
 
     @action
     def focus_selection(self):
@@ -1371,6 +1663,10 @@ class Editor:
                 changes['reset'] = self.pending['resets'][path]
             if self.pending['kinematic'].get(path, item.get('kinematic', False)) != item.get('kinematic', False):
                 changes['kinematic'] = self.pending['kinematic'][path]
+            if path in self.pending['motion'] and self.pending['motion'][path] != (item.get('motion') or None):
+                changes['motion'] = self.pending['motion'][path]
+            if self.pending['visible'].get(path, item.get('visible', True)) != item.get('visible', True):
+                changes['visible'] = self.pending['visible'][path]
             if path in self.pending['meshes'] and self.pending['meshes'][path] != item.get('meshes', []):
                 changes['meshes'] = self.pending['meshes'][path] or None
             if path in self.pending['shapes']:
@@ -1405,8 +1701,8 @@ class Editor:
         return payload
 
     def unsaved(self):
-        """Edits not yet in scene.yaml: pending fields, or structural edits held in the working copy."""
-        return self.dirty() or self.disk_text != self.saved_text
+        """Edits not yet in scene.yaml (pending fields, structural edits held in the working copy) or train.yaml."""
+        return self.dirty() or self.disk_text != self.saved_text or bool(self.pending.get('simulation'))
 
     def dirty(self):
         try:
@@ -1437,11 +1733,18 @@ class Editor:
     @action
     def save(self, *, quiet=False):
         # Saving is not an undo step: undo still returns to the edit before it.
+        simulation = dict(self.pending.get('simulation') or {})  # applying reloads, which clears pending
         result = self._apply(self.collect(), record=False)
         if self.target.read_text() != self.saved_text:
             raise ValueError('scene.yaml 已在编辑器外被修改，未覆盖；点击“放弃修改并重新加载”读取新内容')
         text = self.scene.read_text()
         result = {**result, 'changed': text != self.saved_text}
+        if simulation:
+            from shared.assembly.editing import write_simulation_settings
+            write_simulation_settings(self.target, simulation)
+            self.pending['simulation'] = {}
+            result['changed'] = True
+            self._show_simulation()
         if result['changed']:
             temporary = self.target.with_name(f'.{self.target.name}.save')
             temporary.write_text(text)
@@ -1556,7 +1859,73 @@ class Editor:
                 self.exporter = None
             if self.exporter is None:
                 self.exporter = ExportWorker(python, cache_path(scene).with_suffix('.exporter.log'))
-            return self.exporter.request(scene, force=force)
+            return self.exporter.request(scene, force=force, progress=self._export_progress)
+
+    # ------------------------------------------------- loading placeholders that fill up
+    def _placeholder_bounds(self, path):
+        """Root-frame corners of the boxes standing in for an entity's mesh, or None."""
+        corners = []
+        for mesh in self.info[path]['meshes']:
+            if mesh.shape and mesh.shape['type'] == 'box' and not mesh.shape.get('region'):
+                half, centre = np.asarray(mesh.shape['size']) / 2, mesh.local[:3, 3]
+                corners += [centre - half, centre + half]
+        return (np.min(corners, 0), np.max(corners, 0)) if corners else None
+
+    def _start_loading(self):
+        """Entities drawn as placeholders get a fill that rises while their mesh is made."""
+        for path, item in self.items.items():
+            # A box is drawn exactly from its parameters: nothing to wait for.
+            if path in self.loading or item['category'] not in ('robot', 'object') or item.get('factory') in (None, 'box') \
+                    or self.visual(item)[0] is not None or self._placeholder_bounds(path) is None:
+                continue
+            self.loading[path] = {'target': 0., 'shown': 0., 'start': time.time(), 'handle': None}
+
+    def _stop_loading(self):
+        for state in self.loading.values():
+            if state['handle'] is not None:
+                with contextlib.suppress(Exception):
+                    state['handle'].remove()
+        self.loading = {}
+
+    def _export_progress(self, values):
+        """Exporter progress ({path: fraction}) for entities still drawn as placeholders."""
+        for path, fraction in values.items():
+            state = self.loading.get(path)
+            if state is not None and float(fraction) > state['target']:
+                state['target'], state['start'] = float(fraction), time.time()
+
+    def _animate_loading(self):
+        """Raise each loading placeholder's fill towards its progress. Between reports (the exporter's start-up
+        and scene build come as one step without a count) it creeps on, up to 40% or 20% past the last report."""
+        import math
+        while True:
+            time.sleep(.12)
+            if not self.loading:
+                continue
+            with self.lock:
+                for path, state in list(self.loading.items()):
+                    info = self.info.get(path)
+                    bounds = self._placeholder_bounds(path) if info else None
+                    if bounds is None or ('entity', path) in self.hidden:
+                        continue
+                    target = state['target']
+                    cap = .4 if target <= 0 else 1. if target >= 1 else min(target + .2, .95)
+                    goal = target + (cap - target) * (1 - math.exp(-(time.time() - state['start']) / 4))
+                    shown = state['shown'] + (goal - state['shown']) * (.5 if target >= 1 else .3)
+                    name = info['node'].name + '/loading'
+                    if state['handle'] is not None and state.get('name') == name and abs(shown - state['shown']) < .003:
+                        continue  # a reload renames the nodes: draw again under the new name
+                    state['shown'] = shown
+                    low, high = bounds
+                    size = high - low
+                    height = max(size[2] * shown, 1e-4)
+                    centre = ((low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2] + height / 2)
+                    # Slightly wider than the placeholder so it shows through it; replaced in place.
+                    state['name'] = name
+                    state['handle'] = self.server.scene.add_box(
+                        name, color=(46, 110, 220), opacity=.75,
+                        dimensions=(size[0] * 1.04 + .002, size[1] * 1.04 + .002, height), position=centre,
+                        cast_shadow=False, receive_shadow=False)
 
     def start_export(self, force=False):
         backend = geometry_backend(self.scene)
@@ -1568,6 +1937,7 @@ class Editor:
             self.report(f'未找到 {backend} 的环境 {python}；继续显示示意代理（可设置 RLINF_EXPORT_PYTHON）')
             return
         with self.lock:
+            self._start_loading()
             if self.export_thread and self.export_thread.is_alive():
                 self.export_again = bool(self.export_again) or force
                 self.report('原生网格导出进行中；结束后会再导出一次')
@@ -1581,6 +1951,10 @@ class Editor:
                 try:
                     self._export_visuals(scene, force)
                     error = None
+                    for state in list(self.loading.values()):
+                        state['target'], state['start'] = 1., time.time()
+                    if self.loading:
+                        time.sleep(.5)  # let the fills reach the top before the meshes replace them
                 except SceneChanged:
                     continue  # saved again mid-export: export the current file
                 except Exception as exception:
@@ -1590,6 +1964,7 @@ class Editor:
                         break
                     force, self.export_again = self.export_again, None
             with self.lock:
+                self._stop_loading()
                 if error:
                     self.report(f'原生网格导出失败：{error}', error=True)
                 elif scene != self.scene:
@@ -1609,6 +1984,66 @@ class Editor:
         self.report('后台导出原生网格（通常 5–20 秒），期间可继续编辑')
 
     # ---------------------------------------------------------------------- GUI
+    def _show_command(self):
+        """Under the save button: the command that runs this project's scene in the simulator (saved file)."""
+        if not hasattr(self, 'command_strip'):
+            return
+        target = Path(self.target)
+        if target.name != 'scene.yaml' or target.parent.parent != ROOT / 'projects':
+            self.command_strip.content = ''  # view runs projects; a scene variant or loose file has no command
+            return
+        command = f'bash run.sh view {target.parent.name}'
+        if getattr(self, 'shown_command', None) == command:
+            return
+        self.shown_command = command
+        page = COMMAND_PAGE.replace('__COMMAND__', html.escape(command))
+        self.command_strip.content = (f'<iframe srcdoc="{html.escape(page)}" title="运行命令" style="display:block;width:100%;'
+                                      'height:34px;border:0;margin:-2px 0 2px"></iframe>')
+
+    def _show_simulation(self):
+        """The 项目 tab's physics engine and renderer (train.yaml env.train.init_params), from the backend's
+        ``project.SIMULATION_CHOICES``; a choice is pending until saved, like scene edits."""
+        if not hasattr(self, 'simulation_folder'):
+            return
+        from shared.assembly.editing import simulation_settings
+        for handle in self.simulation_items:
+            handle.remove()
+        self.simulation_items = []
+        gui = self.server.gui
+        try:
+            backend, choices, current = simulation_settings(self.target)
+        except Exception as error:  # noqa: BLE001 - a project without a readable recipe
+            with self.simulation_folder:
+                self.simulation_items.append(gui.add_markdown(f'<small>读不到 train.yaml：{html.escape(str(error))}</small>'))
+            return
+        labels = {'physics': '物理引擎', 'renderer': '渲染（预览窗口与相机）'}
+        with self.simulation_folder:
+            if not choices:
+                self.simulation_items.append(gui.add_markdown(f'<small>后端 `{backend}` 没有可切换的物理引擎或渲染器。</small>'))
+                return
+            for name, options in choices.items():
+                value = self.pending['simulation'].get(name, current[name])
+                names = {key: label for key, (label, _) in options.items()}
+                dropdown = gui.add_dropdown(labels.get(name, name), list(names.values()), initial_value=names[value],
+                                            hint='；'.join(f'{label}：{hint}' for label, hint in options.values()))
+                self.simulation_items.append(dropdown)
+
+                def changed(_, name=name, dropdown=dropdown, names=names, saved=current[name]):
+                    if self.syncing:
+                        return
+                    self.checkpoint()
+                    value = next(key for key, label in names.items() if label == dropdown.value)
+                    if value == saved:
+                        self.pending['simulation'].pop(name, None)
+                    else:
+                        self.pending['simulation'][name] = value
+                    self.report(f'{labels.get(name, name)}：{dropdown.value}；保存后写入 train.yaml'
+                                f'（env.train.init_params.{name}，评估与 view/record 同样使用）')
+                dropdown.on_update(self.guarded(changed))
+            self.simulation_items.append(gui.add_markdown(
+                f'<small>后端 `{backend}`。训练、评估与 `run.sh view` 都按 train.yaml 运行；'
+                '命令行 `+env.train.init_params.physics=…` 可临时覆盖。</small>'))
+
     def report(self, text, error=False):
         if hasattr(self, 'status'):
             shown = text if not self.backend_problem else f'{text}\n⚠️ {self.backend_problem}'
@@ -1624,8 +2059,12 @@ class Editor:
         # Left: scene tree and tools. Right: the selection's properties, always visible.
         panel = gui.add_panel()
         with panel.add_tab('场景', icon='list-tree'):
-            gui.add_markdown('<small>点击选中 · F 聚焦 · H 隐藏 · Esc 取消 · Ctrl+S 保存 · Ctrl+Z 撤回</small>')
+            gui.add_markdown('<small>点击选中 · 双击聚焦 · 行尾开关：物理 / 渲染可见 / 编辑器中显示 · '
+                             'Ctrl+S 保存 · Ctrl+Z 撤回</small>')
             self.tree_style = gui.add_html('')
+            # The outliner (tools/scene_outliner.html, served with the asset library) replaces these buttons
+            # once the library server runs; they remain the tree if it cannot start.
+            self.outliner_frame = gui.add_html('')
             self.tree_folder = gui.add_folder(None)
             self.tree_items = []
         with panel.add_tab('添加', icon='plus'):
@@ -1640,7 +2079,8 @@ class Editor:
             self.shelf_revision, self.shelf_items_revision, self.entity_name = 0, 0, 'new_object'
             self.mount_targets, self.mount_groups = {}, {}
             self.simready_entries, self.simready_problems, self.simready_loaded = {}, {}, False
-            self.simready_job, self.library, self.library_url, self.shelf_pictures = None, None, None, {}
+            self.environment_entries = {}
+            self.jobs, self.library, self.library_url, self.shelf_pictures = [], None, None, {}
             with gui.add_folder('选项 · 按坐标添加', expand_by_default=False):
                 self.asset_mount = gui.add_dropdown('安装到', [NONE], hint='传感器随该实体的连杆运动')
                 self.asset_mount_body = gui.add_dropdown('安装连杆', [ROOT_BODY])
@@ -1691,6 +2131,9 @@ class Editor:
                              '增删终点后请同步 decode_action 的返回值。保存后写入 scene.yaml。')
             self.target_asset.on_update(lambda _: None if self.syncing else self._suggest_target_name())
         with panel.add_tab('项目', icon='folder'):
+            # Physics engine and renderer: run-time choices of train.yaml (_show_simulation).
+            self.simulation_folder = gui.add_folder('仿真（train.yaml）')
+            self.simulation_items = []
             gui.add_button('放弃修改并重新加载', icon='refresh').on_click(lambda _: self.reload())
             gui.add_button('刷新原生网格（Isaac 后台导出）', icon='cube').on_click(lambda _: self._refresh_native())
             with gui.add_folder('新建 / 打开环境'):
@@ -1721,6 +2164,7 @@ class Editor:
                                                              (self.redo_button, '38px', '0', '0')))
         toolbar += ''.join(f'[id="{button._impl.uuid}"]{{padding:0!important}}' for button in (self.undo_button, self.redo_button))
         theme.content = '<style>' + THEME_CSS + toolbar + '</style>'
+        self.command_strip = gui.add_html('')  # `run.sh view <project>` with a copy button (_show_command)
         self.status = gui.add_markdown('<div class="rl-status">加载中…</div>')
         self.inspector = gui.add_folder(None)
         for label, hotkey, modifier, callback, icon in (
@@ -1808,6 +2252,9 @@ class Editor:
         for handle in self.tree_items:
             handle.remove()
         self.tree_items, self.tree_rows = [], {}
+        self.outliner_revision += 1
+        if self.outliner_page:  # the outliner page lists the tree (scene_outliner.html)
+            return
         changed = self.changed_owners()
         entries = self.tree_entries()
         with self.tree_folder:
@@ -1823,6 +2270,7 @@ class Editor:
         self._style_tree()
 
     def _style_tree(self):
+        self.outliner_revision += 1
         rules = []
         for owner, (row, depth) in self.tree_rows.items():
             selected = owner == self.selected
@@ -1834,6 +2282,9 @@ class Editor:
 
     def _label_tree(self, changed=None):
         changed = self.changed_owners() if changed is None else changed
+        if changed != self.tree_changed:
+            self.tree_changed = changed
+            self.outliner_revision += 1
         for owner, (row, _) in self.tree_rows.items():
             text = self._row_text(owner, changed)
             if row.label != text:
@@ -1934,7 +2385,9 @@ class Editor:
             self._abstract_controls(path)
             self._attach_section(path)
             if not item.get('mount'):
-                self._reset_section(path)
+                if (self.current_motion(path) or {}).get('type') != 'path':  # a path decides the reset pose
+                    self._reset_section(path)
+                self._motion_section(path)
             self._add(gui.add_button('删除抽象体', color='red', icon='trash')).on_click(lambda _: self._delete(path))
             return
         with self._section('参数'):
@@ -1949,7 +2402,8 @@ class Editor:
         self._attach_section(path)
         if item.get('factory') and item['category'] in ('robot', 'object'):
             self._initial_section(path)
-        if item['category'] not in ('sensor', 'terrain', 'light') and not info['fixed']:
+        if item['category'] not in ('sensor', 'terrain', 'light') and not info['fixed'] \
+                and (self.current_motion(path) or {}).get('type') != 'path':  # a path decides the reset pose
             self._reset_section(path)
         if item['category'] == 'object' and item.get('scope') != 'global' and not info['fixed'] and not item.get('mount'):
             self._motion_section(path)
@@ -2207,6 +2661,8 @@ class Editor:
             if position is None:
                 position = list(self.asset_position.value) if self.asset_placement.value == '指定位置' else [0, 0, 0]
             return self.library_add(key, self.entity_name, position)
+        if (self.asset_choice or '').startswith('environment:'):
+            return self._environment_add(self.asset_choice.split(':', 1)[1], self.entity_name)
         choice = self.gallery_entries.get(self.asset_choice)
         if not choice:
             raise ValueError('请在资产架中选择资产')
@@ -2381,6 +2837,15 @@ class Editor:
                           'badge': f'×{len(members)}' if len(members) > 1 else None, 'image': simready_preview_url(first),
                           'meta': category + ('' if first['publisher'] == 'nvidia' else f" · {first['publisher']}"),
                           'search': f"{family} {category} {' '.join(entry['name'] for entry in members)}".lower()})
+        for entry in self.environment_entries.values():
+            picture = environment_thumbnail(entry['key'])
+            state = '已包装' if entry['wrapped'] else '本地' if entry['local'] else '在线，添加时下载'
+            items.append({'id': 'environment:' + entry['key'], 'label': entry['label'], 'category': 'environment',
+                          'members': None, 'shape': None, 'local': entry['local'], 'badge': None,
+                          'meta': ('室外' if entry['kind'] == 'outdoor' else '室内') + f' · {state}'
+                                  + ('' if entry['verified'] else ' · 未验证'),
+                          'image': f'thumb/{urllib.parse.quote(picture.stem)}.png' if picture.is_file() else None,
+                          'search': f"{entry['label']} {entry['key']} environment 场景 环境".lower()})
         counts = {}
         for item in items:
             counts[item['category']] = counts.get(item['category'], 0) + 1
@@ -2421,8 +2886,8 @@ class Editor:
         item = self._shelf_item()
         if item is None:
             raise ValueError('请先在资产架中选择资产')
-        if self._mounting() is not None:
-            return self._add_choice()  # a mounted sensor has no place to click
+        if self._mounting() is not None or item['category'] == 'environment':
+            return self._add_choice()  # a mounted sensor or an environment has no place to click
         self.arm_placement(self.entity_name or item['label'], lambda position: self._add_asset(position))
         self._shelf_changed()
 
@@ -2475,11 +2940,13 @@ class Editor:
             options['body'] = {'options': list(self.asset_mount_body.options), 'value': self.asset_mount_body.value}
         if self.asset_size.visible:
             options['size'] = [float(v) for v in self.asset_size.value]
+        environment = (self.asset_choice or '').startswith('environment:')
         state = {'items': self.shelf_items_revision, 'revision': self.shelf_revision, 'choice': self.asset_choice,
                  'variant': self._simready_choice(), 'name': self.entity_name, 'detail': self.shelf_detail,
-                 'focus': self.shelf_focus, 'options': options, 'mounted': mount is not None,
-                 'button': f'安装到 {self.asset_mount.value}' if mount is not None else '点击放置',
-                 'placing': self.placing and self.placing['label'], 'job': self.simready_job}
+                 'focus': self.shelf_focus, 'options': options, 'mounted': mount is not None or environment,
+                 'button': f'安装到 {self.asset_mount.value}' if mount is not None else
+                 '添加到场景' if environment else '点击放置',
+                 'placing': self.placing and self.placing['label'], 'job': self._shown_job()}
         self.shelf_focus = False
         return state
 
@@ -2549,6 +3016,8 @@ class Editor:
         key = self._simready_choice()
         if key:
             self._describe_simready(key)
+        elif (self.asset_choice or '').startswith('environment:'):
+            self._describe_environment(self.asset_choice.split(':', 1)[1])
         elif self.gallery_entries.get(self.asset_choice):
             self._describe_gallery()
         else:
@@ -2604,8 +3073,22 @@ class Editor:
         base = re.sub(r'_[a-z]{0,2}\d{1,3}$', '', entry['name']).split('_')
         self._suggest_name(base[-1] if len(base) > 1 else base[0], {})
 
+    def _describe_environment(self, key):
+        entry, item = self.environment_entries[key], self._shelf_item()
+        for field in (self.asset_parameters, self.asset_size, self.asset_mount, self.asset_mount_body,
+                      self.asset_placement, self.asset_position):
+            field.visible = False
+        state = '已包装' if entry['wrapped'] else '本地，添加时包装' if entry['local'] else '在线，添加时下载并包装'
+        spawn = environments.recorded_spawn(key)
+        self._detail(entry['label'], f"场景环境 · {key} · {state}", [
+            '作为全局静态 usd_object 加入（所有环境共用一份，地面放在 z = 0）；放置位置取场景目录，不取点击位置。',
+            entry['note'], '尚未用机器人 smoke 验证' if not entry['verified'] else '',
+            _spawn_text(spawn) if spawn else ('包装时会找出可放机器人的空地' if spawn is None else '没找到可放机器人的空地'),
+            f"许可：{entry['license']}"], item and item['image'])
+        self._suggest_name('environment', {})
+
     def _unused_name(self, base):
-        names = {item['name'] for item in self.snapshot['entities']}
+        names = {item['name'] for item in self.snapshot['entities']} | {job['name'] for job in self.jobs if job['running']}
         candidate, index = base, 2
         while candidate in names:
             candidate, index = f'{base}_{index}', index + 1
@@ -2629,6 +3112,7 @@ class Editor:
             self.library = Library(host, port, types.SimpleNamespace(
                 catalog=self.library_catalog, asset=self.library_asset, status=self.library_status, add=self.library_add,
                 shelf_get=self.shelf_get, shelf_post=self.shelf_post, shelf_picture=self.shelf_picture,
+                outliner_get=self.outliner_get, outliner_post=self.outliner_post,
                 origin_port=self.server.get_port()))
         except OSError as error:
             self.report(f'⚠️ SimReady 资产库未启动：{error}', error=True)
@@ -2643,6 +3127,14 @@ class Editor:
         self.shelf_frame.content = (f'<iframe srcdoc="{html.escape(page)}" title="资产架" style="display:block;width:100%;'
                                     'height:calc(100vh - 250px);min-height:380px;border:1px solid #e3e6ea;'
                                     'border-radius:8px;background:#f6f7f9"></iframe>')
+        page = OUTLINER_PAGE.read_text().replace('__LIBRARY_PORT__', str(self.library.port))
+        with self.lock:
+            self.outliner_page = True
+            self._rebuild_tree_gui()  # drops the button rows
+            self.tree_style.content = ''
+            self.outliner_frame.content = (f'<iframe srcdoc="{html.escape(page)}" title="场景列表" style="display:block;'
+                                           'width:100%;height:calc(100vh - 190px);min-height:300px;border:0;'
+                                           'background:transparent"></iframe>')
 
     def _open_library(self, client):
         """The browser in a near-full-screen dialog over the editor."""
@@ -2729,26 +3221,41 @@ class Editor:
         return info
 
     def library_status(self):
-        return self.simready_job
+        return self._shown_job()
+
+    def _start_job(self, key, name, message):
+        """Register a background addition; other assets may be prepared meanwhile, each asset once at a time."""
+        if not name.isidentifier():
+            raise ValueError(f'实体名称 {name!r} 须是 Python 标识符（字母、数字、下划线）')
+        running = [job for job in self.jobs if job['running']]
+        if any(job['key'] == key for job in running):
+            raise ValueError(f'{key} 仍在准备中')
+        if name in {item['name'] for item in self.snapshot['entities']} | {job['name'] for job in running}:
+            raise ValueError(f'场景中已有（或正在添加）实体 {name}')
+        job = {'key': key, 'name': name, 'running': True, 'error': False, 'done': 0, 'total': 0, 'message': message}
+        self.jobs = [*running, job]
+        self.report(message)
+        self._describe_asset()  # the next addition gets a fresh name
+        return job
+
+    def _shown_job(self):
+        """The job the shelf shows: the newest running one (with how many others run), else the newest."""
+        running = [job for job in self.jobs if job['running']]
+        if not running:
+            return self.jobs[-1] if self.jobs else None
+        others = len(running) - 1
+        return {**running[-1], 'message': running[-1]['message'] + (f'（另有 {others} 项在后台准备）' if others else '')}
 
     def library_add(self, key, name, position):
         """Download/wrap ``key`` in the background, then add it to the scene as a usd_object at ``position``."""
         entry = self.simready_entries.get(key)
         if entry is None:
             raise KeyError(f'未知的 SimReady 资产 {key!r}')
-        if not name.isidentifier():
-            raise ValueError(f'实体名称 {name!r} 须是 Python 标识符（字母、数字、下划线）')
         position = [float(value) for value in position]
         if len(position) != 3:
             raise ValueError('位置须是 3 个数')
         with self.lock:
-            if self.simready_job and self.simready_job['running']:
-                raise ValueError(f'{self.simready_job["key"]} 仍在准备中')
-            if name in {item['name'] for item in self.snapshot['entities']}:
-                raise ValueError(f'场景中已有实体 {name}')
-            job = self.simready_job = {'key': key, 'name': name, 'running': True, 'error': False, 'done': 0, 'total': 0,
-                                       'message': f'准备 {key}（{"本地镜像" if entry["local"] else "从 Hugging Face 下载"}，再包装）…'}
-        self.report(job['message'])
+            job = self._start_job(key, name, f'准备 {key}（{"本地镜像" if entry["local"] else "从 Hugging Face 下载"}，再包装）…')
         threading.Thread(target=self._prepare_simready, args=(job, entry, position), daemon=True).start()
         return job
 
@@ -2781,6 +3288,84 @@ class Editor:
             traceback.print_exc()
             job.update(running=False, error=True, message=f'{job["key"]} 未添加：{error}')
             self.report(f'⚠️ {job["message"]}', error=True)
+
+    def _environment_add(self, key, name):
+        """Download/wrap the catalog environment ``key`` in the background, then add it as a global usd_object."""
+        job = self._start_job(key, name, f'准备场景环境 {key}…')
+        threading.Thread(target=self._prepare_environment, args=(job,), daemon=True).start()
+        return job
+
+    def _prepare_environment(self, job):
+        def progress(message):
+            job['message'] = message
+            self.report(message)
+
+        try:
+            record = environments.prepare(job['key'], progress)
+            with self.lock:
+                factory = next((item for item in self.snapshot['catalog']['assets'] if item['id'] == 'usd_object'), None)
+                if factory is None:
+                    raise ValueError(f'已准备 {record["formats"]["usd"]}，但当前后端的资产目录没有 usd_object')
+                self._save_first()
+                self._add_entity({'name': job['name'], 'factory': 'usd_object', 'kind': 'entity', 'scope': 'global',
+                                  'parameters': {'usd_path': record['formats']['usd']},
+                                  'pose': {'position': record['environment']['pose'], 'orientation': [1, 0, 0, 0]}},
+                                 factory)
+                self._load_environments()
+                spawn = record['environment'].get('spawn')
+                job.update(running=False, message=f'已添加 {job["name"]}（{job["key"]}）；在编辑器中保存后写入 scene.yaml'
+                           + (f'。{_spawn_text(spawn, 1)}' if spawn else ''))
+        except Exception as error:  # noqa: BLE001 - surfaced in the shelf and the editor
+            traceback.print_exc()
+            job.update(running=False, error=True, message=f'{job["key"]} 未添加：{error}')
+            self.report(f'⚠️ {job["message"]}', error=True)
+
+    def _load_environments(self, thumbnails=False):
+        """Catalog environments for the shelf (part downloads are left to the command line)."""
+        entries = {entry['key']: entry for entry in environments.catalog() if not entry.get('part')}
+        with self.lock:
+            self.environment_entries = entries
+            self._refresh_assets()
+        if not thumbnails:
+            return
+        missing = []
+        for key in entries:
+            if environment_thumbnail(key).is_file():
+                continue
+            source = None
+            with contextlib.suppress(Exception):  # offline: drawn below from the local USD, if any
+                source = environments.thumbnail(key, draw=False)
+            if source:
+                THUMBNAILS.mkdir(parents=True, exist_ok=True)
+                environment_thumbnail(key).write_bytes(source.read_bytes())
+            elif entries[key]['local']:
+                missing.append(key)
+        with self.lock:
+            self._refresh_assets()
+        if not missing:
+            return
+        # Floor plans load whole scenes (several GB each): drawn in a separate process, one after another.
+        process = subprocess.Popen([sys.executable, '-m', 'shared.environments', *missing], cwd=ROOT,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in process.stdout:
+            key, _, path = line.strip().partition(' ')
+            path = path.split(' ', 1)[0]
+            if path and Path(path).is_file():
+                THUMBNAILS.mkdir(parents=True, exist_ok=True)
+                environment_thumbnail(key).write_bytes(Path(path).read_bytes())
+                with self.lock:
+                    self._refresh_assets()
+        process.wait()
+        # Another editor's drawer may hold the machine-wide lock: take what it has drawn by now.
+        found = False
+        for key in missing:
+            source = environments.thumbnail(key, online=False, draw=False)
+            if source and not environment_thumbnail(key).is_file():
+                environment_thumbnail(key).write_bytes(source.read_bytes())
+                found = True
+        if found:
+            with self.lock:
+                self._refresh_assets()
 
     # --------------------------------------------------------------- thumbnails
     def _harvest_thumbnails(self):
@@ -3336,20 +3921,230 @@ class Editor:
         if clear is not None:
             clear.on_click(remove)
 
+    def _regions(self):
+        """Scene paths of abstract entities other entities use as reset or wander regions (kept static)."""
+        found = set()
+        for path, item in self.items.items():
+            reset = self.pending['resets'][path] if path in self.pending['resets'] else item.get('reset')
+            if isinstance(reset, dict) and reset.get('region'):
+                found.add(_resolve(path, reset['region']))
+            motion = self.current_motion(path)
+            if motion and motion.get('type') == 'wander':
+                region = motion.get('region') or (reset or {}).get('region')
+                if region:
+                    found.add(_resolve(path, region))
+        return found
+
+    def _areas(self):
+        """Abstract rectangles/boxes by scene path, as placed in the editor now (``abstract.reset_areas``)."""
+        areas = {}
+        for path, item in self.items.items():
+            if item['category'] != 'abstract':
+                continue
+            shape, size = self.abstract_geometry(path)
+            if shape in ('rectangle', 'box'):
+                areas[path] = {'shape': shape, 'size': list(size), 'pose': F.matrix_pose(self.info[path]['node'].world())}
+        return areas
+
     def _motion_section(self, path):
-        gui, title = self.server.gui, '运动方式'
-        current = self.pending['kinematic'].get(path, self.items[path].get('kinematic', False))
+        gui, title, item = self.server.gui, '运动', self.items[path]
+        abstract = item['category'] == 'abstract'
+        state = None if abstract else self.physics_state(path)
+        draft = self.motion_drafts.get(path) or copy.deepcopy(self.current_motion(path) or {})
         with self._section(title):
-            box = gui.add_checkbox('由 Task 移动（kinematic）', current)
-            gui.add_markdown('<small>不受力、不下落，能推动机器人；每步位姿由 task.py 返回的 `set` 给出，'
-                             '复位仍按“随机复位”放置。此类物体彼此不碰撞。</small>')
+            if state is not None:
+                mode, jointed = state
+                gui.add_markdown(f'<small>物理：**{PHYSICS[mode][0]}**（{PHYSICS[mode][1]}）。'
+                                 '在场景列表行尾的图标切换。</small>')
+                if jointed or mode == 'static':
+                    gui.add_markdown('<small>' + ('带关节的物体不能设为运动学，不能自行运动；可在场景列表中固定其根部。'
+                                                  if jointed else '静态几何没有刚体，不能自行运动。') + '</small>')
+                    return
+            if path in self._regions():
+                gui.add_markdown('<small>它是别的实体的复位或游走区域，保持静止。</small>')
+                return
+            pick = gui.add_dropdown('自行运动', list(MOTIONS.values()), initial_value=MOTIONS[draft.get('type')])
+            kind = draft.get('type')
+            fields = {}
+            if kind:
+                speed = draft.get('speed', [.1, .1])
+                speed = speed if isinstance(speed, (list, tuple)) else [speed, speed]
+                fields['speed'] = gui.add_vector2('速度范围 (m/s)', tuple(float(v) for v in speed), min=(0., 0.), step=.01,
+                                                  hint='每回合在范围内取一个速度；两值相同即固定速度')
+                fields['face'] = gui.add_checkbox('朝向运动方向', bool(draft.get('face')),
+                                                  hint='绕竖直轴转向；当前朝向视为面朝 +X')
+            if kind == 'wander':
+                reset = self.pending['resets'][path] if path in self.pending['resets'] else item.get('reset')
+                own = (reset or {}).get('region')
+                areas = sorted(p for p in self._areas() if p != path)
+                options = ([f'随机复位区域（{own}）'] if own else []) + areas or ['（先添加抽象矩形或长方体）']
+                current = draft.get('region')
+                fields['region'] = gui.add_dropdown('区域', options, initial_value=current if current in options else options[0])
+                top = max(float(v) for v in speed)
+                fields['turn'] = gui.add_number('掉头加速度 (m/s²)', float(draft.get('turn', round(top * top / .04, 4))),
+                                                min=.001, step=.05, hint='越出区域边缘后以此加速度折返；默认最高速时越出约 2 cm')
+            if kind == 'path':
+                points = draft.get('points', [])
+                text = '  \n'.join(f'{i + 1}. ({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})' for i, p in enumerate(points))
+                gui.add_markdown(f'<small>路径点（环境坐标，m）：  \n{text or "尚无，至少需要两个"}</small>')
+                gui.add_button('在视图中点击添加路径点', icon='map-pin-plus',
+                               hint='连续点击添加；高度取实体当前高度；Esc 结束').on_click(lambda _: self._arm_path_point(path))
+                remove = gui.add_button_group('', ['删除最后一点', '清空'])
+                fields['loop'] = gui.add_checkbox('循环（不勾为往返）', draft.get('loop', True) is not False)
+                fields['start'] = gui.add_dropdown('复位时位置', ['第一个点', '路径上随机'],
+                                                   initial_value='路径上随机' if draft.get('start') == 'random' else '第一个点')
+            if kind:
+                gui.add_button('预览运动（8 秒）', icon='player-play').on_click(lambda _: self.preview_motion(path))
+            note = ('选了运动后自动设为不受力（运动学）。' if not abstract else '') + \
+                '每步由场景运动给出位置；task.py 的 set 若给出该实体，以 set 为准。'
+            gui.add_markdown(f'<small>{note}</small>')
+
+        def collect():
+            kind = next(key for key, label in MOTIONS.items() if label == pick.value)
+            if kind is None:
+                return None
+            motion = {'type': kind, 'speed': .1}
+            if 'speed' in fields:
+                low, high = (round(float(v), 4) for v in fields['speed'].value)
+                motion['speed'] = high if low == high else [low, high]
+                if fields['face'].value:
+                    motion['face'] = True
+            if kind == 'wander' and 'region' in fields:
+                if fields['region'].value in self.items:  # else the entity's own reset region
+                    motion['region'] = fields['region'].value
+                motion['turn'] = round(float(fields['turn'].value), 4)
+            if kind == 'path':
+                motion['points'] = draft.get('points', [])
+                if 'loop' in fields and not fields['loop'].value:
+                    motion['loop'] = False
+                if 'start' in fields and fields['start'].value == '路径上随机':
+                    motion['start'] = 'random'
+            return motion
 
         @self.guarded
-        def update(_):
+        def changed(_, rebuild=False):
+            self.checkpoint(('motion', path))
+            self._store_motion(path, collect())
+            if rebuild:
+                self.open_section = title
+                self._rebuild_inspector()
+        pick.on_update(lambda event: changed(event, rebuild=True))
+        for name, field in fields.items():
+            field.on_update(lambda event, name=name: changed(event, rebuild=name == 'speed' and 'turn' not in fields))
+        if draft.get('type') == 'path':
+            @self.guarded
+            def drop(event):
+                self.checkpoint()
+                points = list(self.motion_drafts.get(path, draft).get('points', []))
+                points = points[:-1] if event.target.value == '删除最后一点' else []
+                self._store_motion(path, {**collect(), 'points': points})
+                self.open_section = title
+                self._rebuild_inspector()
+            remove.on_click(drop)
+
+    def _store_motion(self, path, motion):
+        """Keep the edited motion; a complete one becomes the pending scene edit (kinematic for an asset)."""
+        from shared.assembly.motion import check
+        self.motion_drafts[path] = motion
+        if motion is None:
+            self.pending['motion'][path] = None
+        else:
+            reset = self.pending['resets'][path] if path in self.pending['resets'] else self.items[path].get('reset')
+            if motion.get('type') == 'path' and reset:
+                # A path decides where each reset puts the entity.
+                self.pending['resets'][path], reset = None, None
+                self.report(f'{path} 沿路径运动：复位位置由路径决定，已移除其随机复位')
+            try:
+                check(path, motion, reset_region=(reset or {}).get('region'), has_reset=bool(reset))
+            except ValueError as error:
+                self.report(f'运动尚未生效：{error}')
+                self._draw_motion_path()
+                return
+            self.pending['motion'][path] = motion
+            if self.items[path]['category'] != 'abstract':
+                self.pending['kinematic'][path] = True
+        self.outliner_revision += 1
+        self._draw_motion_path()
+        self.report(f'{path} 的运动已暂存；保存后写入 scene.yaml')
+
+    def _arm_path_point(self, path):
+        def add(position):
+            draft = dict(self.motion_drafts.get(path) or self.current_motion(path) or {'type': 'path', 'speed': .3})
+            height = float(self.info[path]['node'].world()[2, 3])
+            draft['points'] = [*draft.get('points', []), [round(position[0], 4), round(position[1], 4), round(height, 4)]]
             self.checkpoint()
-            self.pending['kinematic'][path] = bool(box.value)
-            self.report(f'{path} 的运动方式已暂存；保存后写入 scene.yaml')
-        box.on_update(update)
+            self._store_motion(path, draft)
+            self.open_section = '运动'
+            self._rebuild_inspector()
+            self.arm_placement(f'{path} 的下一个路径点', add)  # keep adding until Esc
+        self.arm_placement(f'{path} 的路径点', add)
+
+    def _draw_motion_path(self):
+        """The selected entity's path (points and segments) in the view."""
+        if self.path_marker is not None:
+            for handle in self.path_marker:
+                handle.remove()
+            self.path_marker = None
+        if not self.selected or self.selected[0] != 'entity' or self.selected[1] not in self.items:
+            return
+        path = self.selected[1]
+        motion = self.motion_drafts.get(path) or self.current_motion(path)
+        if not motion or motion.get('type') != 'path' or not motion.get('points'):
+            return
+        points = np.asarray(motion['points'], float)
+        closed = np.vstack([points, points[:1]]) if motion.get('loop', True) is not False and len(points) > 2 else points
+        scene, handles = self.server.scene, []
+        if len(closed) > 1:
+            handles.append(scene.add_line_segments('/motion_path/segments', np.stack([closed[:-1], closed[1:]], 1),
+                                                   (230, 120, 20), thickness=3., thickness_units='screen'))
+        handles.append(scene.add_point_cloud('/motion_path/points', points, colors=(230, 120, 20), point_size=.03,
+                                             point_shape='circle'))
+        self.path_marker = handles
+
+    @action
+    def preview_motion(self, path):
+        """Play the motion of ``path`` in the view for 8 s with the shared motion code, then put it back."""
+        try:
+            import torch
+            from shared.assembly.motion import Motion, check
+        except ImportError:
+            raise ValueError('预览运动需要 torch；编辑器运行在没有 torch 的环境中') from None
+        motion = self.motion_drafts.get(path) if path in self.motion_drafts else self.current_motion(path)
+        if not motion:
+            raise ValueError(f'{path} 没有设置运动')
+        reset = self.pending['resets'][path] if path in self.pending['resets'] else self.items[path].get('reset')
+        motion = check(path, motion, reset_region=(reset or {}).get('region'), has_reset=bool(reset))
+        if motion['type'] == 'wander' and motion['region'] not in self._areas():
+            raise ValueError(f'区域 {motion["region"]} 不是抽象矩形或长方体')
+        node = self.info[path]['node']
+        original, world = node.local.copy(), node.world()
+        pose = F.matrix_pose(world)
+        state = Motion(motion, pose, self._areas(), 1, 'cpu')
+        state.reset([0])
+        start = state.start([0])
+        current = start if start is not None else torch.tensor([[*pose['position'], *pose['orientation']]])
+        if self.motion_preview:
+            self.motion_preview.set()
+        stop = self.motion_preview = threading.Event()
+
+        def run(current=current):
+            try:
+                for _ in range(240):
+                    if stop.wait(1 / 30):
+                        break
+                    current = state.step(current, 1 / 30, torch.ones(1, dtype=torch.bool))
+                    target = F.pose_matrix({'position': current[0, :3].tolist(), 'orientation': current[0, 3:7].tolist()})
+                    with self.lock:
+                        parent = node.parent.world() if node.parent is not None else np.eye(4)
+                        node.local = np.linalg.inv(parent) @ target
+                        self._update_frame(node)
+            finally:
+                with self.lock:
+                    node.local = original
+                    self._update_frame(node)
+                    self._place_gizmo()
+        threading.Thread(target=run, daemon=True).start()
+        self.report(f'预览 {path} 的运动 8 秒（只在视图中，不改位置）')
 
     def _meshes_section(self, path):
         gui, title = self.server.gui, '射线目标'

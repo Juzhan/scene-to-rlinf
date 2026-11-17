@@ -9,6 +9,15 @@ from pathlib import Path
 from omegaconf import OmegaConf, open_dict
 
 
+def load_project_dataset(data, paths, cfg):
+    """A project's ``data.load_dataset(paths)``, or ``load_dataset(paths, cfg)`` when the dataset depends on
+    model settings (e.g. how many future actions one sample holds)."""
+    import inspect
+    if len(inspect.signature(data.load_dataset).parameters) > 1:
+        return data.load_dataset(paths, cfg)
+    return data.load_dataset(paths)
+
+
 class SftProject:
     def __init__(self, source, package, *, model_type, export_prefix='model', online=False):
         self.online = online
@@ -35,7 +44,7 @@ class SftProject:
             cfg.sft_project = {'package': self.package, 'export_prefix': self.export_prefix}
             cfg.actor.model.model_type = self.model_type
         data = import_module(self.package + '.data')
-        datasets, manifest = data.load_dataset(cfg.data.train_data_paths)
+        datasets, manifest = load_project_dataset(data, cfg.data.train_data_paths, cfg)
         data.validate(cfg, datasets, manifest)
         if cfg.actor.global_batch_size < 1 or cfg.actor.micro_batch_size < 1 or cfg.actor.global_batch_size % cfg.actor.micro_batch_size:
             raise ValueError('Global batch must be a positive multiple of micro batch')

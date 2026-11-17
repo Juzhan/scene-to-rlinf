@@ -13,6 +13,8 @@ import numpy as np
 VERSION = 1
 TRIANGLE_BUDGET = 60000
 MIN_PART_TRIANGLES = 256
+# Beyond this many parts (a whole indoor scene exports ~20 000) parts of one body are merged before simplifying.
+MAX_PARTS = 512
 NOTE = 'Lightweight editor mesh; exact native joint and mounting frames. Simulation uses original assets.'
 # Full-resolution export, only ever read by the simplifiers. Older caches used gzip JSON.
 MESH_SOURCE_SUFFIX = '.mesh.npz'
@@ -59,7 +61,8 @@ def triangles(faces):
 
 
 def _cluster(vertices, faces, cells):
-    low, high = vertices.min(axis=0), vertices.max(axis=0)
+    # Cells span where most vertices are, so one far-off piece (a sky dome) does not coarsen the rest.
+    low, high = np.percentile(vertices, 0.5, axis=0), np.percentile(vertices, 99.5, axis=0)
     size = max(float((high - low).max()), 1e-9) / cells
     keys = np.floor((vertices - low) / size).astype(np.int64)
     _, inverse = np.unique(keys, axis=0, return_inverse=True)
@@ -146,8 +149,50 @@ def write_light(destination, geometry, simplified, method):
             'source_vertex_count': original_vertices}
 
 
+def part_count(filename):
+    """Number of parts of a mesh source, reading only its header where possible."""
+    if str(filename).endswith('.mesh.json.gz'):
+        return len(read_mesh_source(filename)['parts'])
+    with np.load(filename) as data:
+        return len(json.loads(str(data['header']))['names'])
+
+
+def merged_parts(geometry, cells=2048):
+    """`geometry` with the parts of each body (as ``mesh_parts`` assigns them) merged into one, each first
+    snapped to a grid of `cells` along the largest extent, so tens of millions of triangles become a few
+    meshes small enough to simplify."""
+    parts = [part for part in geometry['parts'] if len(part['faces'])]
+    if not parts:
+        return geometry
+    # Grid over where most vertices are: a sky dome kilometres wide must not set the cell size.
+    sample = np.concatenate([part['vertices'][::max(1, len(part['vertices']) // 1000)] for part in parts])
+    low, high = np.percentile(sample, 0.5, axis=0), np.percentile(sample, 99.5, axis=0)
+    size = max(float((high - low).max()), 1e-9) / cells
+    groups = {}
+    for part in parts:
+        body = next((body for body in geometry['frames'] if '/' + body + '/' in part['name']), None)
+        keys = np.floor((part['vertices'] - low) / size).astype(np.int64)
+        _, inverse = np.unique(keys, axis=0, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        faces = inverse[triangles(part['faces'])]
+        faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])]
+        if not len(faces):
+            continue
+        vertices = np.zeros((inverse.max() + 1, 3))
+        vertices[inverse] = part['vertices']  # any vertex of its cell represents it
+        groups.setdefault(body, []).append((part['name'], vertices, faces))
+    merged = []
+    for members in groups.values():
+        offsets = np.cumsum([0] + [len(vertices) for _, vertices, _ in members])
+        merged.append({'name': members[0][0], 'vertices': np.concatenate([vertices for _, vertices, _ in members]),
+                       'faces': np.concatenate([faces + offset for (_, _, faces), offset in zip(members, offsets)])})
+    return {**geometry, 'parts': merged}
+
+
 def simplify(source, destination):
     geometry = read_mesh_source(source)
+    if len(geometry['parts']) > MAX_PARTS:
+        geometry = merged_parts(geometry)
     simplified = {i: simplify_part(part['vertices'], part['faces'], target)
                   for i, (part, target) in enumerate(zip(geometry['parts'], part_targets(geometry))) if target}
     return write_light(destination, geometry, simplified, 'vertex_clustering')

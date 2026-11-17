@@ -7,6 +7,15 @@ from .scene import validate
 # project assets reach this backend through BACKEND_FACTORIES['isaaclab3'].
 PROJECT_TERMS = False
 UNKEYED_FACTORIES = False
+
+# Run-time choices the editor offers (env.train.init_params in train.yaml): name -> ordered
+# {value: (label, hint)}, the first value being the default when train.yaml names none.
+SIMULATION_CHOICES = {
+    'physics': {'newton': ('Newton（MuJoCo-Warp）', 'GPU 并行、可微；SimReady 的 SDF 碰撞按原三角网格算'),
+                'ovphysx': ('OvPhysX（PhysX）', '与 Isaac Sim 同一引擎；支持 SDF 碰撞，复杂资产较慢')},
+    'renderer': {'newton': ('Newton（GL 预览 + Warp 相机）', '快，只画基础颜色与贴图，无阴影'),
+                 'ovrtx': ('OVRTX（路径追踪）', '与 Isaac 画面一致，较慢；需另装 ovrtx')},
+}
 validate_scene = validate
 
 

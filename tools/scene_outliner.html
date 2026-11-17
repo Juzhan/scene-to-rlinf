@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<!-- The scene editor's outliner: the scene tree with per-row switches, like Blender's outliner.
+     The editor embeds it as an iframe srcdoc (same origin as the editor) and replaces __LIBRARY_PORT__;
+     rows and actions go to tools/simready_library.py (/api/outliner/), which asks Editor.outliner_*.
+     Switches: eye = shown in the editor only (never saved); camera = rendered (scene.yaml visible, or
+     visualization.abstract for abstract entities); physics = moves under forces or not (kinematic / fixed). -->
+<style>
+:root { --accent: #2e6edc; --line: #e3e6ea; --muted: #6b7280; --sel: rgba(255,170,40,.28); --selh: rgba(255,170,40,.36); }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; font: 12.5px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; color: #1f2328;
+       background: transparent; display: flex; flex-direction: column; overflow: hidden; }
+header { flex: none; padding: 2px 4px 6px; }
+#filter { width: 100%; padding: 5px 9px; border: 1px solid #cfd4da; border-radius: 7px; font: inherit; font-size: 12.5px; background: #fff; }
+#filter:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+#list { flex: 1; min-height: 0; overflow: auto; padding: 0 2px 8px; scrollbar-width: thin; }
+.row { display: flex; align-items: center; gap: 5px; height: 26px; padding-right: 2px; border-radius: 6px; cursor: pointer;
+       user-select: none; white-space: nowrap; }
+.row:hover { background: rgba(128,128,128,.12); }
+.row.sel { background: var(--sel); font-weight: 600; }
+.row.sel:hover { background: var(--selh); }
+.row .kind { flex: none; width: 16px; height: 16px; color: #6b7280; }
+.row.sel .kind { color: #b35c00; }
+.row .label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.row.dim .label, .row.dim .kind { opacity: .45; }
+.tag { flex: none; font-size: 10.5px; font-weight: 400; color: var(--muted); padding: 0 5px; border-radius: 8px; background: #eef0f3; }
+.tag.motion { color: #b35c00; background: #fff1e0; }
+.dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: #2f9e44; }
+.switches { flex: none; display: flex; gap: 1px; margin-left: 4px; }
+.sw { width: 24px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #495057;
+      display: grid; place-items: center; cursor: pointer; }
+.sw:hover { background: rgba(0,0,0,.08); }
+.sw svg { width: 16px; height: 16px; }
+.sw.off { color: #adb5bd; }
+.sw.blank { visibility: hidden; pointer-events: none; }
+.sw.dynamic { color: #2e6edc; }
+.sw.kinematic { color: #d9480f; }
+.sw.fixed, .sw.static { color: #868e96; }
+#empty { display: none; padding: 14px 8px; color: var(--muted); }
+#message { display: none; margin: 0 4px 4px; padding: 4px 8px; border-radius: 6px; font-size: 11.5px; color: #c92a2a; background: #fff5f5; }
+#offline { display: none; padding: 14px 8px; color: #c92a2a; }
+</style>
+</head>
+<body>
+<header><input id="filter" type="search" placeholder="筛选名称（/）" autocomplete="off"></header>
+<div id="message"></div>
+<div id="list"></div>
+<div id="empty">场景为空：在“添加”中加入地面、机器人和物体。</div>
+<div id="offline">连不上编辑器的资产库服务（编辑器端口 + 1）；远程使用时两个端口都要转发。</div>
+<script>
+const PORT = __LIBRARY_PORT__;
+const embedded = location.protocol === 'about:';
+const API = embedded ? `${parent.location.protocol}//${parent.location.hostname}:${PORT}/` : '/';
+const $ = id => document.getElementById(id);
+const svg = body => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+// Tabler-style outlines, matching the viser icons of the rest of the editor.
+const KINDS = {
+  robot: '<rect x="6" y="5" width="12" height="9" rx="2"/><path d="M9 18h6M12 14v4M9.5 9h.01M14.5 9h.01M12 2v3"/>',
+  box: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/>',
+  mountain: '<path d="M3 20l6-10 4 6 3-4 5 8z"/>',
+  radar: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 12l6-6"/>',
+  bulb: '<path d="M9 17h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9V17h7v-3.1A6 6 0 0 0 12 3z"/>',
+  'stack-2': '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 16l8 4 8-4"/>',
+  'map-pin': '<circle cx="12" cy="10" r="3"/><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.2"/>',
+};
+const EYE = svg('<path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/>');
+const EYE_OFF = svg('<path d="M3 3l18 18M10.6 6.1A9.7 9.7 0 0 1 12 6c6 0 9.5 6 9.5 6a17 17 0 0 1-3 3.7M6.6 6.6C4 8.3 2.5 12 2.5 12S6 18 12 18c1.6 0 3-.4 4.3-1"/>');
+const RENDER = svg('<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.2"/>');
+const RENDER_OFF = svg('<path d="M3 3l18 18M8 5h7l2 3h3v10M17 19H4V8h3"/><path d="M9.8 10.9a3.2 3.2 0 0 0 4.3 4.3"/>');
+const PHYSICS = {
+  dynamic: svg('<circle cx="12" cy="7.5" r="4"/><path d="M12 14v7M8.5 17.5L12 21l3.5-3.5"/>'),            // falls: gravity
+  kinematic: svg('<rect x="3" y="8" width="10" height="9" rx="1.5"/><path d="M16 12.5h5M18.5 10l2.5 2.5-2.5 2.5"/>'),  // moved for it
+  fixed: svg('<circle cx="12" cy="4.5" r="1.6"/><path d="M12 6v14M8 9h8M5 13a7 7 0 0 0 14 0"/>'),       // anchored
+  static: svg('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>'),
+};
+
+let revision = null, rows = [], failures = 0;
+const filterKey = 'rlinf-outliner.filter';
+const store = (() => { try { return embedded ? parent.sessionStorage : sessionStorage; } catch { return null; } })();
+$('filter').value = (store && store.getItem(filterKey)) || '';
+
+async function api(path, body) {
+  const response = await fetch(API + 'api/outliner/' + path, body === undefined ? {} :
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+
+function message(text) {
+  $('message').textContent = text || '';
+  $('message').style.display = text ? 'block' : 'none';
+  if (text) setTimeout(() => { if ($('message').textContent === text) message(''); }, 4000);
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+function render() {
+  const words = $('filter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = words.length ? rows.filter(r => words.every(w => (r.label + ' ' + r.id + ' ' + (r.note || '')).toLowerCase().includes(w))) : rows;
+  $('empty').style.display = rows.length ? 'none' : 'block';
+  $('list').innerHTML = shown.map(r => {
+    const physics = r.physics ? `<button class="sw ${r.physics.mode}" data-what="physics" title="${escapeHtml(r.physics.label + '：' + r.physics.hint + '（点击切换）')}">${PHYSICS[r.physics.mode]}</button>`
+                              : '<button class="sw blank"></button>';
+    const renderSw = r.render === null ? '<button class="sw blank"></button>' :
+      `<button class="sw${r.render ? '' : ' off'}" data-what="render" title="${escapeHtml(r.render_hint || '')}">${r.render ? RENDER : RENDER_OFF}</button>`;
+    const eye = `<button class="sw${r.hidden ? ' off' : ''}" data-what="hidden" title="${r.hidden ? '编辑器中已隐藏（不写入 scene.yaml）' : '编辑器中显示'}">${r.hidden ? EYE_OFF : EYE}</button>`;
+    return `<div class="row${r.selected ? ' sel' : ''}${r.hidden ? ' dim' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(r.hint || '')}"
+                 style="padding-left:${4 + (words.length ? 0 : r.depth) * 14}px">
+      <span class="kind">${svg(KINDS[r.icon] || KINDS.box)}</span>
+      <span class="label">${escapeHtml(r.label)}</span>
+      ${r.note ? `<span class="tag">${escapeHtml(r.note)}</span>` : ''}
+      ${r.motion ? `<span class="tag motion" title="场景运动">${escapeHtml(r.motion)}</span>` : ''}
+      ${r.changed ? '<span class="dot" title="未保存的修改"></span>' : ''}
+      <span class="switches">${physics}${renderSw}${eye}</span>
+    </div>`;
+  }).join('');
+  const selected = $('list').querySelector('.row.sel');
+  if (selected && selected.dataset.id !== render.selected) selected.scrollIntoView({block: 'nearest'});
+  render.selected = selected ? selected.dataset.id : null;
+}
+
+async function refresh() {
+  try {
+    const data = await api('state' + (revision === null ? '' : `?revision=${revision}`));
+    failures = 0;
+    $('offline').style.display = 'none';
+    if (data.rows) { rows = data.rows; render(); }
+    revision = data.revision;
+  } catch (error) {
+    if (++failures > 2) $('offline').style.display = 'block';
+  }
+  setTimeout(refresh, document.hidden ? 1500 : 450);
+}
+
+async function act(path, body) {
+  try {
+    const data = await api(path, body);
+    rows = data.rows; revision = data.revision; render();
+  } catch (error) { message(error.message); }
+}
+
+$('list').addEventListener('click', event => {
+  const row = event.target.closest('.row');
+  if (!row) return;
+  const button = event.target.closest('.sw');
+  if (button) { act('toggle', {id: row.dataset.id, what: button.dataset.what}); return; }
+  act('select', {id: row.dataset.id});
+});
+$('list').addEventListener('dblclick', event => {
+  const row = event.target.closest('.row');
+  if (row && !event.target.closest('.sw')) act('focus', {id: row.dataset.id});
+});
+$('filter').addEventListener('input', () => { if (store) store.setItem(filterKey, $('filter').value); render(); });
+
+// Keys pressed while the outliner has focus still reach the editor's shortcuts (H, F, Ctrl+S, Ctrl+Z, Esc).
+document.addEventListener('keydown', event => {
+  if (event.target === $('filter')) {
+    if (event.key === 'Escape') { $('filter').blur(); }
+    return;
+  }
+  if (event.key === '/') { event.preventDefault(); $('filter').focus(); return; }
+  if (!embedded) return;
+  const forwarded = new parent.KeyboardEvent('keydown', {key: event.key, code: event.code, ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey, shiftKey: event.shiftKey, altKey: event.altKey, bubbles: true, cancelable: true});
+  parent.document.body.dispatchEvent(forwarded);
+  if (forwarded.defaultPrevented || event.ctrlKey || event.metaKey) event.preventDefault();
+});
+
+refresh();
+</script>
+</body>
+</html>

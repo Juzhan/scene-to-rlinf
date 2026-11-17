@@ -18,6 +18,11 @@ SimReady) from the editor's own origin; it calls these with CORS allowed for tha
   GET  /api/shelf/items | state    shelf cards and categories; selection, detail, placement, add job
   POST /api/shelf/select | option | arm | cancel | drop    (see Editor.shelf_post)
   GET  /thumb/<key>.png            an editor sketch of a catalog asset
+
+and the scene tab's outliner (tools/scene_outliner.html):
+
+  GET  /api/outliner/state?revision=n   tree rows with their switches (only the revision when unchanged)
+  POST /api/outliner/select | focus | toggle   (see Editor.outliner_post)
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -36,7 +41,8 @@ _fetching = threading.BoundedSemaphore(6)  # previews not yet cached hit Hugging
 class Library:
     """What the pages need from the editor: ``catalog()``, ``asset(key)``, ``status()``,
     ``add(key, name, position)``, ``shelf_get(name, query)``, ``shelf_post(name, request)``,
-    ``shelf_picture(key)`` and ``origin_port`` (raising ValueError for a request it rejects)."""
+    ``shelf_picture(key)``, ``outliner_get(name, query)``, ``outliner_post(name, request)`` and
+    ``origin_port`` (raising ValueError for a request it rejects)."""
 
     def __init__(self, host, port, editor, attempts=20):
         handler = type('Handler', (_Handler,), {'editor': editor})
@@ -104,6 +110,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._preview(url.path)
             if url.path.startswith('/api/shelf/'):
                 return self._send(200, self.editor.shelf_get(url.path[11:], query))
+            if url.path.startswith('/api/outliner/'):
+                return self._send(200, self.editor.outliner_get(url.path[14:], query))
             if url.path.startswith('/thumb/') and url.path.endswith('.png'):
                 return self._send(200, self.editor.shelf_picture(urllib.parse.unquote(url.path[7:-4])), 'image/png',
                                   cache='no-cache')
@@ -140,6 +148,8 @@ class _Handler(BaseHTTPRequestHandler):
                                                        request.get('position') or [0, 0, 0]))
             if url.path.startswith('/api/shelf/'):
                 return self._send(200, self.editor.shelf_post(url.path[11:], request))
+            if url.path.startswith('/api/outliner/'):
+                return self._send(200, self.editor.outliner_post(url.path[14:], request))
         except (KeyError, ValueError) as error:
             return self._send(400, {'error': str(error)})
         except Exception as error:  # noqa: BLE001 - reported to the page

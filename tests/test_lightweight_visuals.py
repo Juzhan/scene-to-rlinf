@@ -64,3 +64,26 @@ def test_light_mesh_retains_frames_parts_and_original(tmp_path, monkeypatch, suf
     stamp = Path(record['path']).stat().st_mtime_ns
     _ensure_lightweight(manifest)
     assert Path(record['path']).stat().st_mtime_ns == stamp
+
+
+def test_whole_scene_previews_merge_parts_per_body_and_ignore_a_sky_dome(tmp_path):
+    from shared.assembly.mesh_preview import MAX_PARTS
+    rows = int(np.ceil(np.sqrt(MAX_PARTS + 100)))
+    parts = [sphere(f'/World/props/item_{i}', segments=16, rings=8, radius=.1) for i in range(rows * rows)]
+    for i, part in enumerate(parts):
+        part['vertices'] = part['vertices'] + (i % rows, i // rows, 0)
+    parts.append(sphere('/World/sky', segments=32, rings=16, radius=5000.))
+    source = tmp_path / 'scene.mesh.npz'
+    with source.open('wb') as stream:
+        write_mesh_source(stream, parts, {}, [])
+    manifest = tmp_path / 'scene_visuals.json'
+    manifest.write_text(json.dumps({'entities': {'world/environment': {'path': str(source)}}}))
+    _ensure_lightweight(manifest)  # thousands of parts take the numpy path, with or without Blender
+    record = json.loads(manifest.read_text())['entities']['world/environment']
+    with gzip.open(record['path'], 'rt') as stream:
+        light = json.load(stream)
+    assert len(light['parts']) == 1 and record['triangle_count'] <= TRIANGLE_BUDGET + MIN_PART_TRIANGLES
+    vertices = np.asarray(light['parts'][0]['vertices'])
+    # the grid follows the props, not the dome: props keep sub-decimetre detail
+    near = vertices[np.abs(vertices).max(1) < 100]
+    assert len(near) > 1000 and near.min(0)[0] < -.05 and near.max(0)[0] > rows - 1 + .05

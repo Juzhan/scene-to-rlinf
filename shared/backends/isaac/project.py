@@ -7,6 +7,9 @@ from shared.assembly.targets import target_catalog
 PROJECT_TERMS = True
 UNKEYED_FACTORIES = True
 
+# Run-time choices the editor offers (see isaaclab3): Isaac Lab 2 runs PhysX with Kit RTX only.
+SIMULATION_CHOICES = {}
+
 
 def validate_scene(description, settings):
     """Scene-only check; the Isaac scene compiler accepts every shared scene field."""
