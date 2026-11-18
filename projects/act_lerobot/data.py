@@ -2,18 +2,23 @@
 
 Each sample is one frame: the selected camera images, ``observation.state`` and the next
 ``chunk_size`` actions (``action`` [chunk, dim] with ``action_is_pad`` past the episode end), the
-pairing LeRobot's own ACT training uses. Train and validation are split by episode; the last
-``data.validation_episodes`` episodes validate unless a list is given.
+pairing LeRobot's own ACT training uses. ``data.episodes`` (default all) selects the episodes used at all;
+train and validation are split among them by episode, the last ``data.validation_episodes`` validating
+unless a list is given.
 """
 from pathlib import Path
 
 
 def _episodes(cfg, total):
+    selected = cfg.data.get('episodes')
+    used = list(range(total)) if selected is None else sorted({int(e) for e in selected})
+    if not used or any(e < 0 or e >= total for e in used):
+        raise ValueError(f'episodes must name episodes in 0..{total - 1}, got {selected}')
     chosen = cfg.data.get('validation_episodes', 1)
-    validation = sorted(int(e) for e in chosen) if not isinstance(chosen, int) else list(range(total - chosen, total))
-    if not validation or any(e < 0 or e >= total for e in validation):
-        raise ValueError(f'validation_episodes must name episodes in 0..{total - 1}, got {chosen}')
-    train = [e for e in range(total) if e not in validation]
+    validation = sorted(int(e) for e in chosen) if not isinstance(chosen, int) else used[len(used) - chosen:]
+    if not validation or any(e not in used for e in validation):
+        raise ValueError(f'validation_episodes must name used episodes {used[0]}..{used[-1]}, got {chosen}')
+    train = [e for e in used if e not in validation]
     if not train:
         raise ValueError('No training episode left after the validation split')
     return train, validation

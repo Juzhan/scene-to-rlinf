@@ -14,7 +14,8 @@ experiment:
 data:
   # LeRobot 数据集目录（含 meta/info.json）。换成自己采集的数据集。
   train_data_paths: /home/jz/Desktop/recordings/20261008_141506_ebbba4/dataset_stacking_corrected
-  validation_episodes: 1    # 最后 N 个回合做验证；也可写回合编号列表
+  episodes: null            # 参与训练和验证的回合编号列表；null = 全部
+  validation_episodes: 1    # 所用回合中最后 N 个做验证；也可写回合编号列表
   num_workers: 8            # 视频解码进程
   video_backend: pyav
 actor:
