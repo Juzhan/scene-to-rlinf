@@ -15,6 +15,19 @@ back and forth. Each reset puts the entity on the path, at its first point or (`
 random place along it, so a path replaces ``reset``.
 ``face: true`` turns the entity about the vertical axis to look along its motion: its authored
 orientation is the one facing environment +X.
+``custom`` runs a function of the project (an NPC that keeps away from the robot, a cart that stops for
+it)::
+
+    motion: {type: custom, function: .behaviors:keep_away, speed: 0.3}
+
+``function`` names ``module:attribute``, relative to the project package when it starts with a dot. It
+is called once per environment step for all environments as ``function(scene, motion)``: ``scene`` is
+the Task's SceneInfo view (everything observable in the scene), ``motion`` a ``MotionContext`` with
+the entity's current ``pose`` (B, 7), ``velocity`` (B, 3), ``dt``, ``active`` rows (not reset this
+step), the other keys of the mapping as ``parameters`` and an episode-local ``memory`` (TaskMemory). It
+returns the next (B, 3) position or (B, 7) pose, a batched tensor on the scene's device. A class is
+instantiated once with ``parameters``; its ``step(scene, motion)`` is called and ``reset(env_ids)``,
+when defined, at episode resets. Reset places the entity as for any other entity.
 
 Poses are environment-local xyz + wxyz. The backend's command term holding the entity (the same one
 that applies the Task's ``set``) calls ``reset`` on episode reset, ``start`` for the pose a reset
@@ -23,7 +36,7 @@ sets that step wins over the motion. Velocity follows as displacement / step_dt,
 """
 from math import isfinite
 
-TYPES = ('wander', 'path')
+TYPES = ('wander', 'path', 'custom')
 OVERSHOOT = .02  # m past the region edge at the top speed, for the default wander turn
 FIELDS = {'wander': {'type', 'region', 'speed', 'turn', 'face'},
           'path': {'type', 'points', 'speed', 'loop', 'start', 'face'}}
@@ -40,6 +53,12 @@ def check(name, motion, *, reset_region=None, has_reset=False):
     if not isinstance(motion, dict) or motion.get('type') not in TYPES:
         fail(f'is a mapping with type {" or ".join(TYPES)}')
     kind = motion['type']
+    if kind == 'custom':
+        function = motion.get('function')
+        if not isinstance(function, str) or function.count(':') != 1 or not all(function.split(':')):
+            fail('custom names its function as module:attribute (e.g. .behaviors:keep_away)')
+        return {'type': 'custom', 'function': function,
+                'parameters': {key: value for key, value in motion.items() if key not in ('type', 'function')}}
     unknown = set(motion) - FIELDS[kind]
     if unknown:
         fail(f'{kind} takes {", ".join(sorted(FIELDS[kind] - {"type"}))}; unknown: {", ".join(sorted(unknown))}')
@@ -123,18 +142,53 @@ def _yaw(angle):
     return torch.stack((torch.cos(angle / 2), 0 * angle, 0 * angle, torch.sin(angle / 2)), -1)
 
 
+class MotionContext:
+    """What a custom motion function receives besides the scene (see the module docstring)."""
+
+    def __init__(self, name, parameters, memory, num_envs, device):
+        self.name, self.parameters, self.memory = name, parameters, memory
+        self.num_envs, self.device = num_envs, device
+        self.pose = self.velocity = self.active = None
+        self.dt = None
+
+
+def load_function(reference, package):
+    """The object ``module:attribute`` names; a leading dot is relative to the project package."""
+    from importlib import import_module
+    module, attribute = reference.split(':')
+    if module.startswith('.'):
+        if not package:
+            raise ValueError(f'motion function {reference}: a relative module needs the project package')
+        module = package + module
+    target = import_module(module)
+    for part in attribute.split('.'):
+        target = getattr(target, part)
+    return target
+
+
 class Motion:
     """Batched state of one entity's motion (one row per environment).
 
     ``base`` is the entity's authored pose (``{'position', 'orientation'}``); ``areas`` maps scene paths
-    of abstract rectangles/boxes to ``{'shape', 'size', 'pose'}`` (``abstract.reset_areas``)."""
+    of abstract rectangles/boxes to ``{'shape', 'size', 'pose'}`` (``abstract.reset_areas``). A custom
+    motion also needs the project ``package`` and ``scene``, a callable returning the SceneInfo view."""
 
-    def __init__(self, motion, base, areas, num_envs, device, generator=None):
+    def __init__(self, motion, base, areas, num_envs, device, generator=None, *, package=None, scene=None, name=''):
         import torch
         self.motion, self.device, self.generator = motion, device, generator
         self.base = torch.tensor(base['orientation'], device=device, dtype=torch.float32)
         self.speed = torch.zeros(num_envs, device=device)
-        if motion['type'] == 'wander':
+        if motion['type'] == 'custom':
+            import inspect
+            from .task_memory import TaskMemory
+            target = load_function(motion['function'], package)
+            instance = target(dict(motion['parameters'])) if inspect.isclass(target) else None
+            self.function = instance.step if instance is not None else target
+            self.custom_reset = getattr(instance, 'reset', None)
+            self.context = MotionContext(name, dict(motion['parameters']), TaskMemory(), num_envs, device)
+            self.scene, self.name = scene, name
+            self.last = torch.zeros(num_envs, 3, device=device)
+        elif motion['type'] == 'wander':
             area = areas.get(motion['region'])
             if area is None or area['shape'] not in ('rectangle', 'box'):
                 raise ValueError(f'motion region {motion["region"]} must be an abstract rectangle or box')
@@ -161,6 +215,12 @@ class Motion:
         """Draw this episode's speed (and wander direction or path start) for the given environments."""
         import math
         import torch
+        if self.motion['type'] == 'custom':
+            self.context.memory.reset(env_ids)
+            self.last[env_ids] = 0.
+            if self.custom_reset is not None:
+                self.custom_reset(env_ids)
+            return
         count = len(self.speed[env_ids])
         self.speed[env_ids] = self._uniform(count, *self.motion['speed'])
         if self.motion['type'] == 'wander':
@@ -174,7 +234,7 @@ class Motion:
 
     def start(self, env_ids):
         """(N, 7) pose a reset gives these environments, or None when ``reset`` places the entity (wander)."""
-        if self.motion['type'] == 'wander':
+        if self.motion['type'] in ('wander', 'custom'):
             return None
         return self._on_path(self.distance[env_ids], self.direction[env_ids])
 
@@ -204,6 +264,8 @@ class Motion:
         from .abstract import rotate
         pose = pose.to(torch.float32)
         count = len(pose)
+        if self.motion['type'] == 'custom':
+            return self._custom(pose, dt, active)
         if self.motion['type'] == 'wander':
             inverse = self.rotation * self.rotation.new_tensor((1., -1., -1., -1.))
             local = rotate(inverse.expand(count, 4), pose[:, :3] - self.centre)
@@ -230,3 +292,32 @@ class Motion:
         self.direction = torch.where(active, direction, self.direction)
         return self._on_path(self.distance, self.direction)
 
+
+    def _custom(self, pose, dt, active):
+        import torch
+        if self.scene is None:
+            raise ValueError(f'{self.name}: a custom motion needs the scene view of the Task runtime')
+        context = self.context
+        context.pose, context.velocity, context.dt, context.active = pose.clone(), self.last.clone(), dt, active.clone()
+        with torch.no_grad():
+            result = self.function(self.scene(), context)
+        where = f'{self.name}: motion function {self.motion["function"]}'
+        if not torch.is_tensor(result) or not result.is_floating_point() or result.shape not in (
+                (len(pose), 3), (len(pose), 7)):
+            raise ValueError(f'{where} must return a float tensor of shape ({len(pose)}, 3) position or '
+                             f'({len(pose)}, 7) xyz + wxyz, got {getattr(result, "shape", type(result).__name__)}')
+        if result.device != pose.device:
+            raise ValueError(f'{where} must return a tensor on {pose.device}, got {result.device}')
+        if not torch.isfinite(result).all():
+            raise ValueError(f'{where} returned non-finite values')
+        result = result.to(torch.float32)
+        if result.shape[1] == 3:
+            result = torch.cat((result, pose[:, 3:7]), -1)
+        else:
+            norm = result[:, 3:7].norm(dim=-1, keepdim=True)
+            if (norm < 1e-6).any():
+                raise ValueError(f'{where} returned a zero quaternion')
+            result = torch.cat((result[:, :3], result[:, 3:7] / norm), -1)
+        result = torch.where(active[:, None], result, pose)
+        self.last = torch.where(active[:, None], (result[:, :3] - pose[:, :3]) / dt, torch.zeros_like(self.last))
+        return result

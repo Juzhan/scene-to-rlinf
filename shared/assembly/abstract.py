@@ -256,7 +256,7 @@ class AbstractState:
     displacement / step_dt, so it is zero when nothing moves the entity and right after any reset.
     """
 
-    def __init__(self, entity, areas, num_envs, device):
+    def __init__(self, entity, areas, num_envs, device, *, package=None, scene=None):
         import torch
         self.entity, self.areas = entity, areas
         base = entity['pose']
@@ -266,7 +266,7 @@ class AbstractState:
         motion = entity.get('motion')
         if motion is not None:
             from .motion import Motion
-            motion = Motion(motion, base, areas, num_envs, device)
+            motion = Motion(motion, base, areas, num_envs, device, package=package, scene=scene, name=entity['name'])
         self.motion = motion
 
     def resample(self, env_ids):

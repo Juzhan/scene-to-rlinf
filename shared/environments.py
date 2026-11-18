@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import difflib
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -404,6 +405,27 @@ def _open_floor(stage, flats, floor, offset, radius, clear, count, seed, skip):
              'clearance': round(float(score[i]), 2)} for i in chosen]
 
 
+LARGE_SCENE = 1000  # objects: a scene this rich (a furnished shop) is a performance test, not a working scene
+
+
+def wrapped_usd(key):
+    """The wrapper USD of a wrapped scene, or None before it is wrapped."""
+    item = entry(key)
+    usd = item['output'] / 'usd' / f"{item['name']}.usda"
+    return usd if usd.is_file() else None
+
+
+def object_count(key, analyse=True):
+    """Objects of a wrapped scene (shared/assembly/composition.py), or None before it is wrapped; with
+    ``analyse=False`` only when the analysis is cached (a large outdoor scene takes 15 s to analyse)."""
+    usd = wrapped_usd(key)
+    if usd is None:
+        return None
+    from shared.assembly.composition import cached_scene_objects, scene_objects
+    objects = scene_objects(usd) if analyse else cached_scene_objects(usd)
+    return None if objects is None else sum(kind == 'object' for _, kind in objects)
+
+
 def recorded_spawn(key):
     """Spawn points recorded when `key` was wrapped, or None before it is wrapped."""
     path = entry(key)['output'] / 'ASSET.json'
@@ -414,7 +436,8 @@ def recorded_spawn(key):
 
 def _options(item):
     """What the wrapper depends on besides the source: changing any of it rewraps."""
-    return {'pose': item['pose'], 'substitutes': item.get('substitutes') or {},
+    # 'colliders': simplified colliders kept per scene object (removable with usd_object.exclude).
+    return {'pose': item['pose'], 'substitutes': item.get('substitutes') or {}, 'colliders': 'per_object',
             'footprint_colliders': item.get('footprint_colliders') or [],
             'simplify_colliders': item.get('simplify_colliders'), 'deactivate': item.get('deactivate') or [],
             'simplify_visuals': item.get('simplify_visuals'), 'texture_size': item.get('texture_size')}
@@ -429,12 +452,39 @@ def prepare(key, progress=None):
         say(f'{key}：等待前一个场景准备完成…')
         _preparing.acquire()
     try:
-        return _prepare(key, say)
+        record = _prepare(key, say)
     finally:
         _preparing.release()
+    try:  # the editor's mesh, ahead: adding the scene to any project then shows it at once
+        prepare_editor_mesh(key, say)
+    except Exception as error:  # noqa: BLE001 - the editor exports it itself when it is added
+        say(f'{key}：编辑器网格未预先生成（{str(error)[-300:]}），添加后由编辑器生成')
+    return record
 
 
 _preparing = threading.Lock()
+EDITOR_SCENES = CACHE / 'editor'
+
+
+def prepare_editor_mesh(key, progress=None, backend='isaaclab3'):
+    """Export the web editor's lightweight mesh of a wrapped scene into the shared cache
+    (shared/assembly/visuals.py), from a scene of that environment alone: the cache key depends on the
+    asset and its parameters only, so the editor of any project adding the scene (as the shelf does, without
+    ``exclude``) finds it. A furnished house takes about a minute, once; a cached one returns at once."""
+    from shared.assembly.visuals import ensure_visuals
+    say = progress or (lambda message: None)
+    usd = wrapped_usd(key)
+    if usd is None:
+        raise ValueError(f'{key} is not wrapped yet')
+    folder = EDITOR_SCENES / re.sub(r'[^A-Za-z0-9_.-]', '_', key)
+    folder.mkdir(parents=True, exist_ok=True)
+    scene = folder / 'scene.yaml'
+    scene.write_text('schema_version: 1\nname: world\nentities:\n'
+                     '  - {name: environment, factory: usd_object, kind: entity, scope: global,\n'
+                     f'     parameters: {{usd_path: {json.dumps(str(Path(os.path.relpath(usd, ROOT))))}}}}}\n')
+    (folder / 'train.yaml').write_text(f'env:\n  train:\n    init_params:\n      backend: {backend}\n')
+    say(f'{key}：生成编辑器网格（首次约一分钟）…')
+    return ensure_visuals(scene)
 
 
 def _prepare(key, say):

@@ -62,7 +62,9 @@ def _config_type():
             self.motion = None
             if cfg.motion is not None:
                 from shared.assembly.motion import Motion
-                self.motion = Motion(cfg.motion, cfg.base, cfg.areas, self.num_envs, self.device)
+                from .python_task import scene_info
+                self.motion = Motion(cfg.motion, cfg.base, cfg.areas, self.num_envs, self.device, package=cfg.package,
+                                     scene=lambda: scene_info(env), name=cfg.name)
 
         @property
         def command(self):
@@ -124,10 +126,11 @@ def _config_type():
         motion: dict = None
         base: dict = None
         areas: dict = None
+        package: str = None
     return KinematicPoseCfg
 
 
-def attach_kinematic(commands, settings):
+def attach_kinematic(commands, settings, package=None):
     """One command term per kinematic entity; its native scene key is the Task's ``set`` name."""
     from shared.assembly.abstract import reset_areas
     from shared.assembly.kinematic import kinematic_entities, kinematic_poses
@@ -138,5 +141,5 @@ def attach_kinematic(commands, settings):
         if term in commands:
             raise ValueError('Reserved kinematic command name: ' + term)
         # Resampled only on reset: the episode never reaches this interval.
-        commands[term] = _config_type()(name=key, motion=motions.get(key), base=poses[key], areas=areas,
+        commands[term] = _config_type()(name=key, motion=motions.get(key), base=poses[key], areas=areas, package=package,
                                         resampling_time_range=(1e9, 1e9), debug_vis=False)

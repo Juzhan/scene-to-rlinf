@@ -95,7 +95,7 @@
   抽象体的场景路径 `world/<名>`。`mount` 只让抽象体读数跟随实体根部，不是物理约束，且不能再随机复位。
   相对量在模型或 Task 代码计算；仿真显示开关为 `visualization.abstract: [名称]`，两后端形状尺寸共用一份规格，仅在项目预览 view/record 画出（显式 --backend 的物理查看器不画）。
   回合内移动分两种来源，经同一后端写入口：场景本身的运动（宠物游走、车沿路径、移动的木箱）写成实体的
-  `motion`（`wander` 区域内游走 / `path` 沿路径，`shared/assembly/motion.py`，编辑器“运动”栏可设、可预览），
+  `motion`（`wander` 区域内游走 / `path` 沿路径 / `custom` 调用项目函数，如 NPC 避障；`shared/assembly/motion.py`，编辑器“运动”栏可设，前两种可预览），
   不进 Task；与任务语义相关的事件由 evaluate 返回 `set: {名: [B,3] 位置或 [B,7] xyz+wxyz}`，同一步 set 优先。
   两者都由后端原生 command 项在复位之后、观察之前生效；刚复位的环境保持采样位姿（path 的复位位置在路径上），
   Task 看到的是策略上一步观察到的位置。
@@ -104,6 +104,9 @@
   两后端同样支持静态、随机复位、Task 移动和跟随读数；scene motion、`visible: false` 只接入 isaaclab3，其他后端明确报错。
 - 是否受力（动态 / 运动学 / 固定根部）、是否出现在渲染画面（`visible`，抽象体为 `visualization.abstract`）
   是实体属性，编辑器场景列表行尾直接切换，写回同一份 scene.yaml；“编辑器中隐藏”只影响网页，不保存。
+- 导入的场景环境仍是一个 `usd_object` 实体，编辑器从 USD 结构推出物体树（`shared/assembly/composition.py`）展开显示；
+  移除物体只写 `usd_object.exclude`（仿真与编辑器共用），不为场景里的每个物体复制实体定义；需要单独移动、受力或给 Task
+  用的物体才取出为 `usd_object(prim=...)` 实体（同时写入原场景的 exclude）。日常场景以几十到一两百个物体为宜，上千个的作性能测试。
 - 统一入口负责评估/录像/汇总。MuJoCo/VLA 专用项目尚未自动迁移到这套 Python Task 运行接入。
 
 ## 7. 历史、数据与权重兼容

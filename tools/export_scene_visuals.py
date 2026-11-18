@@ -67,9 +67,62 @@ def geometry_only(description, cached):
                 return None
             return replace(node, factory=None, parameters={}, initial_state={}, frames=(),
                            connections=(), reset=None, motion=None, children=children)
+        if {'exclude', 'moved'} & set(node.parameters):  # the editor hides / moves scene objects itself
+            node = replace(node, parameters={k: v for k, v in node.parameters.items() if k not in ('exclude', 'moved')})
         # Placement rules play no part in geometry; a hidden asset (visible: false) is still drawn.
         return replace(node, connections=(), reset=None, motion=None, visible=True, children=children)
     return replace(description, root=keep(description.root), connections=())
+
+
+def _scene_objects(node, state, prim, parts, placement=None):
+    """An imported static scene's mesh parts merged object by object (shared/assembly/composition.py), named
+    by object path relative to its default prim (simplified one by one: the editor joins the parts it draws
+    as one, composition.display_parts); None when the entity is not such a scene.
+
+    An object of the same model (``composition.model_key``) as an earlier one, whose geometry is that
+    one's moved rigidly, keeps no geometry of its own but ``instance: {'of': name, 'matrix': 4x4}``
+    (row vectors: its points are the source's times the matrix), so the model is simplified once.
+    ``placement(prim)`` is a prim's transform into the entity frame of the parts."""
+    import numpy as np
+    from shared.assembly.composition import is_composite, model_key, object_of, objects_below
+    from shared.assembly.mesh_preview import mean_color
+    if node.factory != 'usd_object' or 'links' in state or not parts:
+        return None
+    objects = objects_below(prim)
+    if not is_composite(objects):
+        return None
+    prefix = str(prim.GetPath()) + '/'
+    groups = {}
+    for part in parts:
+        relative = part['name'][len(prefix):] if part['name'].startswith(prefix) else part['name']
+        groups.setdefault(object_of(relative, objects) or relative, []).append(part)
+    merged, models = [], {}
+    for name, members in groups.items():
+        offsets = np.cumsum([0] + [len(part['vertices']) for part in members])
+        part = {'name': name, 'vertices': np.concatenate([part['vertices'] for part in members]),
+                'faces': np.concatenate([part['faces'] + offset for part, offset in zip(members, offsets)]),
+                'color': mean_color(members)}
+        merged.append(part)
+        target = prim.GetStage().GetPrimAtPath(prim.GetPath().AppendPath(name)) if placement else None
+        key = model_key(target) if target else None
+        if key is None:
+            continue
+        here = np.asarray(placement(target))
+        if key not in models:
+            models[key] = (part, np.linalg.inv(here))
+            continue
+        source, undo = models[key]
+        matrix = undo @ here  # source frame -> this object's
+        if (len(source['vertices']) != len(part['vertices']) or len(source['faces']) != len(part['faces'])
+                or not np.array_equal(source['faces'], part['faces'])):
+            continue
+        moved = np.c_[source['vertices'], np.ones(len(source['vertices']))] @ matrix
+        size = max(float(np.ptp(part['vertices'], axis=0).max()), 1e-6)
+        rigid = np.allclose(matrix[:3, :3] @ matrix[:3, :3].T, np.eye(3), atol=1e-4)
+        if rigid and np.abs(moved[:, :3] - part['vertices']).max() <= 1e-4 * size:
+            part.update(vertices=part['vertices'][:0], faces=part['faces'][:0],
+                        instance={'of': source['name'], 'matrix': np.round(matrix, 7).tolist()})
+    return merged
 
 
 def _export(scene, visuals, prepared, revision, *, force=False):
@@ -77,6 +130,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
     from shared.assembly.interfaces import source_revision
     from shared.assembly.visuals import SceneChanged, cache_path, geometry_keys, load_visuals, report_progress
     from shared.assembly.mesh_preview import MESH_SOURCE_SUFFIX, write_mesh_source
+    from shared.asset_formats import base_color
     keys = geometry_keys(scene)
     existing = {} if force else load_visuals(scene)
     # Root-local cached assets need not be spawned again. No tasks, cameras, observations,
@@ -130,7 +184,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                     if body_prim:
                         body_transforms[str(body_prim.GetPath())] = (
                             transforms.GetLocalToWorldTransform(body_prim).GetInverse(), _matrix(*pose))
-            parts = []
+            parts, textures = [], {}
             for child in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
                 if not child.IsA(UsdGeom.Mesh):
                     continue
@@ -169,7 +223,8 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                     used, faces = np.unique(faces, return_inverse=True)
                     vertices, faces = vertices[used], faces.reshape(-1, 3)
                     record['note'] = 'Native generated terrain tile, seed42/env0; local zero is this tile centre. Other training copies hidden.'
-                parts.append({'name': str(child.GetPath()), 'vertices': vertices, 'faces': faces})
+                parts.append({'name': str(child.GetPath()), 'vertices': vertices, 'faces': faces,
+                              'color': base_color(child, textures)})
             frames = {}
             for body_path, (_, live) in body_transforms.items():
                 transform = Gf.Transform(live * inverse)
@@ -203,12 +258,16 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                             if np.isfinite(low) and np.isfinite(high) and low < high:
                                 row['limits'] = [float(low * factor), float(high * factor)]
                     joint_frames.append(row)
+            objects = _scene_objects(node, state, prim, parts,
+                                     lambda target: transforms.GetLocalToWorldTransform(target) * inverse)
+            if objects is not None:
+                parts = objects
             if parts:
                 # Binary intermediate, read only by the preview simplifiers; the editors load the light mesh.
                 filename = output.parent / (keys[path] + MESH_SOURCE_SUFFIX)
                 temporary = filename.with_name(filename.name + '.tmp')
                 with temporary.open('wb') as stream:
-                    write_mesh_source(stream, parts, frames, joint_frames)
+                    write_mesh_source(stream, parts, frames, joint_frames, objects=objects is not None)
                 temporary.replace(filename)
                 record.update(path=str(filename), mesh_count=len(parts),
                               vertex_count=sum(len(p['vertices']) for p in parts))

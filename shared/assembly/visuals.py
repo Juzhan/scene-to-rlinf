@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import shutil
 import os
 
@@ -101,7 +102,8 @@ def geometry_keys(scene, document=None, *, content=False):
     from .editing import SceneDocument, _plain
     document = document or SceneDocument(scene)
     backend = geometry_backend(scene)
-    common = {'tools/export_scene_visuals.py': _digest(ROOT / 'tools/export_scene_visuals.py')}
+    common = {name: _digest(ROOT / name)  # composition: how an imported scene is split into parts
+              for name in ('tools/export_scene_visuals.py', 'shared/assembly/composition.py')}
     if exporter_available(backend):
         for pattern in backend_module(backend, 'visuals').SOURCES:
             for p in sorted(ROOT.glob(pattern)):
@@ -125,7 +127,8 @@ def geometry_keys(scene, document=None, *, content=False):
             dependencies[str(file)] = _digest(file)
         keys[path] = hashlib.sha256(json.dumps({'factory': node.get('factory'),
                  'parameters': _plain({k: v for k, v in node.get('parameters', {}).items()
-                     if not (k == 'fix_root_link' and node.get('factory') in ('piper', 'piper_x', 'm20', 'franka_panda'))}),
+                     if not (k == 'fix_root_link' and node.get('factory') in ('piper', 'piper_x', 'm20', 'franka_panda'))
+                     and k not in ('exclude', 'moved')}),  # the editor hides / moves scene objects itself
                  'initial_state': _plain(node.get('initial_state', {})), 'dependencies': dependencies,
                  'format': 1, 'seed': 42}, sort_keys=True).encode()).hexdigest()
     return keys
@@ -173,11 +176,23 @@ def _ensure_lightweight(path):
         return
     report_progress([name for name, record in data['entities'].items()
                      if any(record is item for item, _ in pending(data))], .75)
+    from .mesh_preview import _has_quadric
     blender = shutil.which(os.environ.get('BLENDER', 'blender'))
     # Whole scenes (thousands of parts) are merged per body first, which only the numpy path does.
     huge = any(part_count(source) > MAX_PARTS for _, source in pending(data))
-    if not blender or huge or os.environ.get('RLINF_PREVIEW_SIMPLIFIER') == 'numpy':
-        # The web editor and headless machines need no Blender installation.
+    choice = os.environ.get('RLINF_PREVIEW_SIMPLIFIER')
+    if _has_quadric() and choice not in ('blender', 'numpy'):
+        # Quadric collapse in worker processes (fast_simplification keeps global state: no threads), from a
+        # process of its own, so an editor quitting mid-way takes no pool down with it.
+        log = path.with_suffix('.simplify.log')
+        with log.open('w') as stream:
+            process = subprocess.run([sys.executable, '-m', 'shared.assembly.mesh_preview', str(path)], cwd=ROOT,
+                                     stdout=stream, stderr=subprocess.STDOUT, timeout=900)
+        if process.returncode:
+            raise RuntimeError(f'Lightweight mesh generation failed; see {log}\n{log.read_text()[-1500:]}')
+        return
+    if not blender or huge or choice == 'numpy':
+        # Vertex clustering: no Blender needed.
         from .mesh_preview import simplify_manifest
         simplify_manifest(path)
         return

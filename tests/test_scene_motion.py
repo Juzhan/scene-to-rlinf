@@ -129,3 +129,49 @@ def test_editing_writes_motion_and_visible_only_when_set(tmp_path):
         document.set_entity('world/cube', {'motion': {**motion, 'points': [[0, 0, 0]]}})
     document.set_entity('world/cube', {'motion': None, 'visible': True})
     assert 'motion' not in document.entities['world/cube'] and 'visible' not in document.entities['world/cube']
+
+
+def test_custom_motion_calls_the_project_function_with_the_scene(monkeypatch):
+    import sys
+    import types
+    module = types.ModuleType('npc_project.behaviors')
+
+    def keep_away(scene, motion):
+        away = motion.pose[:, :2] - scene.robot[:, :2]
+        step = away / away.norm(dim=-1, keepdim=True) * motion.parameters['speed'] * motion.dt
+        motion.memory.hold('moving', torch.ones(len(step), dtype=torch.bool), torch.full((len(step),), motion.dt))
+        return torch.cat((motion.pose[:, :2] + step, motion.pose[:, 2:3]), -1)
+
+    class Shy:
+        def __init__(self, parameters):
+            self.parameters, self.resets = parameters, []
+
+        def step(self, scene, motion):
+            return motion.pose.clone()
+
+        def reset(self, env_ids):
+            self.resets.append(list(env_ids))
+
+    module.keep_away, module.Shy = keep_away, Shy
+    monkeypatch.setitem(sys.modules, 'npc_project', types.ModuleType('npc_project'))
+    monkeypatch.setitem(sys.modules, 'npc_project.behaviors', module)
+    spec = check('npc', {'type': 'custom', 'function': '.behaviors:keep_away', 'speed': 1.})
+    assert spec == {'type': 'custom', 'function': '.behaviors:keep_away', 'parameters': {'speed': 1.}}
+    scene = types.SimpleNamespace(robot=torch.zeros(2, 3))
+    motion = Motion(spec, BASE, {}, 2, 'cpu', package='npc_project', scene=lambda: scene, name='npc')
+    motion.reset(torch.arange(2))
+    assert motion.start(torch.arange(2)) is None  # reset places a custom-moving entity
+    pose = torch.tensor([[1., 0., 0., 1., 0., 0., 0.], [0., 2., 0., 1., 0., 0., 0.]])
+    after = motion.step(pose, .5, torch.tensor([True, False]))
+    assert after[0, :3].tolist() == pytest.approx([1.5, 0., 0.]) and after[1].tolist() == pose[1].tolist()
+    assert motion.last[0].tolist() == pytest.approx([1., 0., 0.]) and motion.last[1].tolist() == [0., 0., 0.]
+    shy = Motion(check('npc', {'type': 'custom', 'function': 'npc_project.behaviors:Shy', 'shyness': 2}),
+                 BASE, {}, 2, 'cpu', scene=lambda: scene, name='npc')
+    shy.reset([1])
+    assert shy.custom_reset.__self__.resets == [[1]] and shy.custom_reset.__self__.parameters == {'shyness': 2}
+    module.keep_away = lambda scene, motion: torch.zeros(2, 4)
+    bad = Motion(spec, BASE, {}, 2, 'cpu', package='npc_project', scene=lambda: scene, name='npc')
+    with pytest.raises(ValueError, match=r'npc: motion function \.behaviors:keep_away must return'):
+        bad.step(pose, .5, torch.ones(2, dtype=torch.bool))
+    with pytest.raises(ValueError, match='module:attribute'):
+        check('npc', {'type': 'custom', 'function': 'keep_away'})

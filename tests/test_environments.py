@@ -66,9 +66,11 @@ def test_simplified_colliders_replace_dense_meshes_in_any_source_unit(tmp_path):
     assert report['deactivated'] == ['/World/sky'] and not out.GetPrimAtPath('/World/sky').IsActive()
     assert not out.GetPrimAtPath('/World/floor').HasAPI(UsdPhysics.CollisionAPI)
     assert out.GetPrimAtPath('/World/box').HasAPI(UsdPhysics.CollisionAPI)  # not a Mesh: kept as is
-    tiles = out.GetPrimAtPath('/World/simplified_colliders').GetChildren()
-    assert tiles and all(tile.HasAPI(UsdPhysics.CollisionAPI) for tile in tiles)
-    assert UsdGeom.Imageable(tiles[0]).ComputePurpose() == UsdGeom.Tokens.guide
+    # The floor is a scene object and a gprim: its simplified collider is beside it, removed with it.
+    assert simplified['object_colliders'] == 1 and simplified['tiles'] == 0
+    collider = out.GetPrimAtPath('/World/floor_simplified_collider')
+    assert collider.HasAPI(UsdPhysics.CollisionAPI) and not out.GetPrimAtPath('/World/floor').GetChildren()
+    assert UsdGeom.Imageable(collider).ComputePurpose() == UsdGeom.Tokens.guide
     # the editor placeholder spans the colliders in metres (guide ones included), not a sky dome
     low, high = usd_bounds(tmp_path / 'room/usd/room.usda')
     assert max(map(abs, low + high)) < 3.5 and high[2] > 0.9

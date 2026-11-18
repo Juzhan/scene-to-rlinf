@@ -421,6 +421,10 @@ class SceneDocument:
         for path, value in list(authoring.get('parents', {}).items()):
             if path in removed or value['entity'] in removed:
                 del authoring['parents'][path]
+        for key in ('labels', 'selectable'):
+            for path in list(authoring.get(key, {})):
+                if path in removed:
+                    del authoring[key][path]
         for profile, value in list(self.data.get('observations', {}).items()):
             terms = value.get('terms', []) if isinstance(value, dict) else value
             kept = [term for term in terms if not dropped(term)]
@@ -737,6 +741,8 @@ class SceneDocument:
             entities.append({"path": path, "parent": path.rsplit("/", 1)[0],
                              "name": node["name"], "factory": node.get("factory"),
                              "label": self.data.get('authoring', {}).get('labels', {}).get(path, node['name']),
+                             "selectable": self.data.get('authoring', {}).get('selectable', {}).get(
+                                 path, meta.get("category") != "terrain"),
                              "kind": node.get("kind", "entity"), "pose": _pose(node.get("pose", {})),
                              "category": meta.get("category", "group"),
                              "category_label": meta.get("category_label", "组合"),
@@ -835,7 +841,7 @@ def _preview(node, directory, metadata=None):
 
 def apply_edits(path, payload):
     """Apply explicit edits from a CLI/Blender snapshot; fail on external changes."""
-    allowed = {"control_train", "components", "revision", "entities", "visualization", "observations", "actions", "rewards", "task", "variables", "add_entities", "connections", "layout_groups", "remove_entities", "layout_parents", "labels"}
+    allowed = {"control_train", "components", "revision", "entities", "visualization", "observations", "actions", "rewards", "task", "variables", "add_entities", "connections", "layout_groups", "remove_entities", "layout_parents", "labels", "selectable"}
     if not isinstance(payload, dict) or payload.keys() - allowed:
         raise ValueError("Unknown edit payload fields; expected revision, entities, visualization, observations, actions, components, rewards, add_entities, connections or layout_groups")
     document = SceneDocument(path)
@@ -846,6 +852,11 @@ def apply_edits(path, payload):
         if entity not in document.entities or not isinstance(label, str) or not label.strip():
             raise ValueError('实体显示名称不能为空，且必须引用场景中的实体')
         document.data.setdefault('authoring', {}).setdefault('labels', {})[entity] = label.strip()
+    # Editor-only: whether a click in the 3D view selects the entity (terrain is locked unless set).
+    for entity, selectable in payload.get('selectable', {}).items():
+        if entity not in document.entities or not isinstance(selectable, bool):
+            raise ValueError('selectable maps scene entities to true or false')
+        document.data.setdefault('authoring', {}).setdefault('selectable', {})[entity] = selectable
     if (document.path.parent / 'task.py').is_file() and set(payload) & {'variables', 'task'}:
         raise ValueError('Edit the Python task in task.py; Task formulas no longer belong in scene.yaml')
     for field in ('variables', 'task'):

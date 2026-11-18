@@ -1289,6 +1289,273 @@ def mjcf_for(source, *, packages=None, root=None):
                 shutil.rmtree(staging)
     return output / 'mjcf' / f'{source.stem}.xml'
 
+COLLIDER_SUFFIX = '_simplified_collider'  # beside a gprim scene object (_simplify_colliders)
+
+
+def pruned_layer(path, exclude):
+    """``scene_edit_layer`` removing ``exclude`` only."""
+    return scene_edit_layer(path, exclude)
+
+
+def _pose_matrix(pose):
+    from pxr import Gf
+    w, x, y, z = (float(v) for v in pose.get('orientation', (1, 0, 0, 0)))
+    return Gf.Matrix4d().SetRotate(Gf.Quatd(w, x, y, z).GetNormalized()).SetTranslateOnly(
+        Gf.Vec3d(*(float(v) for v in pose['position'])))
+
+
+def scene_edit_layer(path, exclude=(), moved=None):
+    """A cached USD layer over the scene ``path`` with its objects (paths relative to the default prim, see
+    shared/assembly/composition.py) edited as ``usd_object`` says: ``exclude`` deactivates them (both engines
+    skip inactive prims), ``moved`` (object -> ``{'position', 'orientation'}``, its pose in the frame the
+    entity places, as ``object_pose`` reads it) puts them elsewhere, still static. The collider the
+    environment wrapper wrote beside a gprim object follows it either way. Returns the layer path."""
+    from pxr import Gf, Sdf, Usd, UsdGeom
+    path = Path(path).resolve()
+    names = sorted({str(item).strip('/') for item in exclude or ()})
+    moves = {str(name).strip('/'): pose for name, pose in (moved or {}).items()}
+    if any(not name or '..' in name.split('/') for name in [*names, *moves]):
+        raise ValueError(f'{workspace_path(path)}: exclude and moved name prims relative to the default prim')
+    for name, pose in moves.items():
+        if not isinstance(pose, dict) or len(pose.get('position') or ()) != 3 or len(pose.get('orientation', (1, 0, 0, 0))) != 4:
+            raise ValueError(f'{workspace_path(path)}: moved.{name} is {{position: [x, y, z], orientation: [w, x, y, z]}}')
+    stage = Usd.Stage.Open(str(path))
+    top = stage.GetDefaultPrim()
+    if not top:
+        raise ValueError(f'{workspace_path(path)}: no default prim to edit objects of')
+    missing = [name for name in [*names, *moves] if not stage.GetPrimAtPath(top.GetPath().AppendPath(name))]
+    if missing:
+        raise ValueError(f'{workspace_path(path)}: exclude or moved names prims that do not exist: {", ".join(missing[:5])}')
+    key = hashlib.sha256(json.dumps({'source': source_hashes(path), 'exclude': names, 'moved': moves,
+                                     'writer': digest(__file__)}, sort_keys=True).encode()).hexdigest()[:12]
+    output = ROOT / '.cache/usd_pruned' / f'{path.stem}_{key}.usda'
+    if output.is_file():
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateAnonymous('.usda')
+    out = Usd.Stage.Open(layer)
+    out.GetRootLayer().subLayerPaths.append(str(path))
+    out.SetDefaultPrim(out.OverridePrim(top.GetPath()))
+
+    def with_collider(name):
+        prim = stage.GetPrimAtPath(top.GetPath().AppendPath(name))
+        beside = stage.GetPrimAtPath(top.GetPath().AppendPath(name + COLLIDER_SUFFIX))  # a gprim object's collider
+        return [prim, beside] if beside else [prim]
+    for name in names:
+        for prim in with_collider(name):
+            _editable(out, prim, top).SetActive(False)
+    if moves:
+        cache = UsdGeom.XformCache()
+        into_top = cache.GetLocalToWorldTransform(top).GetInverse() * Gf.Matrix4d().SetScale(Gf.Vec3d(*_composed_top_scale(top)))
+        for name, pose in sorted(moves.items()):
+            _, current, _ = _object_placement(stage, name)
+            motion = current.GetInverse() * _pose_matrix(pose)  # row vectors: old placement -> new
+            for prim in with_collider(name):
+                parent = cache.GetLocalToWorldTransform(prim.GetParent()) * into_top
+                local = UsdGeom.Xformable(prim).GetLocalTransformation() * parent * motion * parent.GetInverse()
+                editable = UsdGeom.Xformable(_editable(out, prim, top))
+                editable.ClearXformOpOrder()
+                editable.AddTransformOp(opSuffix='moved').Set(local)
+    del out, stage
+    layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
+    staging = output.with_suffix(f'.{os.getpid()}.usda')
+    layer.Export(str(staging))
+    staging.replace(output)
+    return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateAnonymous('.usda')
+    out = Usd.Stage.Open(layer)
+    out.GetRootLayer().subLayerPaths.append(str(path))
+    out.SetDefaultPrim(out.OverridePrim(top.GetPath()))
+    for name in names:
+        prim = stage.GetPrimAtPath(top.GetPath().AppendPath(name))
+        _editable(out, prim, top).SetActive(False)
+        beside = stage.GetPrimAtPath(top.GetPath().AppendPath(name + COLLIDER_SUFFIX))  # a gprim object's collider
+        if beside:
+            _editable(out, beside, top).SetActive(False)
+    del out, stage, prim
+    layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
+    staging = output.with_suffix(f'.{os.getpid()}.usda')
+    layer.Export(str(staging))
+    staging.replace(output)
+    return output
+
+
+# Shader inputs holding a surface's base colour (lower case) and words naming its texture: UsdPreviewSurface,
+# OmniPBR, the GRScenes MDL materials (BaseColor_Color x BaseColor_Tex, the texture used when IsBaseColorTex
+# is set) and Isaac's MDL instances (Color x BaseColor).
+BASE_COLOR_INPUTS = ('diffusecolor', 'diffuse_color_constant', 'basecolor_color', 'base_color', 'basecolor',
+                     'albedo', 'color')
+BASE_TEXTURE_WORDS = ('basecolor', 'base_color', 'diffuse', 'albedo')
+
+
+def _texture_average(path, cache):
+    if path not in cache:
+        cache[path] = None
+        with contextlib.suppress(Exception):  # unreadable or missing: the constant colour alone
+            from PIL import Image
+            with Image.open(path) as image:
+                image.draft('RGB', (64, 64))  # JPEG: decode at a fraction of the size
+                pixels = image.convert('RGB').resize((8, 8))
+                cache[path] = [sum(channel) / (64 * 255.) for channel in zip(*pixels.getdata())]
+    return cache[path]
+
+
+def base_color(prim, cache=None):
+    """Approximate base colour (r, g, b in 0-1) of a gprim: its bound material's base colour times the
+    average of its base colour texture, else its displayColor; None when it has neither. ``cache`` (a
+    dict) keeps texture averages between calls. For the editor's lightweight meshes, not for rendering."""
+    from pxr import Sdf, UsdGeom, UsdShade
+    cache = {} if cache is None else cache
+    material = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()[0]
+    shader = None
+    if material:
+        shader = material.ComputeSurfaceSource('mdl')[0] or material.ComputeSurfaceSource()[0]
+    if not shader:
+        shown = UsdGeom.PrimvarsAPI(prim).GetPrimvar('displayColor')
+        values = shown.ComputeFlattened() if shown and shown.HasValue() else None
+        if not values:
+            return None
+        return [sum(value[i] for value in values) / len(values) for i in range(3)]
+    inputs = {item.GetBaseName().lower(): item for item in shader.GetInputs()}
+    color, texture = None, None
+    for name in BASE_COLOR_INPUTS:
+        source = inputs.get(name)
+        if source is None:
+            continue
+        if source.HasConnectedSource():  # UsdPreviewSurface: diffuseColor from a UsdUVTexture
+            upstream = UsdShade.Shader(source.GetConnectedSources()[0][0].source.GetPrim())
+            file = upstream.GetInput('file') if upstream else None
+            texture = file.Get() if file else None
+            break
+        value = source.Get()
+        if hasattr(value, '__len__') and len(value) >= 3 and not isinstance(value, (str, Sdf.AssetPath)):
+            color = [float(value[i]) for i in range(3)]
+            break
+    if texture is None and (inputs.get('isbasecolortex') is None or inputs['isbasecolortex'].Get()):
+        texture = next((item.Get() for name, item in inputs.items() if any(word in name for word in BASE_TEXTURE_WORDS)
+                        and isinstance(item.Get(), Sdf.AssetPath)), None)
+    average = None
+    if isinstance(texture, Sdf.AssetPath) and texture.resolvedPath:
+        average = _texture_average(texture.resolvedPath, cache)
+    if color is None and average is None:
+        return None
+    return [a * b for a, b in zip(color or (1., 1., 1.), average or (1., 1., 1.))]
+
+
+def authored_top_scale(path):
+    """Scale the file authors on its default prim (e.g. 0.01, the unit conversion of a centimetre
+    environment wrapper), as (x, y, z): Isaac Lab replaces the top prim's transform with the spawn pose
+    and scale, so usd_object multiplies this one back in."""
+    from pxr import Sdf
+    scale = (1., 1., 1.)
+    layer = Sdf.Layer.FindOrOpen(str(path))
+    top = layer.GetPrimAtPath(layer.defaultPrim) if layer and layer.defaultPrim else None
+    order = top.attributes.get('xformOpOrder') if top else None
+    for name in (order.default or []) if order else []:
+        if name.startswith('xformOp:scale') and (op := top.attributes.get(name)) and op.default is not None:
+            authored = op.default
+            authored = tuple(authored) if hasattr(authored, '__len__') else (authored,) * 3
+            scale = tuple(a * float(b) for a, b in zip(scale, authored))
+    return scale
+
+
+def _composed_top_scale(top):
+    """``authored_top_scale`` of an open stage's default prim, through its sublayers and references."""
+    from pxr import UsdGeom
+    scale = (1., 1., 1.)
+    for op in UsdGeom.Xformable(top).GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeScale and op.Get() is not None:
+            scale = tuple(a * float(b) for a, b in zip(scale, op.Get()))
+    return scale
+
+
+def _object_placement(stage, prim):
+    """(object prim, its pose in the frame usd_object spawns the file in as a rigid Gf.Matrix4d, and
+    the matrix from the object's parent to that pose) for ``prim`` relative to the default prim."""
+    from pxr import Gf, UsdGeom
+    top = stage.GetDefaultPrim()
+    target = stage.GetPrimAtPath(top.GetPath().AppendPath(prim)) if top else None
+    if not target:
+        raise ValueError(f'{prim}: no such prim below the default prim')
+    cache = UsdGeom.XformCache()
+    scale = Gf.Matrix4d().SetScale(Gf.Vec3d(*_composed_top_scale(top)))
+    placed = cache.GetLocalToWorldTransform(target) * cache.GetLocalToWorldTransform(top).GetInverse() * scale
+    pose = Gf.Matrix4d().SetRotate(placed.RemoveScaleShear().ExtractRotationQuat()) \
+        .SetTranslateOnly(placed.ExtractTranslation())
+    local = UsdGeom.Xformable(target).GetLocalTransformation()
+    return target, pose, local.GetInverse() * placed * pose.GetInverse()
+
+
+@functools.lru_cache(maxsize=8)
+def _scene_stage(path, _mtime):
+    from pxr import Usd
+    return Usd.Stage.Open(path)
+
+
+def object_pose(path, prim):
+    """``{'position', 'orientation'}`` (m, wxyz) of the scene object ``prim`` (relative to the default
+    prim) in the frame a ``usd_object`` of ``path`` places at its entity pose: where the entity of
+    ``usd_object(path, prim=prim)`` goes to keep the object in place."""
+    path = Path(path).resolve()
+    stage = _scene_stage(str(path), path.stat().st_mtime_ns)
+    _, pose, _ = _object_placement(stage, str(prim).strip('/'))
+    q = pose.ExtractRotationQuat()
+    return {'position': [round(v, 6) for v in pose.ExtractTranslation()],
+            'orientation': [round(q.GetReal(), 8), *(round(v, 8) for v in q.GetImaginary())]}
+
+
+def object_layer(path, prim, convex=False):
+    """A cached USD layer holding only the scene object ``prim`` of ``path`` (relative to its default prim),
+    for ``usd_object(prim=...)``: an object taken out of an imported scene (a chair of a house) to be
+    moved, simulated or used by the Task. Its origin is the object's own pose (``object_pose``); units and
+    the transforms of the scene above it are on an inner prim, since Isaac Lab replaces the top prim's
+    transform. The simplified collider the environment wrapper wrote beside a gprim object comes along.
+    ``convex`` approximates its triangle-mesh colliders by convex hulls, which PhysX needs on a dynamic
+    body. Returns the layer path."""
+    from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+    path, prim = Path(path).resolve(), str(prim).strip('/')
+    if not prim or '..' in prim.split('/'):
+        raise ValueError(f'{workspace_path(path)}: prim is a path relative to the default prim')
+    key = hashlib.sha256(json.dumps({'source': source_hashes(path), 'prim': prim, 'convex': bool(convex),
+                                     'writer': digest(__file__)}, sort_keys=True).encode()).hexdigest()[:12]
+    output = ROOT / '.cache/usd_objects' / f'{path.stem}_{prim.rpartition("/")[2][:40]}_{key}.usda'
+    if output.is_file():
+        return output
+    stage = Usd.Stage.Open(str(path))
+    try:
+        target, _, frame = _object_placement(stage, prim)
+    except ValueError as error:
+        raise ValueError(f'{workspace_path(path)}: {error}') from None
+    beside = stage.GetPrimAtPath(target.GetPath().GetParentPath().AppendChild(target.GetName() + COLLIDER_SUFFIX))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateAnonymous('.usda')
+    out = Usd.Stage.Open(layer)
+    UsdGeom.SetStageUpAxis(out, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(out, 1.0)
+    out.SetDefaultPrim(UsdGeom.Xform.Define(out, '/Object').GetPrim())
+    UsdGeom.Xform.Define(out, '/Object/frame').AddTransformOp().Set(frame)
+    # Absolute while composing here (an anonymous layer resolves nothing relative), relative in the file.
+    holders = {'/Object/frame/object': target.GetPath()}
+    if beside:
+        holders['/Object/frame/collider'] = beside.GetPath()
+    for holder, source in holders.items():
+        out.DefinePrim(holder).GetReferences().AddReference(str(path), source)
+    if convex:
+        for part in Usd.PrimRange(out.GetPrimAtPath('/Object')):
+            if part.IsA(UsdGeom.Mesh) and part.HasAPI(UsdPhysics.CollisionAPI):
+                UsdPhysics.MeshCollisionAPI.Apply(out.OverridePrim(part.GetPath())).CreateApproximationAttr(
+                    UsdPhysics.Tokens.convexHull)
+    del out, stage, target, beside
+    for holder, source in holders.items():
+        layer.GetPrimAtPath(holder).referenceList.prependedItems = [
+            Sdf.Reference(os.path.relpath(path, output.parent), source)]
+    staging = output.with_suffix(f'.{os.getpid()}.usda')
+    layer.Export(str(staging))
+    staging.replace(output)
+    return output
+
+
 def joint_spring_layer(path, springs):
     """A cached USD layer over ``path`` whose named joints get these drive springs (``usd_object.springs``).
 
@@ -1337,7 +1604,8 @@ def joint_spring_layer(path, springs):
     output.parent.mkdir(parents=True, exist_ok=True)
     layer = Sdf.Layer.CreateAnonymous('.usda')
     out = Usd.Stage.Open(layer)
-    out.GetRootLayer().subLayerPaths.append(os.path.relpath(path, output.parent))
+    # Absolute while edited in memory (an anonymous layer has no directory), relative once written.
+    out.GetRootLayer().subLayerPaths.append(str(path))
     if stage.GetDefaultPrim():
         out.SetDefaultPrim(out.OverridePrim(stage.GetDefaultPrim().GetPath()))
     for name, edit in edits.items():
@@ -1352,6 +1620,8 @@ def joint_spring_layer(path, springs):
         if not prim.HasAPI(UsdPhysics.DriveAPI, token):
             drive.CreateTypeAttr('force')
             drive.CreateMaxForceAttr(float('inf'))
+    del out, stage, joints  # no stage recomposes the layer once its path turns relative
+    layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
     staging = output.with_suffix(f'.{os.getpid()}.usda')
     layer.Export(str(staging))
     staging.replace(output)
@@ -1849,7 +2119,11 @@ def _simplify_colliders(out, top, cell, editable, source, units, tile=8.0):
     repeated triangles dropped), merged into one invisible collider per `tile` m square: Newton holds static
     triangle meshes per shape and per triangle, and a furnished GRScenes home has 4400 collider meshes of
     35 M triangles (beyond 20 GB at MuJoCo conversion). The original meshes stay as visuals. Geometry is in
-    the frame of `top`, whose length unit is `units` m."""
+    the frame of `top`, whose length unit is `units` m.
+
+    Colliders of one scene object (shared/assembly/composition.py: a wall, a cabinet) stay with it, as one
+    simplified mesh below the object's prim, so removing the object (``usd_object.exclude``) removes its
+    collision too; only colliders outside every object are merged into tiles."""
     import numpy as np
     from pxr import Gf, Usd, UsdGeom, UsdPhysics
     report = {'cell': cell, 'tile': tile}
@@ -1857,7 +2131,9 @@ def _simplify_colliders(out, top, cell, editable, source, units, tile=8.0):
     cache = UsdGeom.XformCache()
     into_top = cache.GetLocalToWorldTransform(out.GetPrimAtPath(top.GetPath())).GetInverse()
     footprints = top.GetPath().AppendChild('footprint_colliders')
-    tiles, found, before = {}, [], 0
+    from shared.assembly.composition import object_of, objects_below
+    objects = objects_below(out.GetPrimAtPath(top.GetPath()))
+    tiles, owned, found, before = {}, {}, [], 0
     for prim in Usd.PrimRange(out.GetPrimAtPath(top.GetPath()), Usd.TraverseInstanceProxies()):
         if prim.GetPath().HasPrefix(footprints) or not prim.IsA(UsdGeom.Mesh) or \
                 not prim.HasAPI(UsdPhysics.CollisionAPI) or not _mesh_has_geometry(prim):
@@ -1873,6 +2149,10 @@ def _simplify_colliders(out, top, cell, editable, source, units, tile=8.0):
         if not len(triangles):
             continue
         vertices = cells * cell
+        owner = object_of(str(prim.GetPath().MakeRelativePath(top.GetPath())), objects)
+        if owner is not None:
+            owned.setdefault(owner, []).append((vertices, triangles))
+            continue
         keys = np.floor(vertices[triangles].mean(1)[:, :2] / tile).astype(np.int64)
         for key in np.unique(keys, axis=0):
             tiles.setdefault(tuple(key), []).append((vertices, triangles[np.all(keys == key, axis=1)]))
@@ -1880,24 +2160,46 @@ def _simplify_colliders(out, top, cell, editable, source, units, tile=8.0):
         prim = editable(source.GetPrimAtPath(path))
         prim.RemoveAPI(UsdPhysics.MeshCollisionAPI)
         prim.RemoveAPI(UsdPhysics.CollisionAPI)
-    holder = UsdGeom.Scope.Define(out, top.GetPath().AppendChild('simplified_colliders'))
-    UsdGeom.Imageable(holder).CreatePurposeAttr(UsdGeom.Tokens.guide)
     after = 0
-    for (x, y), parts in sorted(tiles.items()):
+
+    def merged(parts):
         used = [np.unique(triangles) for _, triangles in parts]
         offsets = np.cumsum([0] + [len(index) for index in used])
         points = np.concatenate([vertices[index] for (vertices, _), index in zip(parts, used)])
         faces = np.concatenate([np.searchsorted(index, triangles) + offset
                                 for (_, triangles), index, offset in zip(parts, used, offsets)])
-        mesh = UsdGeom.Mesh.Define(out, holder.GetPath().AppendChild(f'tile_{x}_{y}'.replace('-', 'm')))
+        return points, faces
+
+    def collider(mesh, points, faces):
         mesh.CreatePointsAttr([Gf.Vec3f(*point) for point in points.tolist()])
         mesh.CreateFaceVertexCountsAttr([3] * len(faces))
         mesh.CreateFaceVertexIndicesAttr(faces.reshape(-1).tolist())
+        UsdGeom.Imageable(mesh).CreatePurposeAttr(UsdGeom.Tokens.guide)
         UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
         UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr(UsdPhysics.Tokens.none)
-        after += len(faces)
+        return len(faces)
+    for name, parts in sorted(owned.items()):
+        path = top.GetPath().AppendPath(name)
+        editable(source.GetPrimAtPath(path))  # ordinary prims down to the object
+        if source.GetPrimAtPath(path).IsInstance():
+            out.OverridePrim(path).SetInstanceable(False)
+        # Below an Xform object; beside a gprim object (gprims do not nest), removed with it (pruned_layer).
+        gprim = out.GetPrimAtPath(path).IsA(UsdGeom.Gprim)
+        holder = path.GetParentPath() if gprim else path
+        mesh = UsdGeom.Mesh.Define(out, holder.AppendChild(f'{path.name}{COLLIDER_SUFFIX}' if gprim else 'simplified_collider'))
+        # Points stay in the frame of `top`: undo the placement of the prim holding the collider.
+        fresh = UsdGeom.XformCache()
+        to_top = fresh.GetLocalToWorldTransform(out.GetPrimAtPath(holder)) * \
+            fresh.GetLocalToWorldTransform(out.GetPrimAtPath(top.GetPath())).GetInverse()
+        mesh.AddTransformOp().Set(to_top.GetInverse())
+        after += collider(mesh, *merged(parts))
+    holder = UsdGeom.Scope.Define(out, top.GetPath().AppendChild('simplified_colliders'))
+    UsdGeom.Imageable(holder).CreatePurposeAttr(UsdGeom.Tokens.guide)
+    for (x, y), parts in sorted(tiles.items()):
+        mesh = UsdGeom.Mesh.Define(out, holder.GetPath().AppendChild(f'tile_{x}_{y}'.replace('-', 'm')))
+        after += collider(mesh, *merged(parts))
     return {**report, 'meshes': len(found), 'triangles_before': before, 'triangles_after': after,
-            'tiles': len(tiles)}
+            'tiles': len(tiles), 'object_colliders': len(owned)}
 
 
 def _cluster_triangles(points, triangles, cap):

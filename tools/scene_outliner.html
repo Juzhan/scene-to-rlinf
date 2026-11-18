@@ -6,7 +6,9 @@
      The editor embeds it as an iframe srcdoc (same origin as the editor) and replaces __LIBRARY_PORT__;
      rows and actions go to tools/simready_library.py (/api/outliner/), which asks Editor.outliner_*.
      Switches: eye = shown in the editor only (never saved); camera = rendered (scene.yaml visible, or
-     visualization.abstract for abstract entities); physics = moves under forces or not (kinematic / fixed). -->
+     visualization.abstract for abstract entities); physics = moves under forces or not (kinematic / fixed).
+     An imported scene (a house, a warehouse) expands into its objects (shared/assembly/composition.py):
+     folders and objects can be hidden in the editor or removed from the scene (usd_object.exclude). -->
 <style>
 :root { --accent: #2e6edc; --line: #e3e6ea; --muted: #6b7280; --sel: rgba(255,170,40,.28); --selh: rgba(255,170,40,.36); }
 * { box-sizing: border-box; }
@@ -22,12 +24,15 @@ header { flex: none; padding: 2px 4px 6px; }
 .row:hover { background: rgba(128,128,128,.12); }
 .row.sel { background: var(--sel); font-weight: 600; }
 .row.sel:hover { background: var(--selh); }
+.row.also { font-weight: 400; background: rgba(255,170,40,.16); }
 .row .kind { flex: none; width: 16px; height: 16px; color: #6b7280; }
 .row.sel .kind { color: #b35c00; }
 .row .label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .row.dim .label, .row.dim .kind { opacity: .45; }
 .tag { flex: none; font-size: 10.5px; font-weight: 400; color: var(--muted); padding: 0 5px; border-radius: 8px; background: #eef0f3; }
 .tag.motion { color: #b35c00; background: #fff1e0; }
+.row.drop { box-shadow: inset 0 0 0 2px var(--accent); background: #eef3fd; }
+#list.drop-root { box-shadow: inset 0 0 0 2px #adb5bd; border-radius: 6px; }
 .dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: #2f9e44; }
 .switches { flex: none; display: flex; gap: 1px; margin-left: 4px; }
 .sw { width: 24px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #495057;
@@ -35,10 +40,27 @@ header { flex: none; padding: 2px 4px 6px; }
 .sw:hover { background: rgba(0,0,0,.08); }
 .sw svg { width: 16px; height: 16px; }
 .sw.off { color: #adb5bd; }
+.sw.faint { color: #ced4da; }
+.row:hover .sw.faint { color: #868e96; }
+.sw.locked { color: #c2410c; }
 .sw.blank { visibility: hidden; pointer-events: none; }
 .sw.dynamic { color: #2e6edc; }
 .sw.kinematic { color: #d9480f; }
 .sw.fixed, .sw.static { color: #868e96; }
+.caret { flex: none; width: 14px; height: 16px; margin-right: -3px; display: grid; place-items: center; color: #868e96; border-radius: 4px; }
+.caret svg { width: 12px; height: 12px; transition: transform .12s; }
+.caret.open svg { transform: rotate(90deg); }
+.caret:hover { background: rgba(0,0,0,.08); color: #343a40; }
+.caret.none { visibility: hidden; }
+.row.obj { height: 23px; font-size: 12px; }
+.row.obj .kind { width: 14px; height: 14px; }
+.row.obj.more .label { color: var(--accent); }
+.row.obj.removed .label { text-decoration: line-through; color: #adb5bd; }
+.row.obj.removed .kind { opacity: .35; }
+.sw.remove { color: #ced4da; }
+.row:hover .sw.remove { color: #868e96; }
+.sw.remove:hover { color: #c92a2a !important; }
+.sw.restore { color: #2f9e44; }
 #empty { display: none; padding: 14px 8px; color: var(--muted); }
 #message { display: none; margin: 0 4px 4px; padding: 4px 8px; border-radius: 6px; font-size: 11.5px; color: #c92a2a; background: #fff5f5; }
 #offline { display: none; padding: 14px 8px; color: #c92a2a; }
@@ -69,19 +91,36 @@ const KINDS = {
 };
 const EYE = svg('<path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/>');
 const EYE_OFF = svg('<path d="M3 3l18 18M10.6 6.1A9.7 9.7 0 0 1 12 6c6 0 9.5 6 9.5 6a17 17 0 0 1-3 3.7M6.6 6.6C4 8.3 2.5 12 2.5 12S6 18 12 18c1.6 0 3-.4 4.3-1"/>');
+// Blender's "selectable" arrow: off = locked, a click in the view goes through it (floors, terrain).
+const SELECT = svg('<path d="M6 3l12 9-5.5 1.2L16 20l-2.6 1.2-3.3-6.7L6 18z"/>');
+const SELECT_OFF = svg('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>');
 const RENDER = svg('<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.2"/>');
 const RENDER_OFF = svg('<path d="M3 3l18 18M8 5h7l2 3h3v10M17 19H4V8h3"/><path d="M9.8 10.9a3.2 3.2 0 0 0 4.3 4.3"/>');
+const CARET = svg('<path d="M9 6l6 6-6 6"/>');
+const TRASH = svg('<path d="M4 7h16M10 11v6M14 11v6M5 7l1 13h12l1-13M9 7V4h6v3"/>');
+const RESTORE = svg('<path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/>');
+const OBJECT_KINDS = {
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  object: KINDS.box, light: KINDS.bulb,
+};
 const PHYSICS = {
   dynamic: svg('<circle cx="12" cy="7.5" r="4"/><path d="M12 14v7M8.5 17.5L12 21l3.5-3.5"/>'),            // falls: gravity
   kinematic: svg('<rect x="3" y="8" width="10" height="9" rx="1.5"/><path d="M16 12.5h5M18.5 10l2.5 2.5-2.5 2.5"/>'),  // moved for it
   fixed: svg('<circle cx="12" cy="4.5" r="1.6"/><path d="M12 6v14M8 9h8M5 13a7 7 0 0 0 14 0"/>'),       // anchored
-  static: svg('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>'),
+  static: svg('<rect x="3" y="6" width="18" height="12" rx="1"/><path d="M3 12h18M9 6v6M15 12v6"/>'),  // a wall: no body
 };
 
 let revision = null, rows = [], failures = 0;
-const filterKey = 'rlinf-outliner.filter';
+const filterKey = 'rlinf-outliner.filter', openKey = 'rlinf-outliner.open';
 const store = (() => { try { return embedded ? parent.sessionStorage : sessionStorage; } catch { return null; } })();
 $('filter').value = (store && store.getItem(filterKey)) || '';
+// Expanded rows: 'entity:<path>' for an imported scene, '<entity id>|<folder id>' for its folders.
+const opened = new Set(JSON.parse((store && store.getItem(openKey)) || '[]'));
+const saveOpened = () => { if (store) store.setItem(openKey, JSON.stringify([...opened])); };
+const objects = {};  // entity row id -> {revision, rows} of its scene objects (fetched when expanded)
+let followed = null; // the object last revealed after a click in the 3D view
+const PAGE = 200;    // rows listed per folder before a "more" row (GRScenes shops: 7 000 objects in one folder)
+const listed = {};   // '<entity>|<folder>' -> rows listed
 
 async function api(path, body) {
   const response = await fetch(API + 'api/outliner/' + path, body === undefined ? {} :
@@ -101,29 +140,122 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 }
 
+function entityRow(r, words) {
+  const physics = r.physics ? `<button class="sw ${r.physics.mode}" data-what="physics" title="${escapeHtml(r.physics.label + '：' + r.physics.hint + '（点击切换）')}">${PHYSICS[r.physics.mode]}</button>`
+                            : '<button class="sw blank"></button>';
+  const renderSw = r.render === null ? '<button class="sw blank"></button>' :
+    `<button class="sw${r.render ? '' : ' off'}" data-what="render" title="${escapeHtml(r.render_hint || '')}">${r.render ? RENDER : RENDER_OFF}</button>`;
+  const lock = r.selectable === null ? '<button class="sw blank"></button>' :
+    `<button class="sw${r.selectable ? ' faint' : ' locked'}" data-what="selectable" title="${r.selectable ? '视图中可点选、可拖动；点击锁定' : '已锁定：视图中点不中、拖不动（列表里仍可选中编辑）；点击解锁'}">${r.selectable ? SELECT : SELECT_OFF}</button>`;
+  const eye = `<button class="sw${r.hidden ? ' off' : ''}" data-what="hidden" title="${r.hidden ? '编辑器中已隐藏（不写入 scene.yaml）' : '编辑器中显示'}">${r.hidden ? EYE_OFF : EYE}</button>`;
+  const caret = r.objects ? `<span class="caret${opened.has(r.id) ? ' open' : ''}" data-open="${escapeHtml(r.id)}" title="展开场景中的物体">${CARET}</span>`
+                          : '<span class="caret none"></span>';
+  const parts = r.objects ? `<span class="tag" title="导入场景中的物体${r.excluded ? `；${r.excluded} 项已移除` : ''}">${r.objects} 件${r.excluded ? ` −${r.excluded}` : ''}</span>` : '';
+  return `<div class="row${r.selected && !r.selected_object ? ' sel' : ''}${r.selected && !r.active ? ' also' : ''}${r.hidden ? ' dim' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(r.hint || '')}" draggable="${r.id.startsWith('entity:')}"
+               style="padding-left:${2 + (words.length ? 0 : r.depth) * 14}px">
+    ${caret}<span class="kind">${svg(KINDS[r.icon] || KINDS.box)}</span>
+    <span class="label">${escapeHtml(r.label)}</span>
+    ${r.note ? `<span class="tag">${escapeHtml(r.note)}</span>` : ''}${parts}
+    ${r.motion ? `<span class="tag motion" title="场景运动">${escapeHtml(r.motion)}</span>` : ''}
+    ${r.changed ? '<span class="dot" title="未保存的修改"></span>' : ''}
+    <span class="switches">${lock}${physics}${renderSw}${eye}</span>
+  </div>`;
+}
+
+function objectRow(entity, o, depth) {
+  const key = `${entity}|${o.id}`, folder = o.kind === 'folder';
+  const caret = folder ? `<span class="caret${opened.has(key) ? ' open' : ''}" data-open="${escapeHtml(key)}">${CARET}</span>` : '<span class="caret none"></span>';
+  const removed = o.excluded || o.removed;
+  const remove = `<button class="sw ${removed ? 'restore' : 'remove'}" data-what="exclude" title="${removed ? '已从场景移除（保存后仿真中也不存在）；点击恢复' : '从场景中移除：编辑器与仿真中都不再有它（保存后写入 exclude）'}">${removed ? RESTORE : TRASH}</button>`;
+  const eye = `<button class="sw${o.hidden ? ' off' : ''}" data-what="hidden" title="${o.hidden ? '编辑器中已隐藏（不写入 scene.yaml）' : '编辑器中显示'}">${o.hidden ? EYE_OFF : EYE}</button>`;
+  return `<div class="row obj${o.selected ? ' sel' : ''}${o.hidden ? ' dim' : ''}${removed ? ' removed' : ''}" data-entity="${escapeHtml(entity)}" data-object="${escapeHtml(o.id)}"
+               title="${escapeHtml(folder ? `${o.id.replace(/ ×$/, '')}（${o.count} 件）` : o.id)}" style="padding-left:${2 + depth * 14}px">
+    ${caret}<span class="kind">${svg(OBJECT_KINDS[o.kind] || KINDS.box)}</span>
+    <span class="label">${escapeHtml(o.label)}</span>
+    ${folder ? `<span class="tag">${o.count}</span>` : ''}
+    <span class="switches">${remove}${eye}</span>
+  </div>`;
+}
+
+// Object rows of an expanded scene below its entity row; a removed folder shows its members as removed.
+function objectRows(entity, depth, words) {
+  const data = objects[entity];
+  if (!data) return [`<div class="row obj dim" style="padding-left:${2 + depth * 14}px"><span class="caret none"></span><span class="label">读取物体列表…</span></div>`];
+  if (words.length) {  // filtering: matching objects, flat
+    return data.rows.filter(o => o.kind !== 'folder' && words.every(w => (o.label + ' ' + o.id).toLowerCase().includes(w)))
+                    .slice(0, 300).map(o => objectRow(entity, o, 1));
+  }
+  const children = {};
+  for (const o of data.rows) (children[o.parent] = children[o.parent] || []).push(o);
+  const roots = children[null] || [];
+  const out = [];
+  const walk = (list, level, removed, parent) => {
+    const key = `${entity}|${parent}`, limit = listed[key] || PAGE;
+    for (const o of list.slice(0, limit)) {
+      const shown = removed ? {...o, removed: true} : o;
+      out.push(objectRow(entity, shown, depth + level));
+      // a single top folder (GRScenes "Meshes") opens by itself
+      if (o.kind === 'folder' && (opened.has(`${entity}|${o.id}`) || (level === 0 && roots.length === 1 && !opened.has(`${entity}|!${o.id}`))))
+        walk(children[o.id] || [], level + 1, removed || o.excluded, o.id);
+    }
+    if (list.length > limit)
+      out.push(`<div class="row obj more" data-more="${escapeHtml(key)}" style="padding-left:${2 + (depth + level) * 14}px">
+        <span class="caret none"></span><span class="label">再显示 ${Math.min(PAGE * 5, list.length - limit)} 件（还有 ${list.length - limit} 件）</span></div>`);
+  };
+  walk(roots, 0, false, null);
+  return out;
+}
+
 function render() {
   const words = $('filter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const shown = words.length ? rows.filter(r => words.every(w => (r.label + ' ' + r.id + ' ' + (r.note || '')).toLowerCase().includes(w))) : rows;
   $('empty').style.display = rows.length ? 'none' : 'block';
-  $('list').innerHTML = shown.map(r => {
-    const physics = r.physics ? `<button class="sw ${r.physics.mode}" data-what="physics" title="${escapeHtml(r.physics.label + '：' + r.physics.hint + '（点击切换）')}">${PHYSICS[r.physics.mode]}</button>`
-                              : '<button class="sw blank"></button>';
-    const renderSw = r.render === null ? '<button class="sw blank"></button>' :
-      `<button class="sw${r.render ? '' : ' off'}" data-what="render" title="${escapeHtml(r.render_hint || '')}">${r.render ? RENDER : RENDER_OFF}</button>`;
-    const eye = `<button class="sw${r.hidden ? ' off' : ''}" data-what="hidden" title="${r.hidden ? '编辑器中已隐藏（不写入 scene.yaml）' : '编辑器中显示'}">${r.hidden ? EYE_OFF : EYE}</button>`;
-    return `<div class="row${r.selected ? ' sel' : ''}${r.hidden ? ' dim' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(r.hint || '')}"
-                 style="padding-left:${4 + (words.length ? 0 : r.depth) * 14}px">
-      <span class="kind">${svg(KINDS[r.icon] || KINDS.box)}</span>
-      <span class="label">${escapeHtml(r.label)}</span>
-      ${r.note ? `<span class="tag">${escapeHtml(r.note)}</span>` : ''}
-      ${r.motion ? `<span class="tag motion" title="场景运动">${escapeHtml(r.motion)}</span>` : ''}
-      ${r.changed ? '<span class="dot" title="未保存的修改"></span>' : ''}
-      <span class="switches">${physics}${renderSw}${eye}</span>
-    </div>`;
-  }).join('');
+  const html = [];
+  for (const r of rows) {
+    const match = !words.length || words.every(w => (r.label + ' ' + r.id + ' ' + (r.note || '')).toLowerCase().includes(w));
+    const inner = r.objects && (opened.has(r.id) || (words.length && objects[r.id])) ? objectRows(r.id, r.depth + 1, words) : [];
+    if (match || inner.length) html.push(entityRow(r, words), ...inner);
+  }
+  $('list').innerHTML = html.join('');
   const selected = $('list').querySelector('.row.sel');
-  if (selected && selected.dataset.id !== render.selected) selected.scrollIntoView({block: 'nearest'});
-  render.selected = selected ? selected.dataset.id : null;
+  const key = selected ? (selected.dataset.id || `${selected.dataset.entity}|${selected.dataset.object}`) : null;
+  if (selected && key !== render.selected) selected.scrollIntoView({block: 'nearest'});
+  render.selected = key;
+}
+
+async function loadObjects(entity) {
+  const path = entity.slice('entity:'.length);
+  try {
+    const data = await api('objects?entity=' + encodeURIComponent(path));
+    objects[entity] = data;
+  } catch (error) { delete objects[entity]; opened.delete(entity); message(error.message); }
+}
+
+// After a click on an object in the 3D view: expand the scene and the folders down to that object.
+function reveal() {
+  const r = rows.find(row => row.selected_object);
+  const key = r ? `${r.id}|${r.selected_object}` : null;
+  if (!r || key === followed) { followed = key; return false; }
+  opened.add(r.id);
+  const data = objects[r.id];
+  if (data) {
+    followed = key;
+    const parent = Object.fromEntries(data.rows.map(o => [o.id, o.parent]));
+    for (let id = parent[r.selected_object]; id; id = parent[id]) { opened.add(`${r.id}|${id}`); opened.delete(`${r.id}|!${id}`); }
+    for (let id = r.selected_object; id; id = parent[id]) {  // list far enough to show it
+      const siblings = data.rows.filter(o => o.parent === parent[id]);
+      const key = `${r.id}|${parent[id] ?? null}`, at = siblings.findIndex(o => o.id === id) + 1;
+      if (at > (listed[key] || PAGE)) listed[key] = Math.ceil(at / PAGE) * PAGE;
+    }
+  }
+  saveOpened();
+  return true;
+}
+
+async function update() {
+  // Objects of every expanded scene follow the editor's revision (removals, hidden, selection).
+  const wanted = rows.filter(r => r.objects && (opened.has(r.id) || r.selected_object || $('filter').value.trim()));
+  await Promise.all(wanted.filter(r => !objects[r.id] || objects[r.id].revision !== revision).map(r => loadObjects(r.id)));
+  if (reveal()) await update(); else render();
 }
 
 async function refresh() {
@@ -131,8 +263,8 @@ async function refresh() {
     const data = await api('state' + (revision === null ? '' : `?revision=${revision}`));
     failures = 0;
     $('offline').style.display = 'none';
-    if (data.rows) { rows = data.rows; render(); }
     revision = data.revision;
+    if (data.rows) { rows = data.rows; await update(); }
   } catch (error) {
     if (++failures > 2) $('offline').style.display = 'block';
   }
@@ -142,22 +274,89 @@ async function refresh() {
 async function act(path, body) {
   try {
     const data = await api(path, body);
-    rows = data.rows; revision = data.revision; render();
+    rows = data.rows; revision = data.revision; await update();
   } catch (error) { message(error.message); }
 }
 
+function toggleOpen(key) {
+  const [entity, folder] = key.split('|');
+  const auto = folder !== undefined && `${entity}|!${folder}`;
+  if (opened.has(key)) opened.delete(key);
+  else if (auto && !opened.has(auto) && isAutoOpen(entity, folder)) opened.add(auto);  // close the self-opened top folder
+  else { opened.add(key); if (auto) opened.delete(auto); }
+  saveOpened();
+  update();
+}
+function isAutoOpen(entity, folder) {
+  const roots = (objects[entity] ? objects[entity].rows : []).filter(o => o.parent === null);
+  return roots.length === 1 && roots[0].id === folder;
+}
+
 $('list').addEventListener('click', event => {
+  const caret = event.target.closest('.caret[data-open]');
+  if (caret) { toggleOpen(caret.dataset.open); return; }
+  const more = event.target.closest('.row[data-more]');
+  if (more) { listed[more.dataset.more] = (listed[more.dataset.more] || PAGE) + PAGE * 5; render(); return; }
   const row = event.target.closest('.row');
   if (!row) return;
   const button = event.target.closest('.sw');
+  if (row.dataset.object !== undefined) {
+    const body = {id: row.dataset.entity, object: row.dataset.object};
+    if (button) act('toggle_object', {...body, what: button.dataset.what}); else act('select_object', body);
+    return;
+  }
   if (button) { act('toggle', {id: row.dataset.id, what: button.dataset.what}); return; }
+  // Like Blender's outliner: Ctrl/Cmd-click adds or drops a row, Shift-click selects the rows in between.
+  if (event.ctrlKey || event.metaKey) { act('select', {id: row.dataset.id, mode: 'toggle'}); return; }
+  if (event.shiftKey) {
+    const ids = [...$('list').querySelectorAll('.row[data-id]')].map(r => r.dataset.id);
+    const active = (rows.find(r => r.active) || {}).id;
+    const [a, b] = [ids.indexOf(active), ids.indexOf(row.dataset.id)];
+    const span = a < 0 ? [row.dataset.id] : ids.slice(Math.min(a, b), Math.max(a, b) + 1);
+    act('select', {id: row.dataset.id, mode: 'range', ids: span});
+    return;
+  }
   act('select', {id: row.dataset.id});
 });
 $('list').addEventListener('dblclick', event => {
   const row = event.target.closest('.row');
-  if (row && !event.target.closest('.sw')) act('focus', {id: row.dataset.id});
+  if (!row || event.target.closest('.sw') || event.target.closest('.caret')) return;
+  if (row.dataset.object !== undefined) act('select_object', {id: row.dataset.entity, object: row.dataset.object, focus: true});
+  else act('focus', {id: row.dataset.id});
 });
-$('filter').addEventListener('input', () => { if (store) store.setItem(filterKey, $('filter').value); render(); });
+// Drag a row onto another: a sensor is mounted on it, an abstract entity follows it, anything else is laid
+// out with it (no physical joint). Dropped on empty space, the row is detached. World poses are kept.
+const ROW = 'application/x-rlinf-outliner-row';
+let dragged = null;
+const clearDrop = () => { for (const element of document.querySelectorAll('.drop')) element.classList.remove('drop');
+                          $('list').classList.remove('drop-root'); };
+$('list').addEventListener('dragstart', event => {
+  const row = event.target.closest('.row');
+  if (!row || !row.dataset.id) return;
+  dragged = row.dataset.id;
+  event.dataTransfer.setData(ROW, dragged);
+  event.dataTransfer.effectAllowed = 'link';
+});
+$('list').addEventListener('dragover', event => {
+  if (!dragged) return;
+  event.preventDefault();
+  clearDrop();
+  if (event.target.closest('.row.obj')) return;  // objects of a scene are not drop targets
+  const row = event.target.closest('.row[data-id]');
+  if (row && row.dataset.id !== dragged) row.classList.add('drop'); else if (!row) $('list').classList.add('drop-root');
+});
+$('list').addEventListener('dragleave', event => { if (event.target === $('list')) clearDrop(); });
+$('list').addEventListener('drop', event => {
+  if (!dragged) return;
+  event.preventDefault();
+  const row = event.target.closest('.row[data-id]'), source = dragged;
+  clearDrop(); dragged = null;
+  if (event.target.closest('.row.obj')) return;
+  if (row && row.dataset.id === source) return;
+  act('bind', {id: source, target: row ? row.dataset.id : null});
+});
+$('list').addEventListener('dragend', () => { clearDrop(); dragged = null; });
+$('filter').addEventListener('input', () => { if (store) store.setItem(filterKey, $('filter').value); update(); });
 
 // Keys pressed while the outliner has focus still reach the editor's shortcuts (H, F, Ctrl+S, Ctrl+Z, Esc).
 document.addEventListener('keydown', event => {

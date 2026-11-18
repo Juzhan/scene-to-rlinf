@@ -71,3 +71,6 @@ events.out.tfevents.*
 *.gif
 *.pptx
 MUJOCO_LOG.TXT
+
+# Personal Claude Code permissions
+.claude/settings.local.json

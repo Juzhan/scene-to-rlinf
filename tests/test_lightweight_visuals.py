@@ -87,3 +87,46 @@ def test_whole_scene_previews_merge_parts_per_body_and_ignore_a_sky_dome(tmp_pat
     # the grid follows the props, not the dome: props keep sub-decimetre detail
     near = vertices[np.abs(vertices).max(1) < 100]
     assert len(near) > 1000 and near.min(0)[0] < -.05 and near.max(0)[0] > rows - 1 + .05
+
+
+def test_part_colours_survive_the_mesh_source_and_join_by_triangles(tmp_path):
+    from shared.assembly.mesh_preview import mean_color, read_mesh_source
+    parts = [{**cube('wood'), 'color': [.8, .6, .4]}, {**sphere('glass', 8, 4), 'color': None}]
+    with (tmp_path / 'scene.mesh.npz').open('wb') as stream:
+        write_mesh_source(stream, parts, {}, [], objects=True)
+    read = read_mesh_source(tmp_path / 'scene.mesh.npz')['parts']
+    assert read[0]['color'] == [.8, .6, .4] and read[1]['color'] is None
+    red = {'color': [1., 0., 0.], 'faces': np.zeros((3, 3))}
+    blue = {'color': [0., 0., 1.], 'faces': np.zeros((1, 3))}
+    assert mean_color([red, blue, {'color': None, 'faces': np.zeros((9, 3))}]) == [.75, 0., .25]
+    assert mean_color([{'color': None, 'faces': np.zeros((1, 3))}]) is None
+
+
+def test_scene_objects_keep_their_own_detail_up_to_a_cap(monkeypatch):
+    import shared.assembly.mesh_preview as preview
+    from shared.assembly.mesh_preview import OBJECT_TRIANGLES, part_targets
+    sofa = sphere('sofa', 256, 128, radius=1.)      # 65 536 triangles: capped
+    kettle = sphere('kettle', 64, 32, radius=.1)    # 4 096: kept whole, however large the scene
+    wall = cube('wall', size=4.)
+    targets = part_targets({'parts': [sofa, kettle, wall], 'objects': True})
+    assert targets == [OBJECT_TRIANGLES, len(kettle['faces']), 12]
+    monkeypatch.setattr(preview, 'SCENE_CEILING', 12000)  # only a scene beyond the ceiling scales down
+    sofa_target, kettle_target, _ = part_targets({'parts': [sofa, kettle, wall], 'objects': True})
+    assert sofa_target + kettle_target <= 12000 and sofa_target / kettle_target == pytest.approx(OBJECT_TRIANGLES / 4096, rel=.01)
+
+
+@pytest.mark.skipif(not __import__('importlib').util.find_spec('fast_simplification'), reason='no fast_simplification')
+def test_quadric_simplification_reaches_the_budget_of_a_part_made_of_many_pieces():
+    from shared.assembly.mesh_preview import simplify_part
+    body = sphere('body', 128, 64, radius=.5)
+    # 2 000 screws: separate pieces that collapse cannot join, each keeping its triangles.
+    screws = [cube(f's{i}', size=.004) for i in range(2000)]
+    offsets = np.random.default_rng(0).uniform(-.5, .5, (2000, 3))
+    vertices = [body['vertices']] + [s['vertices'] + o for s, o in zip(screws, offsets)]
+    starts = np.cumsum([0] + [len(v) for v in vertices[:-1]])
+    faces = np.concatenate([body['faces']] + [s['faces'] + start for s, start in zip(screws, starts[1:])])
+    reduced, kept = simplify_part(np.concatenate(vertices), faces, 1500)
+    assert len(kept) <= 1500 * 2
+    # The body is kept: its points stay on the sphere.
+    radius = np.linalg.norm(reduced[np.unique(kept)], axis=1)
+    assert (np.abs(radius - .5) < .02).mean() > .9

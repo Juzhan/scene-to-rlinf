@@ -108,8 +108,9 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
     attach_task(output, prepared.terms['object_api'], settings)
     output['terminations']['workspace_time_limit'] = TerminationTermCfg(func=mdp.time_out, time_out=True)
     commands = {}
-    attach_abstract(commands, settings, visualize=visualize)
-    attach_kinematic(commands, settings)
+    package = prepared.terms['object_api']['module']  # custom scene motion lives in the project
+    attach_abstract(commands, settings, visualize=visualize, package=package)
+    attach_kinematic(commands, settings, package=package)
     decimation = settings['world']['decimation']
     # Managers set attributes such as debug_vis on their cfg, so terms go in attribute containers.
     terms = lambda entries: SimpleNamespace(**entries)

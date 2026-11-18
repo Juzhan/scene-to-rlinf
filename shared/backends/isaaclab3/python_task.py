@@ -18,6 +18,14 @@ def task_set(env, name):
     return None if runtime is None else runtime.take(name)
 
 
+def scene_info(env):
+    """The Task's SceneInfo view of the live scene, for custom scene motion (shared/assembly/motion.py)."""
+    runtime = getattr(env, '_assembly_python_task', None)
+    if runtime is None:
+        raise ValueError('custom motion runs after the Task: the Task runtime has not evaluated yet')
+    return runtime.info()
+
+
 def evaluate(env, config, settings, field):
     runtime = getattr(env, '_assembly_python_task', None)
     if runtime is None:

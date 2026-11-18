@@ -39,7 +39,9 @@ def _config_type():
 
         def __init__(self, cfg, env):
             super().__init__(cfg, env)
-            self.state = AbstractState(cfg.entity, cfg.areas, self.num_envs, self.device)
+            from .python_task import scene_info
+            self.state = AbstractState(cfg.entity, cfg.areas, self.num_envs, self.device, package=cfg.package,
+                                       scene=lambda: scene_info(env))
 
         @property
         def command(self):
@@ -86,11 +88,12 @@ def _config_type():
         class_type: type = AbstractPose
         entity: dict = None
         areas: dict = None
+        package: str = None
         marker_path: str = '/Visuals/Abstract'
     return AbstractPoseCfg
 
 
-def attach_abstract(commands, settings, *, visualize=False):
+def attach_abstract(commands, settings, *, visualize=False, package=None):
     """Command terms for commanded abstract entities and, with ``visualize``, shown ones."""
     from shared.assembly.abstract import abstract_entities, commanded, commanded_entity, reset_areas
     from shared.assembly.targets import visualization
@@ -104,7 +107,7 @@ def attach_abstract(commands, settings, *, visualize=False):
             raise ValueError('Reserved abstract command name: ' + key)
         seconds = node.reset.interval if node.reset is not None and node.reset.interval else 1e9
         commands[key] = _config_type()(
-            entity=commanded_entity(settings, node), areas=areas,
+            entity=commanded_entity(settings, node), areas=areas, package=package,
             resampling_time_range=(seconds, seconds), debug_vis=node.name in shown, marker_path='/Visuals/' + key)
 
 
