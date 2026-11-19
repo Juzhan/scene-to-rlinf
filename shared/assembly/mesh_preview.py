@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 3  # 2: quadric collapse; 3: a triangle cap per object, not a scene budget
+VERSION = 4  # 2: quadric collapse; 3: a triangle cap per object, not a scene budget; 4: textures
 TRIANGLE_BUDGET = 60000
 MIN_PART_TRIANGLES = 256
 # Beyond this many parts (a whole indoor scene exports ~20 000) parts of one body are merged before simplifying.
@@ -36,16 +36,36 @@ def mean_color(parts):
     return [round(sum(color[i] * weight for color, weight in coloured) / total, 4) for i in range(3)]
 
 
+def join_surfaces(parts):
+    """``{'uv', 'pieces'}`` of parts joined in order (their faces one after another): ``pieces`` lists each
+    part's surfaces as face runs ``{'faces', 'texture', 'tint', 'color'}``; ``uv`` (N, 2) covers the joined
+    vertices (zeros where a part has none). Both None when no part has a surface."""
+    if not any(part.get('pieces') for part in parts):
+        return {'uv': None, 'pieces': None}
+    pieces, uv = [], []
+    for part in parts:
+        pieces += part.get('pieces') or [{'faces': len(part['faces']), 'texture': None, 'tint': None,
+                                          'color': part.get('color')}]
+        part_uv = part.get('uv')
+        uv.append(np.asarray(part_uv, dtype=np.float32).reshape(-1, 2) if part_uv is not None
+                  else np.zeros((len(part['vertices']), 2), dtype=np.float32))
+    return {'uv': np.concatenate(uv) if any(part.get('uv') is not None for part in parts) else None, 'pieces': pieces}
+
+
 def write_mesh_source(stream, parts, frames, joints, objects=False):
     """parts: [{'name', 'vertices' (N, 3), 'faces' (M, 3) triangles, optional 'color' (r, g, b in 0-1, from the
-    material) and 'instance' ({'of': part name, 'matrix': 4x4}, a copy of another part, without geometry of
-    its own)}]; ``objects``: one part per scene object, named by its path relative to the entity's default prim."""
+    material), 'uv' (N, 2) and 'pieces' (its surfaces, ``join_surfaces``) and 'instance' ({'of': part name,
+    'matrix': 4x4}, a copy of another part, without geometry of its own)}]; ``objects``: one part per scene
+    object, named by its path relative to the entity's default prim."""
     arrays = {}
     for index, part in enumerate(parts):
         arrays[f'vertices_{index}'] = np.asarray(part['vertices'], dtype=np.float32).reshape(-1, 3)
         arrays[f'faces_{index}'] = np.asarray(part['faces'], dtype=np.int32).reshape(-1, 3)
+        if part.get('uv') is not None and len(part['vertices']):
+            arrays[f'uv_{index}'] = np.asarray(part['uv'], dtype=np.float32).reshape(-1, 2)
     header = {'names': [part['name'] for part in parts], 'frames': frames, 'joints': joints, 'objects': objects,
-              'colors': [part.get('color') for part in parts], 'instances': [part.get('instance') for part in parts]}
+              'colors': [part.get('color') for part in parts], 'instances': [part.get('instance') for part in parts],
+              'pieces': [part.get('pieces') for part in parts]}
     np.savez(stream, header=np.array(json.dumps(header)), **arrays)
 
 
@@ -62,9 +82,11 @@ def read_mesh_source(filename):
         header = json.loads(str(data['header']))
         colors = header.get('colors') or [None] * len(header['names'])
         instances = header.get('instances') or [None] * len(header['names'])
+        pieces = header.get('pieces') or [None] * len(header['names'])
         parts = [{'name': name, 'vertices': data[f'vertices_{index}'].astype(float), 'faces': data[f'faces_{index}'].astype(np.int64),
-                  'color': color, **({'instance': instance} if instance else {})}
-                 for index, (name, color, instance) in enumerate(zip(header['names'], colors, instances))]
+                  'color': color, 'uv': data[f'uv_{index}'] if f'uv_{index}' in data.files else None, 'pieces': piece,
+                  **({'instance': instance} if instance else {})}
+                 for index, (name, color, instance, piece) in enumerate(zip(header['names'], colors, instances, pieces))]
     return {'parts': parts, 'frames': header['frames'], 'joints': header['joints'], 'objects': header.get('objects', False)}
 
 
@@ -240,13 +262,21 @@ def assign(geometries, jobs):
 
 
 def write_light(destination, geometry, simplified, method):
-    """``simplified[i] = (vertices, triangles)`` for every part that has faces."""
+    """``simplified[i] = (vertices, triangles)``, or ``(vertices, triangles, uv, pieces)`` keeping surfaces
+    (``simplify_surfaces``), for every part that has faces."""
     original_vertices = sum(len(part['vertices']) for part in geometry['parts'])
     for i, part in enumerate(geometry['parts']):
         if i not in simplified:
             part['vertices'], part['faces'] = np.asarray(part['vertices']).tolist(), []
+            part['uv'] = None
             continue
-        vertices, faces = simplified[i]
+        vertices, faces, *surfaces = simplified[i]
+        if surfaces:
+            uv, pieces = surfaces
+            part['pieces'] = pieces
+            part['uv'] = np.round(np.asarray(uv, dtype=float), 5).tolist() if any(p.get('texture') for p in pieces) else None
+        else:  # one surface left: drawn in the part's colour
+            part['uv'], part['pieces'] = None, None
         if not np.isfinite(vertices).all():
             raise ValueError('Preview contains non-finite coordinates')
         if not len(faces):
@@ -301,6 +331,7 @@ def merged_parts(geometry, cells=2048):
         offsets = np.cumsum([0] + [len(vertices) for _, vertices, _, _ in members])
         merged.append({'name': members[0][0], 'vertices': np.concatenate([vertices for _, vertices, _, _ in members]),
                        'faces': np.concatenate([faces + offset for (_, _, faces, _), offset in zip(members, offsets)]),
+                       'uv': None, 'pieces': None,
                        'color': mean_color([{'color': color, 'faces': faces} for _, _, faces, color in members])})
     return {**geometry, 'parts': merged}
 
@@ -309,7 +340,7 @@ def simplify(source, destination):
     geometry = read_mesh_source(source)
     if len(geometry['parts']) > MAX_PARTS and not geometry.get('objects'):
         geometry = merged_parts(geometry)
-    work = [(i, part['vertices'], part['faces'], target)
+    work = [(i, part['vertices'], part['faces'], target, part.get('uv'), part.get('pieces'))
             for i, (part, target) in enumerate(zip(geometry['parts'], part_targets(geometry))) if target]
     simplified = dict(_simplify_all(work))
     return write_light(destination, geometry, simplified, 'quadric' if _has_quadric() else 'vertex_clustering')
@@ -324,14 +355,91 @@ def _has_quadric():
 
 
 def _simplify_one(item):
-    index, vertices, faces, target = item
+    index, vertices, faces, target, *surfaces = item
+    uv, pieces = surfaces if surfaces else (None, None)
+    if pieces and (len(pieces) > 1 or (uv is not None and pieces[0].get('texture'))):
+        if uv is None:
+            uv = np.zeros((len(vertices), 2), dtype=np.float32)
+        return index, simplify_surfaces(vertices, faces, uv, pieces, target)
     return index, simplify_part(vertices, faces, target)
+
+
+def simplify_surfaces(vertices, faces, uv, pieces, target):
+    """``(vertices, faces, uv, pieces)`` of a part with textured surfaces: each surface (a run of faces with
+    its own texture, ``join_surfaces``) is simplified on its own, with the part's budget shared by faces, so
+    a surface keeps its texture coordinates (``_textured``); an untextured one as any part."""
+    vertices, faces = np.asarray(vertices, dtype=float).reshape(-1, 3), triangles(faces)
+    uv = np.asarray(uv, dtype=np.float32).reshape(-1, 2)
+    out_vertices, out_faces, out_uv, out_pieces, offset, start = [], [], [], [], 0, 0
+    total = max(len(faces), 1)
+    for piece in pieces:
+        run = faces[start:start + piece['faces']]
+        start += piece['faces']
+        if not len(run):
+            continue
+        used, local = np.unique(run, return_inverse=True)
+        local = local.reshape(-1, 3)
+        share = max(MIN_OBJECT_TRIANGLES, int(target * len(run) / total))
+        if piece.get('texture'):
+            v, f, t = _textured(vertices[used], local, uv[used], share)
+        else:
+            v, f = simplify_part(vertices[used], local, share)
+            t = None
+        if not len(f):
+            continue
+        out_vertices.append(v)
+        out_faces.append(f + offset)
+        out_uv.append(np.zeros((len(v), 2), dtype=np.float32) if t is None else t)
+        out_pieces.append({**piece, 'faces': len(f), 'texture': piece.get('texture') if t is not None else None})
+        offset += len(v)
+    if not out_faces:
+        return vertices[:0], faces[:0], uv[:0], []
+    return np.concatenate(out_vertices), np.concatenate(out_faces), np.concatenate(out_uv), out_pieces
+
+
+def _textured(vertices, faces, uv, target):
+    """Quadric collapse keeping texture coordinates: vertices are welded only where position and coordinate
+    agree (UV seams stay), and after each collapse (replayed for its vertex mapping) a vertex takes the
+    coordinate of the nearest vertex merged into it. Returns (vertices, faces, uv), uv None when only vertex
+    clustering met the budget (the surface is then drawn in its colour)."""
+    if len(faces) <= target:
+        return vertices, faces, uv
+    try:
+        import fast_simplification
+    except ImportError:
+        return (*simplify_part(vertices, faces, target), None)
+    low, scale = vertices.min(axis=0), max(float(np.ptp(vertices, axis=0).max()), 1e-9)
+    grid = np.round((vertices - low) / scale * (2 ** 20)).astype(np.int64)
+    keys = np.c_[grid, np.round(uv.astype(np.float64) * 4096).astype(np.int64)]
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    kept = inverse.reshape(-1)[faces]
+    kept = kept[(kept[:, 0] != kept[:, 1]) & (kept[:, 1] != kept[:, 2]) & (kept[:, 0] != kept[:, 2])]
+    used, kept = np.unique(kept, return_inverse=True)  # replay needs every vertex in a face
+    points, coords, kept = vertices[first][used].astype(np.float32), uv[first][used], kept.reshape(-1, 3).astype(np.int32)
+    for _ in range(3):
+        if len(kept) <= target * 1.25:
+            break
+        try:
+            _, _, collapses = fast_simplification.simplify(points, kept, target_reduction=1 - target / len(kept),
+                                                           agg=3, return_collapses=True)
+            new_points, new_faces, mapping = fast_simplification.replay_simplification(points, kept, collapses)
+        except (IndexError, ValueError):  # a mesh the replay cannot follow: drawn in its colour
+            return (*simplify_part(vertices, faces, target), None)
+        distance = np.linalg.norm(points - new_points[mapping], axis=1)
+        order = np.lexsort((distance, mapping))
+        nearest = order[np.r_[True, mapping[order][1:] != mapping[order][:-1]]]
+        new_coords = np.zeros((len(new_points), 2), dtype=np.float32)
+        new_coords[mapping[nearest]] = coords[nearest]
+        points, coords, kept = np.asarray(new_points, dtype=np.float32), new_coords, np.asarray(new_faces, dtype=np.int32)
+    if len(kept) > target * 2:
+        return (*simplify_part(vertices, faces, target), None)
+    return points.astype(float), kept.astype(np.int64), coords
 
 
 def _simplify_all(work):
     """``[(index, (vertices, faces))]`` of ``work`` items, in worker processes when it is large: a furnished
     house is 15 M source triangles in 700 objects, about two minutes on one core."""
-    heavy = sum(len(faces) for _, _, faces, target in work if len(faces) > target)
+    heavy = sum(len(item[2]) for item in work if len(item[2]) > item[3])
     if heavy < 2_000_000 or len(work) < 8:
         return [_simplify_one(item) for item in work]
     import concurrent.futures

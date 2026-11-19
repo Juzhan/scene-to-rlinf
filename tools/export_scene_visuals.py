@@ -74,6 +74,29 @@ def geometry_only(description, cached):
     return replace(description, root=keep(description.root), connections=())
 
 
+def _corner_uvs(mesh, indices, points):
+    """(corners, 2) texture coordinates of a UsdGeom mesh (its ``st`` or first texCoord primvar), or None."""
+    import numpy as np
+    from pxr import Sdf, UsdGeom
+    primvars = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+    found = primvars.GetPrimvar('st')
+    if not (found and found.HasValue()):
+        found = next((p for p in primvars.GetPrimvars() if p.HasValue() and p.GetTypeName() in
+                      (Sdf.ValueTypeNames.TexCoord2fArray, Sdf.ValueTypeNames.Float2Array)), None)
+    if not found:
+        return None
+    values = found.ComputeFlattened()
+    if values is None or not len(values):
+        return None
+    values = np.asarray(values, dtype=np.float64).reshape(-1, 2)
+    interpolation = found.GetInterpolation()
+    if interpolation == UsdGeom.Tokens.faceVarying and len(values) == len(indices):
+        return values
+    if interpolation in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying) and len(values) == points:
+        return values[indices]
+    return None
+
+
 def _scene_objects(node, state, prim, parts, placement=None):
     """An imported static scene's mesh parts merged object by object (shared/assembly/composition.py), named
     by object path relative to its default prim (simplified one by one: the editor joins the parts it draws
@@ -85,7 +108,7 @@ def _scene_objects(node, state, prim, parts, placement=None):
     ``placement(prim)`` is a prim's transform into the entity frame of the parts."""
     import numpy as np
     from shared.assembly.composition import is_composite, model_key, object_of, objects_below
-    from shared.assembly.mesh_preview import mean_color
+    from shared.assembly.mesh_preview import join_surfaces, mean_color
     if node.factory != 'usd_object' or 'links' in state or not parts:
         return None
     objects = objects_below(prim)
@@ -101,7 +124,7 @@ def _scene_objects(node, state, prim, parts, placement=None):
         offsets = np.cumsum([0] + [len(part['vertices']) for part in members])
         part = {'name': name, 'vertices': np.concatenate([part['vertices'] for part in members]),
                 'faces': np.concatenate([part['faces'] + offset for part, offset in zip(members, offsets)]),
-                'color': mean_color(members)}
+                'color': mean_color(members), **join_surfaces(members)}
         merged.append(part)
         target = prim.GetStage().GetPrimAtPath(prim.GetPath().AppendPath(name)) if placement else None
         key = model_key(target) if target else None
@@ -120,7 +143,7 @@ def _scene_objects(node, state, prim, parts, placement=None):
         size = max(float(np.ptp(part['vertices'], axis=0).max()), 1e-6)
         rigid = np.allclose(matrix[:3, :3] @ matrix[:3, :3].T, np.eye(3), atol=1e-4)
         if rigid and np.abs(moved[:, :3] - part['vertices']).max() <= 1e-4 * size:
-            part.update(vertices=part['vertices'][:0], faces=part['faces'][:0],
+            part.update(vertices=part['vertices'][:0], faces=part['faces'][:0], uv=None,
                         instance={'of': source['name'], 'matrix': np.round(matrix, 7).tolist()})
     return merged
 
@@ -130,7 +153,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
     from shared.assembly.interfaces import source_revision
     from shared.assembly.visuals import SceneChanged, cache_path, geometry_keys, load_visuals, report_progress
     from shared.assembly.mesh_preview import MESH_SOURCE_SUFFIX, write_mesh_source
-    from shared.asset_formats import base_color
+    from shared.asset_formats import base_material
     keys = geometry_keys(scene)
     existing = {} if force else load_visuals(scene)
     # Root-local cached assets need not be spawned again. No tasks, cameras, observations,
@@ -208,7 +231,19 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                 sizes = np.maximum(counts - 2, 0)
                 first = np.repeat(starts, sizes)
                 step = np.arange(sizes.sum()) - np.repeat(np.cumsum(sizes) - sizes, sizes) + 1
-                faces = np.stack([indices[first], indices[first + step], indices[first + step + 1]], axis=1)
+                material = base_material(child, textures)
+                uv = _corner_uvs(mesh, indices, len(points)) if material and material['texture'] else None
+                if uv is not None:
+                    # A vertex per (point, texture coordinate): corners on a UV seam keep their own.
+                    uv_cells = np.round(uv * 4096).astype(np.int64)
+                    _, first_corner, corner_vertex = np.unique(
+                        np.c_[indices, uv_cells], axis=0, return_index=True, return_inverse=True)
+                    corner_vertex = corner_vertex.reshape(-1)
+                    vertices, uv = vertices[indices[first_corner]], uv[first_corner].astype(np.float32)
+                    corners = np.arange(len(indices))
+                    faces = corner_vertex[np.stack([corners[first], corners[first + step], corners[first + step + 1]], axis=1)]
+                else:
+                    faces = np.stack([indices[first], indices[first + step], indices[first + step + 1]], axis=1)
                 if node.factory == 'terrain':
                     # Show one real training tile instead of surrounding 160
                     # curriculum copies; its centre is the project's local zero.
@@ -222,9 +257,12 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                         continue
                     used, faces = np.unique(faces, return_inverse=True)
                     vertices, faces = vertices[used], faces.reshape(-1, 3)
+                    uv = uv[used] if uv is not None else None
                     record['note'] = 'Native generated terrain tile, seed42/env0; local zero is this tile centre. Other training copies hidden.'
                 parts.append({'name': str(child.GetPath()), 'vertices': vertices, 'faces': faces,
-                              'color': base_color(child, textures)})
+                              'color': material['color'] if material else None, 'uv': uv,
+                              'pieces': [{'faces': len(faces), 'texture': material['texture'] if uv is not None else None,
+                                          'tint': material['tint'], 'color': material['color']}] if material else None})
             frames = {}
             for body_path, (_, live) in body_transforms.items():
                 transform = Gf.Transform(live * inverse)

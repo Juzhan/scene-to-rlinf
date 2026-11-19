@@ -53,6 +53,9 @@ def _referenced_files(value):
         path = path if path.is_absolute() else ROOT / path
         if path.is_file():
             yield path.resolve()
+            # A wrapped environment's lightened visuals live in a sublayer beside it (environment_layer).
+            if (visuals := path.with_suffix('.visuals.usdc')).is_file():
+                yield visuals.resolve()
 
 
 def geometry_backend(scene):

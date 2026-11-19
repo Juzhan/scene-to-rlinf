@@ -130,3 +130,33 @@ def test_quadric_simplification_reaches_the_budget_of_a_part_made_of_many_pieces
     # The body is kept: its points stay on the sphere.
     radius = np.linalg.norm(reduced[np.unique(kept)], axis=1)
     assert (np.abs(radius - .5) < .02).mean() > .9
+
+
+def test_joined_surfaces_keep_their_face_runs_and_texture_coordinates():
+    from shared.assembly.mesh_preview import join_surfaces
+    wood = {**cube('wood'), 'uv': np.full((8, 2), .5, dtype=np.float32),
+            'pieces': [{'faces': 12, 'texture': '/wood.png', 'tint': [1, 1, 1], 'color': [.6, .4, .2]}]}
+    metal = {**cube('metal'), 'color': [.7, .7, .7]}
+    joined = join_surfaces([wood, metal])
+    assert [(p['faces'], p['texture']) for p in joined['pieces']] == [(12, '/wood.png'), (12, None)]
+    assert joined['uv'].shape == (16, 2) and (joined['uv'][8:] == 0).all()
+    assert join_surfaces([metal]) == {'uv': None, 'pieces': None}
+
+
+@pytest.mark.skipif(not __import__('importlib').util.find_spec('fast_simplification'), reason='no fast_simplification')
+def test_textured_surfaces_keep_coordinates_through_simplification():
+    from shared.assembly.mesh_preview import simplify_surfaces
+    ball = sphere('ball', 128, 64, radius=1.)
+    v, f = ball['vertices'], ball['faces']
+    d = v / np.linalg.norm(v, axis=1, keepdims=True)
+    uv = np.c_[.5 + np.arctan2(d[:, 1], d[:, 0]) / (2 * np.pi), .5 + np.arcsin(np.clip(d[:, 2], -1, 1)) / np.pi]
+    pieces = [{'faces': len(f) // 2, 'texture': '/map.png', 'tint': [1, 1, 1], 'color': [.5, .5, .5]},
+              {'faces': len(f) - len(f) // 2, 'texture': None, 'tint': None, 'color': [1, 0, 0]}]
+    vertices, faces, coords, kept = simplify_surfaces(v, f, uv.astype(np.float32), pieces, 2000)
+    assert len(faces) <= 2000 * 1.3 and [p['texture'] for p in kept] == ['/map.png', None]
+    textured = np.unique(faces[:kept[0]['faces']])
+    n = vertices[textured] / np.linalg.norm(vertices[textured], axis=1, keepdims=True)
+    expected = np.c_[.5 + np.arctan2(n[:, 1], n[:, 0]) / (2 * np.pi), .5 + np.arcsin(np.clip(n[:, 2], -1, 1)) / np.pi]
+    error = np.abs(coords[textured] - expected)
+    error[:, 0] = np.minimum(error[:, 0], 1 - error[:, 0])  # the seam at u = 0 / 1
+    assert np.median(error) < .01

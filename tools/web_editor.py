@@ -435,8 +435,127 @@ def load_mesh(filename):
                 parts.append((part['name'], vertices @ matrix[:3, :3] + matrix[3, :3], faces))
                 instances[part['name']] = (part['instance']['of'], matrix)
         colors = {part['name']: part['color'] for part in geometry['parts'] if part.get('color') is not None}
-        _MESHES[signature] = (parts, geometry.get('frames', {}), geometry.get('joints', []), colors, instances)
+        # Surfaces (``mesh_preview.join_surfaces``): textured or of several colours; a copy shares its source's.
+        surfaces = {}
+        for part in geometry['parts']:
+            pieces = part.get('pieces')
+            if not pieces or not (len(pieces) > 1 or any(piece.get('texture') for piece in pieces)):
+                continue
+            uv = part.get('uv')
+            if part.get('instance'):
+                source = next((p for p in geometry['parts'] if p['name'] == part['instance']['of']), None)
+                uv = (source or {}).get('uv')
+            surfaces[part['name']] = {'uv': None if uv is None else np.asarray(uv, dtype=np.float32).reshape(-1, 2),
+                                      'pieces': pieces}
+        _MESHES[signature] = (parts, geometry.get('frames', {}), geometry.get('joints', []), colors, instances, surfaces)
     return _MESHES[signature][:3]
+
+
+def mesh_surfaces(filename):
+    """``{part name: {'uv', 'pieces'}}`` of parts drawn with their own textures or colours."""
+    load_mesh(filename)
+    return _MESHES[(filename, Path(filename).stat().st_mtime_ns)][5]
+
+
+TEXTURE_PIXELS = 256  # editor textures are reduced to at most this size
+_TEXTURES, _GLBS = {}, {}
+
+
+def _texture_image(path):
+    """The texture at ``path`` as an RGB(A) PIL image of at most ``TEXTURE_PIXELS``, or None."""
+    if path not in _TEXTURES:
+        _TEXTURES[path] = None
+        with contextlib.suppress(Exception):  # unreadable: the surface is drawn in its colour
+            from PIL import Image
+            with Image.open(path) as image:
+                image.draft('RGB', (TEXTURE_PIXELS, TEXTURE_PIXELS))
+                image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
+                image.thumbnail((TEXTURE_PIXELS, TEXTURE_PIXELS))
+                _TEXTURES[path] = image.copy()
+    return _TEXTURES[path]
+
+
+def surface_glb(vertices, faces, surface, fallback):
+    """GLB of a part drawn with its surfaces: a primitive per surface, textured (with its tint) or in its
+    colour (``_shade``); ``fallback`` colours a surface without one. Cached per arrays."""
+    key = (id(vertices), id(faces), id(surface))
+    if key in _GLBS and _GLBS[key][0] is vertices:
+        return _GLBS[key][1]
+    import trimesh
+    from trimesh.visual.material import PBRMaterial
+    scene, start = trimesh.Scene(), 0
+    for index, piece in enumerate(surface['pieces']):
+        run = faces[start:start + piece['faces']]
+        start += piece['faces']
+        if not len(run):
+            continue
+        used, local = np.unique(run, return_inverse=True)
+        image = _texture_image(piece['texture']) if piece.get('texture') and surface['uv'] is not None else None
+        if image is not None:
+            tint = [int(255 * min(max(v, 0.), 1.)) for v in (piece.get('tint') or (1., 1., 1.))[:3]]
+            material = PBRMaterial(baseColorTexture=image, baseColorFactor=[*tint, 255], metallicFactor=0.,
+                                   roughnessFactor=.9, doubleSided=True)
+            visual = trimesh.visual.TextureVisuals(uv=surface['uv'][used], material=material)
+        else:
+            color = _shade(piece['color']) if piece.get('color') else tuple(fallback)
+            visual = trimesh.visual.TextureVisuals(material=PBRMaterial(
+                baseColorFactor=[*color, 255], metallicFactor=0., roughnessFactor=.9, doubleSided=True))
+        scene.add_geometry(trimesh.Trimesh(vertices[used], local.reshape(-1, 3), visual=visual, process=False),
+                           node_name=f'surface_{index}')
+    data = scene.export(file_type='glb')
+    _GLBS[key] = (vertices, data)
+    return data
+
+
+class _GlbView:
+    """Handle of a part drawn as a GLB (``surface_glb``): its colour cannot change, so highlighting lays a
+    translucent copy of the mesh over it."""
+
+    def __init__(self, scene, name, data, vertices, faces, color):
+        self.scene, self.name, self.vertices, self.faces = scene, name, vertices, faces
+        self.glb = scene.add_glb(name, data)
+        self.base, self.lit, self.overlay = tuple(color), None, None
+
+    @property
+    def color(self):
+        return self.lit or self.base
+
+    @color.setter
+    def color(self, value):
+        value = tuple(int(v) for v in value)
+        if value == self.base:
+            self.lit = None
+            if self.overlay is not None:
+                with contextlib.suppress(Exception):
+                    self.overlay.remove()
+                self.overlay = None
+            return
+        self.lit = value
+        if self.overlay is None:
+            self.overlay = self.scene.add_mesh_simple(self.name + '_lit', self.vertices, self.faces, color=value,
+                                                      opacity=.55, side='double', visible=self.glb.visible)
+        else:
+            self.overlay.color = value
+
+    @property
+    def visible(self):
+        return self.glb.visible
+
+    @visible.setter
+    def visible(self, value):
+        self.glb.visible = value
+        if self.overlay is not None:
+            self.overlay.visible = value
+
+    def remove(self):
+        for handle in (self.glb, self.overlay):
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    handle.remove()
+
+    def on_drag(self, callback):
+        with contextlib.suppress(Exception):
+            self.glb.on_drag(callback)
 
 
 def mesh_instances(filename):
@@ -450,9 +569,10 @@ class _Batch:
     scene node however many copies (Rivermark's 1 038 road reflectors). Each copy stays an editor node of its
     own, for picking, highlighting and hiding, through a ``_Slot``."""
 
-    def __init__(self, key, vertices, faces):
-        self.key, self.vertices, self.faces = key, vertices, faces
+    def __init__(self, key, vertices, faces, surface=None):
+        self.key, self.vertices, self.faces, self.surface = key, vertices, faces, surface
         self.nodes, self.handle, self.name, self.dirty = [], None, None, False
+        self.overlays = {}  # highlighted copies of a textured model: a translucent mesh over each
         self.colors = np.zeros((0, 3), dtype=np.uint8)
         self.scales = np.zeros(0, dtype=np.float32)
 
@@ -471,22 +591,48 @@ class _Batch:
             self.flush(force=True)
             return
         self.remove()
-        self.name = name
-        self.handle = scene.add_batched_meshes_simple(
-            name, self.vertices, self.faces, batched_wxyzs=wxyzs, batched_positions=positions,
-            batched_colors=self.colors.copy(), batched_scales=self.scales.copy(), side='double')
+        self.name, self.scene = name, scene
+        if self.surface is not None and self.textured:
+            self.handle = scene.add_batched_glb(
+                name, surface_glb(self.vertices, self.faces, self.surface, tuple(self.colors[0])),
+                batched_wxyzs=wxyzs, batched_positions=positions, batched_scales=self.scales.copy())
+        else:
+            self.handle = scene.add_batched_meshes_simple(
+                name, self.vertices, self.faces, batched_wxyzs=wxyzs, batched_positions=positions,
+                batched_colors=self.colors.copy(), batched_scales=self.scales.copy(), side='double')
         self.dirty = False
+        self._overlays()
+
+    textured = True  # set per editor (show_textures) before drawing
 
     def flush(self, force=False):
         if self.handle is not None and (self.dirty or force):
-            self.handle.batched_colors, self.handle.batched_scales = self.colors.copy(), self.scales.copy()
+            if hasattr(self.handle, 'batched_colors'):
+                self.handle.batched_colors = self.colors.copy()
+            self.handle.batched_scales = self.scales.copy()
+            self._overlays()
         self.dirty = False
 
+    def _overlays(self):
+        """Textured copies keep their texture: a highlighted one gets a translucent mesh laid over it."""
+        if self.handle is None or hasattr(self.handle, 'batched_colors'):
+            return
+        for index, node in enumerate(self.nodes):
+            lit = tuple(int(v) for v in self.colors[index]) != tuple(node.shape['color']) and self.scales[index]
+            if lit and index not in self.overlays:
+                self.overlays[index] = self.scene.add_mesh_simple(
+                    f'{self.name}_lit{index}', self.vertices, self.faces, color=tuple(int(v) for v in self.colors[index]),
+                    opacity=.55, side='double', position=_xyz(node.local), wxyz=_wxyz(node.local))
+            elif not lit and index in self.overlays:
+                with contextlib.suppress(Exception):
+                    self.overlays.pop(index).remove()
+
     def remove(self):
-        if self.handle is not None:
-            with contextlib.suppress(Exception):
-                self.handle.remove()
-        self.handle = None
+        for handle in [self.handle, *self.overlays.values()]:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    handle.remove()
+        self.handle, self.overlays = None, {}
 
 
 class _Slot:
@@ -550,11 +696,15 @@ def usd_placeholder(item):
     return np.minimum(low, high), np.maximum(low, high)
 
 
-def _join_parts(parts, shown, colors):
+_JOINED = {}
+
+
+def _join_parts(parts, shown, colors, surfaces):
     """Mesh parts of an imported scene (one per object) joined into the parts the editor draws
     (``composition.display_parts``: the browser keeps one scene node per part); ``colors`` gains the
-    triangle-weighted colour of each joined part."""
-    from shared.assembly.mesh_preview import mean_color
+    triangle-weighted colour, ``surfaces`` the joined surfaces of each joined part. The same parts
+    joined the same way give the same arrays, so a reload redraws nothing."""
+    from shared.assembly.mesh_preview import join_surfaces, mean_color
     owner = {name: part for part, names in shown.items() for name in names}
     joined, order, names_of = {}, [], {}
     for name, vertices, faces in parts:
@@ -570,11 +720,23 @@ def _join_parts(parts, shown, colors):
         if len(pieces) == 1:
             result.append((key, *pieces[0]))
             continue
-        offsets = np.cumsum([0] + [len(vertices) for vertices, _ in pieces])
-        colors[key] = mean_color([{'color': colors.get(name), 'faces': faces}
-                                  for name, (_, faces) in zip(names_of[key], pieces)])
-        result.append((key, np.concatenate([vertices for vertices, _ in pieces]),
-                       np.concatenate([faces + offset for (_, faces), offset in zip(pieces, offsets)])))
+        memo = (key, tuple(id(vertices) for vertices, _ in pieces), tuple(names_of[key]))
+        if memo not in _JOINED or any(a is not b for a, b in zip(_JOINED[memo][0], (v for v, _ in pieces))):
+            offsets = np.cumsum([0] + [len(vertices) for vertices, _ in pieces])
+            members = [{'vertices': vertices, 'faces': faces, 'color': colors.get(name),
+                        **(surfaces.get(name) or {'uv': None, 'pieces': [{'faces': len(faces), 'texture': None,
+                                                                          'tint': None, 'color': colors.get(name)}]})}
+                       for name, (vertices, faces) in zip(names_of[key], pieces)]
+            joined_surface = join_surfaces(members) if any(name in surfaces for name in names_of[key]) else None
+            _JOINED[memo] = ([vertices for vertices, _ in pieces],
+                             np.concatenate([vertices for vertices, _ in pieces]),
+                             np.concatenate([faces + offset for (_, faces), offset in zip(pieces, offsets)]),
+                             mean_color(members), joined_surface)
+        _, vertices, faces, color, joined_surface = _JOINED[memo]
+        colors[key] = color
+        if joined_surface is not None:
+            surfaces[key] = joined_surface
+        result.append((key, vertices, faces))
     return result
 
 
@@ -738,6 +900,7 @@ class Editor:
         self.selected_object, self.hidden_objects = None, set()
         self.split_objects = {}  # entity -> scene objects drawn on their own to be moved
         self.also_selected = []  # multi-selection beyond self.selected (Ctrl/Shift-click in the outliner)
+        self.show_textures = True  # draw exported textures and surface colours (surface_glb)
         self.cutaway = None  # (entity path, height): objects of that scene above it are hidden while focused
         # Entities waiting for their native mesh: {path: {'target', 'shown', 'start', 'handle'}}; the placeholder
         # box fills up from the bottom as the exporter reports progress (_animate_loading).
@@ -957,18 +1120,20 @@ class Editor:
         shown_parts = display_parts([(name, kind) for name, kind in objects.items()
                                      if name not in batched and name not in alone]) if objects else {}
         shown_parts.update({name: [name] for name in [*batched, *alone]})
-        colors = dict(mesh_colors(record['path']))
+        colors, surfaces = dict(mesh_colors(record['path'])), dict(mesh_surfaces(record['path']))
         batches, geometry = {}, {name: (vertices, faces) for name, vertices, faces in parts}
         parts = [part for part in parts if part[0] not in batched]
         if shown_parts:
-            parts = _join_parts(parts, {key: names for key, names in shown_parts.items() if key not in batched}, colors)
+            parts = _join_parts(parts, {key: names for key, names in shown_parts.items() if key not in batched},
+                                colors, surfaces)
         for index, (name, vertices, faces) in enumerate(parts):
             body = next((body for body in frames if '/' + body + '/' in name), None)
             parent = info['bodies'][body] if body else info['node']
             local = np.linalg.inv(F.pose_matrix(frames[body])) if body else None
             mesh = self._node(f'{item["path"]}@{index}', local, parent, owner=('entity', item['path']),
                               shape={'type': 'mesh', 'vertices': vertices, 'faces': faces,
-                                     'color': _shade(colors[name]) if own and colors.get(name) else color})
+                                     'color': _shade(colors[name]) if own and colors.get(name) else color,
+                                     **({'surface': surfaces[name]} if own and name in surfaces else {})})
             # A scene exported object by object names each part by its object path (or merged folder).
             mesh.object = name if name in shown_parts else None
             info['meshes'].append(mesh)
@@ -977,7 +1142,7 @@ class Editor:
                 continue
             vertices, faces = geometry[source]
             if source not in batches:
-                batches[source] = _Batch(source, vertices, faces)
+                batches[source] = _Batch(source, vertices, faces, surfaces.get(source) if own else None)
             mesh = self._node(f'{item["path"]}@copy:{name}', np.asarray(matrix, dtype=float).T, info['node'],
                               owner=('entity', item['path']),
                               shape={'type': 'mesh', 'vertices': vertices, 'faces': faces, 'batch': batches[source],
@@ -1216,7 +1381,8 @@ class Editor:
                 if not batch.nodes or not info['node'].name:
                     continue
                 name = info['node'].name + '/batch_' + hashlib.sha1(batch.key.encode()).hexdigest()[:10]
-                signature = (id(batch.vertices), len(batch.nodes))
+                batch.textured = self.show_textures
+                signature = (id(batch.vertices), len(batch.nodes), self.show_textures)
                 old = previous.pop(name, None)
                 if old is not None and old[1] == signature:
                     batch.handle, batch.name = old[0], name
@@ -1228,6 +1394,13 @@ class Editor:
         for handle, _ in previous.values():
             with contextlib.suppress(Exception):
                 handle.remove()
+
+    def _set_textures(self, on):
+        if self.show_textures != on:
+            self.show_textures = on
+            self._emit()
+            if self.selected:
+                self._highlight(self.selected, True)
 
     def _flush_batches(self, path):
         for batch in ((self.info.get(path) or {}).get('batches') or {}).values():
@@ -1245,7 +1418,7 @@ class Editor:
             return None
         faint = bool(node.owner and node.owner[0] == 'entity' and node.owner[1] in self.items
                      and not self.render_visible(node.owner[1]))
-        return faint, tuple(sorted((key, id(value) if isinstance(value, np.ndarray) else repr(value))
+        return faint, bool(shape.get('surface') and self.show_textures), tuple(sorted((key, id(value) if isinstance(value, np.ndarray) else repr(value))
                                    for key, value in shape.items()))
 
     def _draw_shape(self, node, highlight=False):
@@ -1264,7 +1437,13 @@ class Editor:
         # Hidden from rendering (visible: false): drawn faint, it still collides.
         faint = {'opacity': .3} if node.owner and node.owner[0] == 'entity' and node.owner[1] in self.items \
             and not self.render_visible(node.owner[1]) else {}
-        if kind == 'mesh':
+        if kind == 'mesh' and shape.get('surface') and self.show_textures and not faint:
+            handle = _GlbView(scene, name, surface_glb(shape['vertices'], shape['faces'], shape['surface'],
+                                                       shape.get('color') or COLORS['mesh']),
+                              shape['vertices'], shape['faces'], shape.get('color') or COLORS['mesh'])
+            if highlight:
+                handle.color = color
+        elif kind == 'mesh':
             handle = scene.add_mesh_simple(name, shape['vertices'], shape['faces'], color=color, side='double', **faint)
         elif kind == 'box' and shape.get('region'):
             # Abstract rectangle/box: a translucent body plus screen-width edges, so it
@@ -2824,6 +3003,8 @@ class Editor:
             self.simulation_items = []
             gui.add_button('放弃修改并重新加载', icon='refresh').on_click(lambda _: self.reload())
             gui.add_button('刷新原生网格（Isaac 后台导出）', icon='cube').on_click(lambda _: self._refresh_native())
+            textures = gui.add_checkbox('编辑器中显示贴图', True, hint='关闭后按材质主色显示，传输更少、更快；只影响编辑器')
+            textures.on_update(lambda _: self.guarded(self._set_textures)(textures.value))
             with gui.add_folder('新建 / 打开环境'):
                 from tools.create import MAINTAINED_TEMPLATES
                 self.new_name = gui.add_text('新项目名称', 'new_environment')

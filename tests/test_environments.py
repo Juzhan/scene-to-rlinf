@@ -127,3 +127,63 @@ def test_spawn_points_stand_on_the_floor_clear_of_obstacles(tmp_path):
         assert max(abs(x - 10), abs(y)) >= 0.5 + 0.45 - 0.1 and max(abs(x - 10), abs(y)) <= 3
     assert np.min([np.hypot(a['position'][0] - b['position'][0], a['position'][1] - b['position'][1])
                    for a in found for b in found if a is not b]) >= 0.9
+
+
+def test_unreal_like_exports_get_expanded_instances_and_colliders(tmp_path):
+    """A centimetre scene without physics, as Unreal exports it: a floor, a pebble, grass, wall pieces
+    of a PointInstancer (one mirrored, one hidden) and an instanced tree."""
+    import numpy as np
+    from pxr import Gf
+    from shared.asset_formats import environment
+    stage = Usd.Stage.CreateNew(str(tmp_path / 'town.usda'))
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 0.01)
+    stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, '/Root').GetPrim())
+
+    def square(path, size, z=0.):
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.CreatePointsAttr([(-size, -size, z), (size, -size, z), (size, size, z), (-size, size, z)])
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        return mesh
+    square('/Root/floor', 1000)
+    square('/Root/pebble', 1, 1)
+    square('/Root/grass_patch', 100, 1)
+    UsdGeom.Xform.Define(stage, '/Root/street').AddTranslateOp().Set((0, 200, 0))
+    walls = UsdGeom.PointInstancer.Define(stage, '/Root/street/walls')
+    wall = square('/Root/street/walls/Prototypes/wall', 50)
+    wall.AddTranslateOp().Set((0, 0, 100))  # the prototype's own transform
+    walls.CreatePrototypesRel().SetTargets([wall.GetPath()])
+    walls.CreateProtoIndicesAttr([0, 0, 0])
+    walls.CreatePositionsAttr([(0, 0, 0), (500, 0, 0), (-500, 0, 0)])
+    walls.CreateScalesAttr([(1, 1, 1), (-1, 1, 1), (1, 1, 1)])
+    walls.CreateInvisibleIdsAttr([2])
+    trees = UsdGeom.PointInstancer.Define(stage, '/Root/trees')
+    square('/Root/trees/Prototypes/tree_oak', 100)
+    trees.CreatePrototypesRel().SetTargets(['/Root/trees/Prototypes/tree_oak'])
+    trees.CreateProtoIndicesAttr([0])
+    trees.CreatePositionsAttr([(300, 300, 0)])
+    stage.Save()
+    record = environment(tmp_path / 'town.usda', tmp_path / 'town', expand_instancers=True, add_colliders=True)
+    report = record['steps'][0]
+    assert report['expanded_instancers'] == {'instancers': 1, 'instances': 2, 'kept_instancers': 1,
+                                             'missing_prototypes': 0}
+    assert report['added_colliders']['meshes'] == 3  # the floor and two walls
+    assert report['added_colliders']['skipped'] == {'bare': 1, 'small': 1}
+    out = Usd.Stage.Open(str(tmp_path / 'town/usd/town.usda'))
+    assert not out.GetCompositionErrors() and not out.GetPrimAtPath('/Root/street/walls').IsActive()
+    assert out.GetPrimAtPath('/Root/trees').IsActive()  # foliage: left to the PointInstancer
+    collided = {str(prim.GetPath()) for prim in out.Traverse() if prim.HasAPI(UsdPhysics.CollisionAPI)}
+    assert collided == {'/Root/floor', '/Root/street/walls_expanded/wall_0/model',
+                        '/Root/street/walls_expanded/wall_1/model'}
+    cache = UsdGeom.XformCache()
+    for name, x in (('wall_0', 0), ('wall_1', 5)):  # metres; the mirrored copy is re-expressed in place
+        mesh = out.GetPrimAtPath(f'/Root/street/walls_expanded/{name}/model')
+        matrix = cache.GetLocalToWorldTransform(mesh)
+        assert matrix.GetDeterminant() > 0
+        points = np.array([matrix.Transform(Gf.Vec3d(*point)) for point in UsdGeom.Mesh(mesh).GetPointsAttr().Get()])
+        assert np.allclose(points.mean(0), [x, 2, 1]) and np.allclose(np.ptp(points, 0), [1, 1, 0])
+    # The simplifiers edit the copies, which only the wrapper has.
+    record = environment(tmp_path / 'town.usda', tmp_path / 'simplified', expand_instancers=True,
+                         add_colliders=True, simplify_colliders=0.05, simplify_visuals=4)
+    assert record['steps'][0]['simplified_colliders']['meshes'] == 3

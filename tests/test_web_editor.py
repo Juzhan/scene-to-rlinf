@@ -533,3 +533,22 @@ editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None or find_spec('trimesh') is None, reason='viser or trimesh not installed')
+def test_textured_part_is_one_glb_with_a_primitive_per_surface(tmp_path):
+    import struct
+    from PIL import Image
+    import tools.web_editor as W
+    Image.new('RGB', (512, 512), (200, 120, 40)).save(tmp_path / 'wood.png')
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [2, 0, 0], [2, 1, 0]], dtype=np.float32)
+    faces = np.array([[0, 1, 2], [1, 3, 2], [1, 4, 3], [4, 5, 3]], dtype=np.uint32)
+    surface = {'uv': np.array([[0, 0], [1, 0], [0, 1], [1, 1], [0, 0], [0, 1]], dtype=np.float32),
+               'pieces': [{'faces': 2, 'texture': str(tmp_path / 'wood.png'), 'tint': [1, 1, 1], 'color': [.8, .5, .2]},
+                          {'faces': 2, 'texture': None, 'tint': None, 'color': [.1, .1, .1]}]}
+    data = W.surface_glb(vertices, faces, surface, (178, 189, 201))
+    length = struct.unpack('<I', data[12:16])[0]
+    gltf = json.loads(data[20:20 + length])
+    assert len(gltf['meshes']) == 2 and len(gltf.get('images', [])) == 1
+    assert W.surface_glb(vertices, faces, surface, (178, 189, 201)) is data  # cached per arrays
+    assert max(W._texture_image(str(tmp_path / 'wood.png')).size) == W.TEXTURE_PIXELS
