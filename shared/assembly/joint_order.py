@@ -10,7 +10,7 @@ Control targets are matched by joint name and need no reordering.
 
 # Public readings with one column per joint.
 JOINT_FIELDS = frozenset({'joint_position', 'joint_velocity', 'joint_effort',
-                          'default_joint_position', 'default_joint_velocity'})
+                          'default_joint_position', 'default_joint_velocity', 'joint_limits'})
 
 
 def canonical_joints(native, canonical, where):

@@ -79,6 +79,7 @@
 - 场景配置只承担实体、目标、观察选择和基础控制。项目 task.py 自动发现，无需 YAML 注册
   evaluate、parameters 或公式；阈值和计算直接写 Python/Torch。
 - task.py 提供 evaluate(obs: SceneInfo)，有状态时提供 Task.evaluate(self, obs: SceneInfo)。
+  常用关系（inside/on_top/near/is_open/upright 及对应间隙）用 `shared/predicates.py`，不在项目里重写。
   返回 reward/success/failure/metrics 字典，每项按环境输出；缺省 reward=0、success/failure=False；
   可选 set（抽象体名 -> 位置/位姿）是 Task 发起的每步事件。
   不负责模型加载、窗口、仿真 step/reset 或训练循环。
@@ -87,7 +88,7 @@
   不为普通任务强制引入状态类。Task 与观察读取独立，模型反馈不经过 Task 缓存。
 - 新 Python Task 项目不接受 scene.yaml 中的 task/variables 评价配置，不保留双重配置入口。
   原公式引擎不是新模板要求，未迁移历史实验的运行记录不重写。
-- control.output 仅选择对象、关节和位置/速度/力矩类型；executor 返回实际单位目标，缩放/偏移在模型代码完成。频率由组件声明。
+- 控制按机器人自动：每台机器人的全部关节受策略控制，`policy.modes` 只写例外（速度/力矩/不控制）；decode_action 返回实际单位目标，缩放/偏移在模型代码完成。频率由各层的 period 声明。
 - targets 是实体的显式固定期望值。点、方向、矩形、长方体等空间量是 `entities` 中 `kind: abstract` 的抽象体：
   与物体同等地添加、选中、编辑、删除和选作观察（`<名>.position/orientation`，另有 size 或 direction），
   只是没有模型和物理。没有 goal/随机区域类型，含义由 Task 或模型代码决定；不再有 `regions:` 段。
@@ -104,6 +105,9 @@
   两后端同样支持静态、随机复位、Task 移动和跟随读数；scene motion、`visible: false` 只接入 isaaclab3，其他后端明确报错。
 - 是否受力（动态 / 运动学 / 固定根部）、是否出现在渲染画面（`visible`，抽象体为 `visualization.abstract`）
   是实体属性，编辑器场景列表行尾直接切换，写回同一份 scene.yaml；“编辑器中隐藏”只影响网页，不保存。
+- 机器人的重力补偿（`gravity_compensation: true`，仅 isaaclab3，编辑器“控制”栏开关）也是实体属性：连杆不受重力（PhysX
+  disable_gravity + Newton gravcomp），关节只管跟踪目标，对应真机控制器自带的重力补偿；动作是“实测位置 + 增量”时必须打开，
+  否则没有固定设定点，手臂会慢慢下垂。增益仍按机器人设置。
 - 导入的场景环境仍是一个 `usd_object` 实体，编辑器从 USD 结构推出物体树（`shared/assembly/composition.py`）展开显示；
   移除物体只写 `usd_object.exclude`（仿真与编辑器共用），不为场景里的每个物体复制实体定义；需要单独移动、受力或给 Task
   用的物体才取出为 `usd_object(prim=...)` 实体（同时写入原场景的 exclude）。日常场景以几十到一两百个物体为宜，上千个的作性能测试。
@@ -124,8 +128,7 @@
 
 ## 8. 当前实现边界：不能当作所有新项目的模板要求
 
-- 维护中的 assembly 使用显式 build_planner/build_executor(config, torch_dtype)；
-  当前共享 SFT 接入仍调用 `build_model(cfg, training_dataset)`。两者尚未统一。
+- 维护中的 assembly 用 `policy.layers` 的模型类；当前共享 SFT 接入仍调用 `build_model(cfg, training_dataset)`。两者尚未统一。
   统一签名是后续改进方向，不能只改项目函数名而不核对共享调用方。
 - 当前碗盘项目在线评估使用共享的单环境驱动；不代表已接入 RLinf 分布式评估或在线 PPO。
 - 当前 RLinf `HistoryManager` 接在奖励模型历史路径上；它没有自动为此残差构造策略历史。
@@ -146,43 +149,57 @@
 - 项目 README 写清入口、可修改项、模型输入输出、运行方式和未接入的能力。
   新约定与本文件冲突时先结合用户最新要求明确取舍，再同步文档，不维护互相矛盾的规范。
 
-## 10. Planner / Executor 与 RLinf 接入
+## 10. 策略（policy 层）与 RLinf 接入
 
-- 默认模板 planner_executor 生成 scene.yaml、policy.py、task.py、observation.py、train.yaml 和入口。
-  场景项目的 train.yaml 必须写明 `env.train.init_params.backend`（新项目为 isaaclab3）；未写明的旧项目沿用
-  configs/state_ppo.yaml 的 isaac，check 给出 WARN，复制这类项目时把 isaac 显式写进新 train.yaml。
-  两个模型工厂显式配置，control.train 选择训练角色。固定模型 forward(obs) 返回动作 Tensor。
-  默认 planner 将目标位置和朝向拼为输出；简单任务也保留 planner，可仅透传。
-- Policy 的对象输入统一，当前 PPO 示例 forward(obs) 返回动作均值和值预测，actor_logstd 是
-  项目模型参数。RLinf 特定采样/logprob/value 接口由 shared/integrations/rlinf/object_policy.py 负责，
-  不把 GaussianPolicy 或固定向量结构作为用户模型输入规范。其他训练算法仍需相应适配。
-- 被训练工厂接收 config/torch_dtype/可选 parameters；固定工厂只接收 parameters。
-  LazyLinear 在共享接入层用实际观察形状和 dtype 初始化后才交给 FSDP/优化器。
-- 训练 planner 时，固定 executor 在原生物理子步读取即时反馈；训练 executor 时，固定 planner
-  按周期刷新。共享层复用 Isaac 原生循环，不写新的仿真推进循环。
-- planner 输出维度显式声明；executor.dimension=auto 根据实际基础控制关节数解析。
-  component.output/previous_output 为张量；component.input 是最近基础输入的对象结构。
+- scene.yaml 的 `policy:` 是唯一的策略配置：`layers`（一层或两层，有序，名字自取，最后一层驱动机器人）、
+  `decode`、可选 `initial`、`modes`、两层时的 `train`。每层写 `model`（policy.py 里的类或工厂）、`parameters`、
+  `period`（秒）、`inputs`（场景信息名，或另一层的名字 = 读它的结果；自己的名字 = 自己上一步的动作）、可选 `history`。
+  `shared/assembly/layers.py` 读成内部 control 映射，运行时、类型生成、编辑器共用；旧的 `control:`（planner/executor、
+  dimension）照常读取运行，两者不能同时写。
+- 默认模板 go2_goal 是一层；分层只用于不同频率、现成不训练的模型或需单独替换的部分。编辑器“增加一层 / 去掉一层”
+  改同一份 scene.yaml，增加时在 policy.py 末尾追加起始代码。场景项目的 train.yaml 必须写明
+  `env.train.init_params.backend`（新项目为 isaaclab3）；未写明的旧项目沿用 configs/state_ppo.yaml 的 isaac，check 给出 WARN。
+- 层的结果由代码定义：forward 返回 Tensor，或张量字典 `{'goal': ..., 'heading': ...}`（每项后写 `# [B, ...] 说明`），
+  下一层读 `obs.<层>.<键>`。键名与注释从 policy.py 里 `return {...}` 静态读出（不导入），形状写不出的为 None，运行时第一步测得并核对；
+  编辑器箭头上显示键名，注释在悬停提示里。不为层的输出写维度配置，也没有专门的结果类。被训练层返回一个动作张量。
+- 动作相对的名义姿态（站姿、home 位姿）、缩放等是策略自己的常数，写在 policy.py 里，真机部署用同一组数；
+  不把仿真的 `default_joint_position` 当作策略输入或动作基准（编辑器不再提供它和“仿真”作为输入；Task 可以读）。
+- 模型的设置写在 YAML 里由代码读取，不在编辑器里填：构造参数写 `config` 就收到 train.yaml 的 `actor.model`
+  （hidden_dims 及项目自加的任何键，环境进程里经 configs/state_ppo.yaml 的 `init_params.model` 传入，同一份）；
+  scene.yaml 该层的 `parameters` 作为构造参数传入（如权重文件）。
+- 被训练层 forward(obs) 只返回动作均值 [B, 动作个数]；个数即模型最后一层大小，构造参数写 `actions` 时传入受控关节总数，
+  否则用试运行测出（试运行与固定层的首次运行都保存并恢复随机数状态，不改变环境的随机序列）。
+  `shared/integrations/rlinf/object_policy.py` 补上 PPO 需要的 `log_std`（初值 train.yaml `actor.model.action_std`）与价值网络：
+  模型有 `value(obs)` 就用它，否则是读本层数值输入的 MLP；价值网络参数名须含 `value_head`（RLinf 据此用 value_lr 与预热）。
+  forward 返回 (均值, 价值) 并自带 actor_logstd 的旧式模型照常可用。`parameters.weights` 由框架加载
+  （被训练层是整个适配器的检查点，固定层取其 `model.` 部分或模块本身的 state dict）；项目自有格式的权重用别的参数名由模型自己读。
+- 固定层在环境进程按周期运行、无隐藏状态、不能读自己的输出；被训练层的动作来自 RLinf。共享层复用 Isaac 原生循环，
+  不写新的仿真推进循环。LazyLinear 在共享接入层用实际观察形状和 dtype 初始化后才交给 FSDP/优化器。
 - RLinf 传输/轨迹内部使用命名张量字典，图像等形状不展平。接收模型调用时再构造 typed view。
   共享适配器将命名 Tensor 字典放在原生 RLinf states 传输字段内，task_descriptions 提供批次元数据；
-  states 在这里是内部字典而非项目输入向量，模型入口解包为对象，无需修改 EnvOutput；
   forward_inputs 按 RLinf 轨迹批处理要求保存为平铺字典，项目不需要知道其键格式。
-- 迁移后旧整策略 checkpoint 不静默加载：适配器模型命名/输入约定已变。冻结 Go2 行走权重
-  仍保留原 235 特征网络，由项目内对象读取与特征计算负责对应。新训练写独立运行目录。
-- 支持命名多终点，固定模型无隐藏状态；未实现任意控制图或联合训练。
-  Blender 支持场景与观察选择；双组件分别选择 planner/executor 输入。无 Task 面板，任务直接编辑 task.py。
+- 迁移后旧整策略 checkpoint 不静默加载：适配器参数名已变（如 `model.actor_logstd` → `log_std`；只有 `weights`
+  初始权重做这一换名）。迁移项目的输入顺序与动作含义不变，现有权重评估结果与迁移前一致。新训练写独立运行目录。
+- 支持多机器人控制；未实现两层同时训练、三层以上或任意控制图。Blender 插件仍只认旧的 `control:` 写法。
+  无 Task 面板，任务直接编辑 task.py。
 
-## 命名多终点控制
+## 机器人控制（按机器人自动）
 
-- 维护模板 planner_executor 及 IL3 维护项目（piper_pick、go2_chase、go2_piper_wholebody）均保留 planner / executor。control.output 为命名终点映射，每项仅 type/asset_name/joint_names。
-  joint_names 逐个列出关节名，不用正则；列出顺序即动作维度顺序（check、编辑器与 Blender 拒绝正则，旧快照仍可读取）。
-- executor.decode 显式引用 policy.py 中的 decode_action(action, obs)，返回同名 Tensor 字典，供固定和训练执行器共用。
+- 场景里每台机器人（资产能力含 articulation 或 `kind: robot`，非 kinematic）的全部关节都受策略控制，默认关节位置目标
+  （`shared/assembly/control.py` `automatic_outputs`）。柜子、门等只有 joint_state 的铰接物体不受控。编辑器里是策略卡片末尾的“控制对象”。
+- `policy.modes`（可选）只写例外：`<机器人>: joint_velocity | joint_effort | none`；`none` 表示不受策略控制（保持默认目标，
+  如由场景运动驱动的机器人）。modes 写了非机器人或未知模式时报错。
+- `policy.decode` 引用 policy.py 中的 decode_action(action, obs)，返回 `{机器人名: Tensor[B, 关节数]}`，每台受控机器人一项、
+  不多不少；列序同 `obs.<机器人>.joint_position`（ASSET.json joint_order）。不训练的关节（如夹爪）由 decode 给默认值；
+  末端控制等其他动作在 decode 里换算（如 `differential_ik`）。机器人增删后 decode 需同步，运行时报错会列出应有的名字。
 - 训练动作与控制目标分离：RLinf 记录采样动作的概率，解码后的目标直接下发各原生控制项，不重新采样或按目标计算概率。
-- executor.dimension 可显式指定，auto 仅用于训练动作维度等于目标关节总数。Lift 为8维训练动作、arm7维目标、gripper2维目标。
-- 控制目标必须是当前设备上的批量浮点 Tensor；不逐环境循环，不将目标拼接成多余的大张量，不调用CPU/NumPy。
-- 终点初始化时解析关节并拒绝同一关节被多个终点覆盖；允许不同实体及同实体不同关节使用不同控制模式。
-- executor.initial 为可选项目函数，定义初始动作，默认零；reset只重置对应环境。output/previous_output仍表示解码前动作。
-- PPO协议暂时保留当前Gaussian接口，但固定模块只输出Tensor；不要求通用执行器提供分布。
-- Blender维护训练角色、观察和命名绑定，不自动生成用户的动作转换算法；新增终点时用户需同步decode返回值。
+  所以控制写法只影响 decode 的返回形状，不影响训练算法与权重。wholebody 为 18 个训练动作（腿 12 + 臂 6），
+  目标为 robot 12 + piperx 8（夹爪取默认值）。
+- 控制目标必须是当前设备上的批量浮点 Tensor；不逐环境循环，不调用CPU/NumPy。
+- 旧项目和实验快照的 `control.output`（命名终点映射，每项 type/asset_name/joint_names，逐个列关节、不用正则）仍可读取并照旧
+  运行；它与 modes 不能同时写。同一机器人需要混用控制模式时暂用这种写法（`policy.output` 同义）。
+- `policy.initial` 为可选项目函数，定义复位后第一步之前的动作，默认零；reset 只重置对应环境。
+  `obs.<层>.output/previous_output` 是解码前的动作。
 
 ## 原生 RLinf 依赖边界
 
@@ -199,6 +216,7 @@
 - mjlab 已接通原生 GPU 环境及原生 RLinf PPO，支持 check/smoke/train/evaluate/view/record（view 用 MuJoCo 被动窗口显示 env 0）；已验证短 rollout、部分复位、终止观察和参数更新。显式 --backend mjlab 的 view 仍仅查看物理场景，不运行策略。
 - `.venv-mjlab` 为增量验证环境，不升级现有 Isaac 依赖；Go2 两后端共用 `assets/go2/`（USD 与其转换 MJCF，来源见 `source/SOURCE.json`）。
 - 新机器人/物体资产用 `run.py asset convert` 同时备好 USD 与 MJCF，记录 ASSET.json 并通过对齐检查；不手写转换器，不在转换文件里写执行器增益，对齐不通过时不静默修正。
+  用户自带文件经编辑器“导入”或 `run.py asset import --project <项目>` 进该项目的 `projects/<项目>/assets/<名>/`，登记在项目自己的 `assets/library.json`，项目自己管理；不带 `--project` 时进工作区 `assets/imported/<名>/` 与 `assets/library.json`，仅用于维护者扩展公共资产（`shared/asset_import.py`）：URDF/MJCF 仍走 convert（ROS `.urdf.xacro` 先按上传里的 package.xml 展开；网格缺失时停止并要求导入整个文件夹，只缺碰撞网格时用外观网格并写明；URDF 无关节增益，一律给默认 PD），USD 直接用，网格（OBJ/STL/glTF/FBX 等）写成 USD 并估算质量；原文件保留在 source/；物体用封闭凸包碰撞并写明质心与惯量。导入机器人的关节增益写在实体参数 `usd_object.actuators`（不写进转换文件），USD 无驱动刚度时导入给默认 PD；编辑器向已有策略的项目添加机器人时默认 `modes: none`。
 - 后续按 `docs/SCENE_BACKENDS.md` 扩展传感器和连接，不把短训练参数更新当作学会任务；关节顺序以 ASSET.json `joint_order`（= Isaac 顺序）为准，由各后端读数换序；同名资产仍不保证动力学/权重兼容。
 
 ## 域随机化与多条件评估

@@ -274,13 +274,14 @@ def test_deleting_the_controlled_robot_reports_what_goes_and_check_names_it(tmp_
     document = SceneDocument(project / "scene.yaml")
     removed = ["world/robot", "world/height_scanner", "world/contact_forces"]
     effects = document.removal_effects(set(removed))
-    assert effects["outputs"] == ["legs"] and "robot.joint_position" in effects["observations"]
+    assert effects["outputs"] == ["robot"] and "robot.joint_position" in effects["observations"]
     document.remove_entities(removed)
     document.save()
-    from shared.assembly.control import validate_outputs
-    from shared.assembly.layout import load_scene_config
-    with pytest.raises(ValueError, match="control.output is empty"):
-        validate_outputs(load_scene_config(project / "scene.yaml")["control"]["output"])
+    from shared.assembly.control import effective_outputs, validate_outputs
+    from shared.assembly.layout import load_scene_config, load_world_spec
+    control = load_scene_config(project / "scene.yaml")["control"]
+    with pytest.raises(ValueError, match="没有受策略控制的机器人"):
+        validate_outputs(effective_outputs(control, load_world_spec(project / "scene.yaml")))
 
 
 def test_invalid_edit_does_not_write(project):
@@ -662,3 +663,10 @@ def test_delete_entity_drops_its_contact_material(project):
     doc.save()
     apply_edits(project, {'revision': SceneDocument(project).revision, 'remove_entities': ['world/cube_2']})
     assert 'cube_2' not in (load(project).get('world') or {}).get('contact_materials', {})
+
+
+def test_an_edited_parameter_is_replaced_whole_and_none_removes_it():
+    from shared.assembly.editing import _merge
+    entity = {'parameters': {'usd_path': 'x.usda', 'couplings': {'lid': {'leader': 'pedal'}, 'needle': {'leader': 'knob'}}}}
+    _merge(entity, {'parameters': {'couplings': {'lid': {'leader': 'pedal', 'ratio': 2.0}}, 'usd_path': None}})
+    assert entity['parameters'] == {'couplings': {'lid': {'leader': 'pedal', 'ratio': 2.0}}}

@@ -45,7 +45,7 @@ class StateContractTests(unittest.TestCase):
         from tools.preview import checked_states, parse_options
 
         options, overrides = parse_options(["--steps", "0", "env.train.seed=17"], "view")
-        self.assertEqual(options.actions, "zero")
+        self.assertEqual(options.actions, "hold")  # the executor's initial action
         self.assertEqual(overrides, ["env.train.seed=17"])
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             parse_options(["--steps", "0"], "record")

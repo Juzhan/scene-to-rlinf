@@ -2,7 +2,7 @@
 
 Go2 追一个会逃跑的虚拟球，用头部（水平距离）碰到它。场景与任务复刻
 [`Zhengtianjin/go2-supermimic`](https://github.com/Zhengtianjin/go2-supermimic)（MIT，提交 `054a13c`）的 **Chase** 部分；
-executor 直接使用该仓库发布的平地 actor 权重 `flat.pt`（SuperMimic 方法训练，本工作区没有重新训练）。
+策略直接使用该仓库发布的平地 actor 权重 `flat.pt`（SuperMimic 方法训练，本工作区没有重新训练）。
 默认后端 Isaac Lab 3 + Newton。
 
 ## 文件与要写的位置
@@ -10,7 +10,7 @@ executor 直接使用该仓库发布的平地 actor 权重 `flat.pt`（SuperMimi
 | 文件 | 内容 | 谁来改 |
 | --- | --- | --- |
 | `scene.yaml` / `scene_terrain.yaml` | 实体、观察选择、5 帧历史、控制目标 | `run.sh edit` 或直接编辑 |
-| `policy.py` | `build_planner`、`build_executor`（模型）、`decode_action`（动作→关节目标）、`initial_action` | 换模型时改这里 |
+| `policy.py` | `Policy`（参考 actor 与 PPO 微调用的 `value_head`）、`decode_action`（动作→关节目标） | 换模型时改这里 |
 | `task.py` | `evaluate(obs)`：奖励、成功、失败、指标、逃跑球的 `set` | 改任务时改这里 |
 | `observation.py` | 由 scene.yaml 生成的观察类型（形状、单位），`check` 时刷新 | 不要手改 |
 | `train.yaml` / `train_terrain.yaml` | PPO 配方（平地/粗糙地形） | 微调时改 |
@@ -41,9 +41,9 @@ executor 直接使用该仓库发布的平地 actor 权重 `flat.pt`（SuperMimi
 
 ## 模型、观察与动作
 
-executor 50 Hz（`period: 0.02`）是参考 actor 的原结构：`RunningNorm`（权重内的均值/方差，冻结）+
+策略（一层 `policy`，50 Hz，`period: 0.02`）是参考 actor 的原结构：`RunningNorm`（权重内的均值/方差，冻结）+
 MLP 350-512-256-128-12（ELU）。`policy.py` 的 `features(obs)` 按权重的约定拼出 350 维输入：
-6 项，每项是 5 帧历史（旧→新，scene.yaml `executor.history` 提供，复位后以首帧补齐）依次展平：
+6 项，每项是 5 帧历史（旧→新，scene.yaml 该层的 `history` 提供，复位后以首帧补齐）依次展平：
 
 | 项 | 每帧维度 | 处理 |
 | --- | --- | --- |
@@ -51,15 +51,15 @@ MLP 350-512-256-128-12（ELU）。`policy.py` 的 `features(obs)` 按权重的�
 | projected gravity | 3 | (0,0,-1) 转到机体系 |
 | 关节位置 | 12 | 换成 actor 顺序后减站姿 |
 | 关节速度 | 12 | 换成 actor 顺序 |
-| 上一步动作 | 12 | `executor.output`，复位后为 0 |
+| 上一步动作 | 12 | `policy.output`（自己上一步的动作），复位后为 0 |
 | 目标槽 ×2 | 28 | 槽 1：球相对位置与球速度（偏航系）、不确定度 0、可见 1、age 0、点目标、active 1；槽 2（躲避）全 0 |
 
 - actor 的关节顺序是逐腿 FL、FR、RL、RR 的 hip/thigh/calf；机器人读数是 hips、thighs、calves
-  （ASSET.json `joint_order`），由 `ASSET_TO_ACTOR` 换序。`control.output.legs` 直接按 actor 顺序列关节。
+  （ASSET.json `joint_order`），由 `ASSET_TO_ACTOR` 换序；`decode_action` 按 actor 顺序算出目标后换回机器人顺序返回 `robot`。
 - 动作 12 维，目标 = 站姿 (hip ±0.1, thigh 0.9, calf −1.8) + scale × 动作，scale 为 0.3349（hip/thigh）、0.2853（calf）。
 - 没有线速度、LiDAR、height scan 输入（与该 actor 一致）；地形场景对策略不可见。
 - 以上排列、顺序、站姿、scale 都由权重决定，改任何一项都需要重新训练，不能只改代码。
-- PPO 微调用：`actor_logstd`（初值 −2）与新建价值头（350-`hidden_dims`-1）。权重文件没有 critic。
+- PPO 微调用：动作噪声初值 exp(−2)（train.yaml `action_std: 0.135`）与新建价值网络 `value_head`（350-512-256-128-1，`value(obs)`）。权重文件没有 critic。
 
 机器人用 `go2` 工厂的 `actuators: supermimic`：参考仓库的显式 DC 电机（hip/thigh kp 17.69、kd 1.126、
 力矩 23.7/饱和 47.4 N·m、vel 30.1；calf kp 39.81、kd 2.534、45.43/90.86 N·m、vel 20.07；含转子 armature）
@@ -67,13 +67,13 @@ MLP 350-512-256-128-12（ELU）。`policy.py` 的 `features(obs)` 按权重的�
 Newton 原生执行器支持范围内，后端自动改用 Isaac Lab 的 Python 执行器路径（Newton 与 OvPhysX 相同）；
 用 `actuators: native`（IL3 自带 DC 电机预设）时该权重会摔倒。旧 `isaac` 后端没有延迟 DC 电机，选 supermimic 时报错。
 
-planner 每 0.2 s 固定透传 `ball.position`（3 维），不参与 executor 输入，保留以沿用 planner/executor 模板。
+2026-11-25 从 planner/executor 写法迁移成一层：原 planner 只透传 `ball.position`，executor 不读它，已去掉；输入、动作和权重不变，迁移后评估（Newton，32 环境）回报 24.46、平均 48.1 步全部追到，与迁移前相同。`scene_terrain.yaml` 一并改为新写法（按机器人自动控制，不再逐个列关节），粗糙地形评估 95.1% 追到、4.9% 摔倒（此前记录为 95.5%）。
 
 ## 权重
 
 `weights/flat.pt` 随项目一起进 git（`.gitignore` 对 `projects/*/weights/*.pt` 例外放行），哈希与来源见 `weights/WEIGHTS.json`。
-`build_executor` 默认加载它；scene.yaml `executor.parameters.weights` 可换成别的文件（相对本项目或绝对路径），
-写 `null` 则随机初始化。文件缺失时直接报错，不会静默用随机权重。evaluate/view 若另给 checkpoint，在此之上加载。
+`Policy` 默认加载它；scene.yaml `policy.layers.policy.parameters.actor_file` 可换成别的文件（相对本项目或绝对路径），
+写 `null` 则随机初始化（它是参考仓库的格式，不是 RLinf 检查点，所以由模型自己读，不用框架的 `weights`）。文件缺失时直接报错，不会静默用随机权重。evaluate/view 若另给 checkpoint，在此之上加载。
 
 ## 奖励与成功（task.py）
 

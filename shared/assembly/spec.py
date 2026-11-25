@@ -78,6 +78,9 @@ class Entity:
     motion: dict | None = None
     # False: absent from rendered images (cameras, previews, videos); it still collides.
     visible: bool = True
+    # True: its bodies carry no weight, as an arm controller compensating gravity keeps them; the joint drives
+    # then only track their targets (a target set from the measured position does not let the arm sag).
+    gravity_compensation: bool = False
     kind: ClassVar[str] = "entity"
 
 
@@ -290,6 +293,9 @@ class WorldSpec:
                 raise ValueError(f"Entity {path}: kinematic is true or false, on a per-environment physical asset")
             if node.visible is not True and (node.visible is not False or not node.factory or isinstance(node, Sensor)):
                 raise ValueError(f"Entity {path}: visible is true or false, on a physical asset")
+            if node.gravity_compensation is not False and (node.gravity_compensation is not True or not node.factory
+                                                           or isinstance(node, Sensor)):
+                raise ValueError(f"Entity {path}: gravity_compensation is true or false, on a physical asset")
             if node.motion is not None:
                 if node.kinematic is not True:
                     raise ValueError(f"Entity {path}: motion moves kinematic entities; declare kinematic: true")

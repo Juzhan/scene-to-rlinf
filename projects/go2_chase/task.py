@@ -80,7 +80,7 @@ def evaluate(obs: SceneInfo) -> TaskResult:
     fallen = (gravity[:, 2] > -FALL_COS) | (robot.position[:, 2] < -.2)
     outside = (torch.linalg.vector_norm(robot.position[:, :2], dim=-1) - ARENA_RADIUS).clamp(min=0.)
     success = (head_distance < TAG_RADIUS) & ~fallen
-    change = (obs.executor.output - obs.executor.previous_output).square().sum(-1)
+    change = (obs.policy.output - obs.policy.previous_output).square().sum(-1)
     reward = (1.5 * speed_toward + .5 * facing + 1.5 * tag + upright - 2. * outside
               - .05 * tilt_rate - .1 * q.square().sum(-1) - .05 * change
               - 2e-5 * robot.joint_effort.square().sum(-1)

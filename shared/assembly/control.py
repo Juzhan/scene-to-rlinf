@@ -4,6 +4,7 @@ from importlib import import_module
 import math
 
 from .assets import DEFAULT_BACKEND, backend_module
+from .layers import type_name
 
 
 def load_factory(path):
@@ -24,18 +25,63 @@ def component_observations(selection):
     return [{'source': source} for source in selection]
 
 
+CONTROL_MODES = ('joint_position', 'joint_velocity', 'joint_effort')
+
+
+def actuated(node):
+    """Robots the executor drives: assets declaring an articulation (Go2, Piper, Franka) or entities of kind
+    robot; ``node`` is a scene description node or a scene.yaml entity. Articulated objects (drawers, doors)
+    only report joint_state and stay passive; a kinematic entity is moved by scene motion or the Task."""
+    from collections.abc import Mapping
+    from .catalog import asset_capabilities, factory_capabilities
+    field = (lambda name, default=None: node.get(name, default)) if isinstance(node, Mapping) else \
+        (lambda name, default=None: getattr(node, name, default))
+    factory = field('factory')
+    return bool(factory) and not field('kinematic') and (field('kind') == 'robot' or 'articulation' in asset_capabilities(
+        factory, factory_capabilities(factory), field('parameters') or {}))
+
+
+def automatic_outputs(world, modes=None):
+    """One control target per robot of the scene, named after it, driving all its joints in the order of its
+    joint readings (obs.<robot>.joint_position). ``modes`` (control.modes) gives a robot velocity or effort
+    targets, or ``none``: not driven by the policy (it keeps its default targets)."""
+    modes = dict(modes or {})
+    if not isinstance(modes, dict) or any(mode not in (*CONTROL_MODES, 'none') for mode in modes.values()):
+        raise ValueError(f'policy.modes (control.modes) maps robot names to one of {", ".join((*CONTROL_MODES, "none"))}')
+    outputs = {}
+    for path, (node, _) in world.index().items():
+        if not actuated(node):
+            continue
+        key = path.split('/', 1)[1].replace('/', '__')
+        mode = modes.pop(key, 'joint_position')
+        if mode != 'none':
+            outputs[key] = {'type': mode, 'asset_name': key, 'joint_names': ['.*']}
+    if modes:
+        raise ValueError(f'policy.modes (control.modes) names entities that are not robots: {", ".join(sorted(modes))}')
+    return outputs
+
+
+def effective_outputs(control, world):
+    """The control targets of a scene: control.output when it lists them (older projects), else one per
+    robot (automatic_outputs)."""
+    if 'output' in control:
+        if 'modes' in control:
+            raise ValueError('policy.modes applies to automatic targets; with policy.output (control.output) set the type per target')
+        return control['output']
+    return automatic_outputs(world, control.get('modes'))
+
+
 def validate_outputs(outputs):
     if not isinstance(outputs, dict):
         raise ValueError('control.output must map names to control bindings')
     if not outputs:
-        raise ValueError('control.output is empty, so the executor drives no joints (deleting the controlled '
-                         'entity removes its targets); select control targets, then match decode_action in policy.py')
+        raise ValueError('没有受策略控制的机器人（场景里没有机器人，或都在 policy.modes 中设为 none），策略无法驱动任何关节')
     for key, output in outputs.items():
         if not isinstance(key, str) or not key.isidentifier() or key.startswith('_'):
             raise ValueError('Control target names must be public Python identifiers')
         if not isinstance(output, dict) or set(output) != {'type', 'asset_name', 'joint_names'}:
             raise ValueError('Each control output binds type, asset_name and joint_names; implement scaling in policy.py')
-        if output['type'] not in {'joint_position', 'joint_velocity', 'joint_effort'}:
+        if output['type'] not in CONTROL_MODES:
             raise ValueError('Use position, velocity or effort; convert higher-level commands in policy.py')
         if not isinstance(output['joint_names'], list) or not output['joint_names']:
             raise ValueError('A control target must select joints')
@@ -202,6 +248,8 @@ def joint_count(output):
 def declared_dimension(control, role):
     """Output size known from scene.yaml alone: explicit, or executor auto = total endpoint joints."""
     dimension = control['components'][role].get('dimension', 'auto')
+    if dimension is None:  # a policy layer: measured from the model
+        return None
     if type(dimension) is int:
         return dimension
     counts = [joint_count(output) for output in (control.get('output') or {}).values()]
@@ -219,46 +267,66 @@ def period_steps(name, seconds, dt):
 
 
 def component_config(control, project_package):
+    """Validated internal control: ``components`` in order (the last, ``driver``, drives the robots).
+
+    scene.yaml ``policy:`` arrives here as converted by layers.control_from_policy (``layers: True``: one or two
+    layers of any names, output sizes measured at run time); the older ``control:`` has a planner and an executor
+    with declared dimensions."""
     control = deepcopy(control)
-    components = control['components']
-    if set(control) != {'train', 'components', 'output'} or not isinstance(components, dict):
-        raise ValueError('control requires train, components and output')
-    if set(components) != {'planner', 'executor'}:
-        raise ValueError('Declare both planner and executor')
-    validate_outputs(control['output'])
+    components = control.get('components')
+    layered = control.get('layers') is True
+    allowed = {'train', 'components', 'output', 'modes', 'driver', 'layers', 'structure'}
+    if not {'train', 'components'} <= set(control) <= allowed or not isinstance(components, dict):
+        raise ValueError('control requires train and components (output or modes optional)')
+    if 'output' in control and 'modes' in control:
+        raise ValueError('policy.modes applies to automatic targets; with policy.output (control.output) set the type per target')
+    if layered:
+        if not 1 <= len(components) <= 2 or control.get('driver') != list(components)[-1]:
+            raise ValueError('policy.layers names one or two layers; the last drives the robots')
+    else:
+        if set(components) != {'planner', 'executor'}:
+            raise ValueError('Declare both planner and executor')
+        components = {name: components[name] for name in ('planner', 'executor')}
+        control['driver'] = 'executor'
+    if 'output' in control:
+        validate_outputs(control['output'])
     if control['train'] not in components:
-        raise ValueError('control.train must select planner or executor')
-    control['components'] = {name: components[name] for name in ('planner', 'executor') if name in components}
+        raise ValueError(f'control.train must select one of {list(components)}')
+    control['components'] = components
+    driver = control['driver']
     for name, cfg in control['components'].items():
         if cfg.keys() - {'period', 'dimension', 'model', 'parameters', 'observations', 'decode', 'initial', 'history'}:
             raise ValueError(f'{name}: unsupported component fields')
         if not isinstance(cfg.get('model'), str):
-            raise ValueError(f'{name}.model must explicitly select a model factory')
+            raise ValueError(f'{name}.model must explicitly select a model class or factory')
         if cfg['model'].startswith('.'):
             if not project_package:
                 raise ValueError('Relative model factories require a project package')
             cfg['model'] = project_package + cfg['model']
         load_factory(cfg['model'])
-        if name == 'executor' and 'decode' not in cfg:
-            raise ValueError('executor.decode must explicitly map actions to named control targets')
+        if name == driver and 'decode' not in cfg:
+            raise ValueError(f'{name}.decode must explicitly map actions to the robots\' joint targets')
         for field in ('decode', 'initial'):
             if field in cfg:
-                if name != 'executor' or not isinstance(cfg[field], str):
-                    raise ValueError(f'{field} is an executor function')
+                if name != driver or not isinstance(cfg[field], str):
+                    raise ValueError(f'{field} belongs to the layer driving the robots ({driver})')
                 if cfg[field].startswith('.'):
                     cfg[field] = project_package + cfg[field]
                 load_factory(cfg[field])
 
         if not isinstance(cfg.get('parameters', {}), dict):
             raise ValueError('Model parameters must be a mapping')
-        dimension = cfg.get('dimension', 'auto')
-        if dimension != 'auto' and (type(dimension) is not int or dimension <= 0):
-            raise ValueError('Component dimension must be auto or a positive integer')
-        cfg['dimension'] = dimension
-        if name == 'planner' and dimension == 'auto':
-            raise ValueError('A planner must declare its output dimension')
+        if layered:
+            cfg['dimension'] = None  # measured from the model on the first step
+        else:
+            dimension = cfg.get('dimension', 'auto')
+            if dimension != 'auto' and (type(dimension) is not int or dimension <= 0):
+                raise ValueError('Component dimension must be auto or a positive integer')
+            cfg['dimension'] = dimension
+            if name == 'planner' and dimension == 'auto':
+                raise ValueError('A planner must declare its output dimension')
         if not cfg.get('observations'):
-            raise ValueError(f'{name} 尚未选择观察；至少选择一项')
+            raise ValueError(f'{name} 尚未选择输入；在编辑器“策略”里添加，至少一项')
         component_observations(cfg.get('observations'))
         if 'history' in cfg:
             from .history import validate_history
@@ -266,11 +334,18 @@ def component_config(control, project_package):
     return control
 
 
-def compile_control(settings, registry, *, project_package=None, backend=DEFAULT_BACKEND):
+def compile_control(settings, registry, *, project_package=None, backend=DEFAULT_BACKEND, world=None):
+    """``world`` (the scene description) resolves automatic control targets (effective_outputs)."""
     if 'control' not in settings:
         return settings, registry
     settings, registry = deepcopy(settings), deepcopy(registry)
-    control = component_config(settings['control'], project_package)
+    control = dict(settings['control'])
+    if 'output' not in control:
+        if world is None:
+            raise ValueError('Automatic control targets need the scene description')
+        control['output'] = effective_outputs(control, world)
+        control.pop('modes', None)
+    control = component_config(control, project_package)
     components, selected = control['components'], control['train']
     if settings.get('actions') or settings.get('observations'):
         raise ValueError('With control, declare observations on components and basic control in output')
@@ -283,7 +358,7 @@ def compile_control(settings, registry, *, project_package=None, backend=DEFAULT
     targets = target_catalog(settings)
     for name, cfg in components.items():
         periods[name] = period_steps(name, cfg.get('period'), dt)
-        cfg['_view'] = f'{project_package}.observation:{name.capitalize()}Obs' if project_package else None
+        cfg['_view'] = f'{project_package}.observation:{type_name(name)}Obs' if project_package else None
         cfg['_targets'] = {}
         for entry in component_observations(cfg['observations']):
             source = entry['source']
@@ -292,14 +367,19 @@ def compile_control(settings, registry, *, project_package=None, backend=DEFAULT
             elif source in {name + '.output', name + '.previous_output'}:
                 if cfg['dimension'] == 'auto' and name == 'planner':
                     raise ValueError('A recurrent planner must declare dimension')
+                if control.get('layers') and name != selected:
+                    raise ValueError(f'{name} is not trained and keeps no state: it cannot read its own output')
             elif name == 'executor' and source == 'planner.output' and 'planner' in components:
                 pass
+            elif control.get('layers') and source.split('.')[0] in components:
+                pass  # the other layer's output (layers.layer_sources)
             elif source in settings.get('variables', {}):
                 raise ValueError(f'{name}: select basic information; compute {source!r} inside the model')
             elif source != 'simulation.gravity' and not parse_signal(source):
                 raise ValueError(f'{name}: unavailable input {source!r}')
-    if 'planner' in periods and periods['planner'] % periods['executor']:
-        raise ValueError('Executor period must divide planner period')
+    order = list(components)
+    if len(order) == 2 and periods[order[0]] % periods[order[1]]:
+        raise ValueError(f'{order[1]} period must divide {order[0]} period')
     world = settings.setdefault('world', {})
     if 'decimation' in world and world['decimation'] != periods[selected]:
         raise ValueError('world.decimation conflicts with selected component period')

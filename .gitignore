@@ -23,6 +23,7 @@ events.out.tfevents.*
 # Projects are added selectively later: un-ignore with `!/projects/<name>/` or `git add -f`.
 /projects/*
 !/projects/__init__.py
+!/projects/go2_goal/
 !/projects/planner_executor/
 !/projects/piper_pick/
 !/projects/go2_chase/

@@ -54,7 +54,7 @@ bash run.sh train act_lerobot experiment.output=runs/<新目录> data.train_data
 
 ## 训练记录：piper 主从遥操作数据（2026-11-18）
 
-- 数据：`~/ws/outputs/robot_tasks/piper_master_slave/dataset/merged_20261118`，48 回合、15231 帧、30 fps、2 路 640×480 AV1 相机（wrist/external）、7 维状态与动作（6 关节 rad + 夹爪宽度 m）。
+- 数据：`~/ws/outputs/robot_tasks/piper_master_slave/dataset/merged_20261118`（同日 18:29 被移到 `~/ws/outputs/robot_tasks/piper_master_slave/lerobot`，回合与帧数相同），48 回合、15231 帧、30 fps、2 路 640×480 AV1 相机（wrist/external）、7 维状态与动作（6 关节 rad + 夹爪宽度 m）。
 - 命令（`train.yaml` 未改，以下为命令行覆盖）：`bash run.sh train act_lerobot experiment.output=runs/piper_ms_20261118 data.train_data_paths=<上述目录> data.validation_episodes=4 actor.model.chunk_size=100 actor.model.n_action_steps=50 runner.max_steps=50000 runner.val_check_interval=1000 runner.save_interval=10000`。训练 44 回合 14078 帧，验证回合 44–47 共 1153 帧。
 - RTX 5080 约 0.11 s/步，50000 步用时 1 小时 42 分。验证误差（归一化 L1）0.724 → 3000 步 0.409，之后在 0.40–0.42 之间波动，最低 0.399（41000 步，即 `act_best.pt`）；训练损失降到 0.073。
 - `act_best.pt` 已导出为 `runs/piper_ms_20261118/pretrained_model/`。按实际单位逐步统计的平均绝对误差（rad，夹爪 m）：验证回合第 1 步 0.037、第 30 步 0.083、第 100 步 0.109；训练回合各步都在 0.016–0.019。验证回合前约 15 步不如“保持当前位置”的基线（第 1 步基线为 0.015），之后优于基线（第 100 步基线为 0.221）。训练与验证差距大，说明对训练回合拟合充分、对未见回合的泛化有限。
@@ -85,6 +85,12 @@ bash run.sh train act_lerobot experiment.output=runs/<新目录> data.train_data
 两者差别在 5% 左右，各只训练了一个种子，不足以说明哪一方更好。
 
 真机（`piper_real.py`，`--steps 10 --ensemble 0.01 --max-speed 0.9 --max-accel 2.5`，30 秒，红块在绿块右后方）运行 LeRobot 50000 步版本：第 2–6 秒伸向红块，第 7 秒闭合（0.018 m），j1 转向绿块，第 10–12 秒张开；第 16 秒再次闭合，之后夹爪停在约 0.044 m 并保持到结束。现场观察：抓取成功，放置偏离绿块，与本项目版本的表现类似。单次运行，未统计成功率。
+
+## 只用外部相机正常的回合（2026-11-18，`piper_ms_20261118_bright`）
+
+外部相机平均亮度：第 0–24 回合 0.03–0.06（几乎全黑），第 25–47 回合 0.27–0.34。用 `data.episodes=[25,...,47]`、`data.validation_episodes=4` 训练（训练 25–43 共 19 回合 5957 帧，验证 44–47 共 1153 帧），其余设置同 `piper_ms_20261118`。训练到约 37000 步时数据集目录被移走，读取视频失败而中止；验证误差（归一化 L1，归一化统计与全量版不同，不可与之直接比较）在 5000 步为 0.461，最低 0.442（30000 步，`act_best.pt`，已导出 `pretrained_model`）。
+
+验证回合 44–47 上的平均绝对误差（rad / m）：第 1 / 10 / 30 / 50 / 100 步为 0.046 / 0.057 / 0.086 / 0.106 / 0.123，1–50 步平均 0.078，比全量版本（0.073）和 LeRobot 版本（0.070）略差。离线误差不反映外部相机画面的作用，真机效果尚未测试。
 
 ## 真机运行（Piper X）
 

@@ -54,8 +54,8 @@ def _config_type():
         def process_actions(self, actions): self.chain.process(actions)
         def apply_actions(self):
             action = self.chain.advance()
-            if (self.chain.tick - 1) % self.chain.periods['executor'] == 0:
-                targets = self.chain.decode(action, self.chain.readers['executor']())
+            if (self.chain.tick - 1) % self.chain.periods[self.chain.driver] == 0:
+                targets = self.chain.decode(action, self.chain.readers[self.chain.driver]())
                 validate_targets(targets, self.endpoints, self.chain.env.num_envs, action.device)
                 for name, endpoint in self.endpoints.items():
                     endpoint.process_actions(targets[name])

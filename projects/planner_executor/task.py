@@ -22,7 +22,7 @@ def evaluate(obs: SceneInfo) -> TaskResult:
     _, heading = relative_goal(robot.position, robot.orientation, goal.position, yaw(goal.orientation))
     heading = heading[:,0].abs()
     fallen = torch.linalg.vector_norm(obs.contact_forces.contact_force_samples, dim=-1).amax(dim=(1,2)) > 1.
-    action_change = ((obs.executor.output - obs.executor.previous_output) / .25).square().sum(-1)
+    action_change = (obs.executor.output - obs.executor.previous_output).square().sum(-1)  # actions are in units of SCALE
     reward = .5*(1-torch.tanh(distance/2.)) + .5*(1-torch.tanh(distance/.2)) - .2*heading - 400.*fallen - .01*action_change
     return {'reward': reward, 'failure': fallen,
             'metrics': {'distance_m': distance, 'heading_error_rad': heading, 'reached': distance < .5, 'fallen': fallen}}

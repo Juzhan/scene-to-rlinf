@@ -48,7 +48,7 @@ class Task:
         held = self.memory.hold('held', grasped & (height >= LIFT) & (speed < STILL_SPEED), dt)
         success = held >= HOLD_TIME - 1e-6
         dropped = (torch.linalg.vector_norm(cube[:, :2] - obs.cube_area.position[:, :2], dim=-1) > .6) | (cube[:, 2] < -.05)
-        action_change = (obs.executor.output - obs.executor.previous_output).square().sum(-1)
+        action_change = (obs.policy.output - obs.policy.previous_output).square().sum(-1)
         # 稠密奖励
         reward = (1 - torch.tanh(reach / .1)                                  # approach the cube
                   + .5 * (reach < .03) * (1 - opening / .1)                   # close the gripper on it

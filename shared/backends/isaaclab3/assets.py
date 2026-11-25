@@ -16,7 +16,7 @@ from shared.backends.isaac.assets import FACTORY_SCOPES  # noqa: F401
 # none carries a quaternion, and their root poses are left to scene.py (xyzw). PhysX-only schema
 # fields (solver iterations, combine modes) apply on OvPhysX and are ignored by Newton, as in
 # Isaac Lab 3's own presets.
-from shared.backends.isaac.assets import (clear_sky, contact_sensor, dex_cube, m20, piper, piper_x,
+from shared.backends.isaac.assets import (clear_sky, dex_cube, m20, piper, piper_x,
                                           seattle_table, terrain, usd_robot)
 
 
@@ -86,8 +86,23 @@ def franka_panda(fix_root_link=True, tracking: FrankaTracking = 'native'):
     return config
 
 
+def _pd_actuators(usd_path, actuators):
+    """Implicit PD actuator groups of usd_object(actuators=...), one per joint-name pattern."""
+    from isaaclab.actuators import ImplicitActuatorCfg
+    groups = {}
+    for index, (pattern, gains) in enumerate((actuators or {}).items()):
+        if not isinstance(gains, dict) or 'stiffness' not in gains or set(gains) - {'stiffness', 'damping', 'effort_limit'}:
+            raise ValueError(f'{usd_path}: actuators[{pattern!r}] takes stiffness, damping and an optional effort_limit')
+        limit = gains.get('effort_limit')
+        groups[f'drive_{index}'] = ImplicitActuatorCfg(
+            joint_names_expr=[pattern], stiffness=float(gains['stiffness']), damping=float(gains.get('damping', 0.0)),
+            joint_effort_limit=None if limit is None else float(limit))
+    return groups
+
+
 def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False, springs: dict | None = None,
-               exclude: list | None = None, prim: str | None = None, moved: dict | None = None):
+               exclude: list | None = None, prim: str | None = None, moved: dict | None = None,
+               actuators: dict | None = None, couplings: dict | None = None):
     """Imported USD object, simulated as its UsdPhysics schemas say (``usd_body_structure``).
 
     One rigid body is a dynamic rigid object; jointed bodies are an articulation without actuators,
@@ -97,6 +112,14 @@ def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False, springs: dic
     about 1 mm of travel, far below the weight of the cap, so its buttons rest pressed in. Newton's
     MuJoCo-Warp solver integrates a stiff spring on a light part explicitly: keep stiffness / moving mass
     below about 1 / substep^2 (4e4 at 5 ms), else the joint diverges.
+    ``couplings`` (follower joint -> ``{leader, ratio, offset}``, follower = ratio * leader + offset in rad or m)
+    links joints physically, on Newton and OvPhysX alike (``joint_coupling_layer``): a trash can's lid opens as
+    its pedal is pressed, a dial's needle turns with its knob.
+    ``actuators`` drives the joints of an articulated object as a robot: joint-name pattern ->
+    ``{stiffness, damping, effort_limit?}`` (N·m/rad and N·m·s/rad, prismatic N/m and N·s/m; the limit
+    defaults to the USD's), Isaac Lab implicit PD actuators following the position targets (the executor's,
+    or the default pose of a robot set to ``none``). Without it the joints follow only the USD's drives, so
+    an imported robot whose USD authors no stiffness hangs limp.
     ``exclude`` lists prims (relative to the default prim) left out, e.g. objects removed from an indoor
     scene in the editor, and ``moved`` gives objects another pose, still static (object -> ``{position,
     orientation}`` in the entity frame; ``scene_edit_layer``, shared/assembly/composition.py).
@@ -108,14 +131,14 @@ def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False, springs: dic
     when the USD authors none."""
     import isaaclab.sim as sim
     from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
-    from shared.asset_formats import (authored_top_scale, joint_spring_layer, object_layer, scene_edit_layer,
+    from shared.asset_formats import (authored_top_scale, joint_coupling_layer, joint_spring_layer, object_layer, scene_edit_layer,
                                       recorded_joint_order, usd_authored_mass, usd_body_structure, usd_joint_order,
-                                      usd_root_offset)
+                                      usd_root_offset, usd_zero_outside_limits)
 
     path = workspace_file(usd_path)
     structure = usd_body_structure(path)
     if prim is not None:
-        if structure != 'static' or exclude or springs or moved:
+        if structure != 'static' or exclude or springs or moved or couplings:
             raise ValueError(f'{usd_path}: prim takes one object out of a static scene, as it is '
                              '(no exclude, moved or springs)')
         scale = tuple(scale) if isinstance(scale, (list, tuple)) else (float(scale),) * 3
@@ -131,26 +154,33 @@ def usd_object(usd_path, mass=None, scale=1.0, fix_root_link=False, springs: dic
     offset = usd_root_offset(path) if structure != 'static' else None
     if offset is not None:
         # Isaac Lab writes the scene pose to the root body: the asset would start displaced by this offset.
-        raise ValueError(f'{usd_path}: its root body sits at {[round(v, 3) for v in offset]} m from the asset origin; '
-                         'Isaac Lab would place that body, not the asset, at the scene pose. Wrap it with '
+        raise ValueError(f'{usd_path}: its root body is moved ({[round(v, 3) for v in offset]} m) or turned from the asset '
+                         'frame; Isaac Lab would place that body, not the asset, at the scene pose. Wrap it with '
                          '`run.py asset simready` (which moves the body frame onto the asset origin)')
     scale = tuple(scale) if isinstance(scale, (list, tuple)) else (float(scale),) * 3
     # Isaac Lab replaces the top prim's scale with the spawn scale; keep the one the file authors
     # (e.g. the 0.01 unit conversion of a centimetre environment wrapper).
     scale = tuple(a * b for a, b in zip(scale, authored_top_scale(path)))
-    if springs and structure != 'articulation':
-        raise ValueError(f'{usd_path}: springs act on movable joints; this object has none')
+    if (springs or couplings) and structure != 'articulation':
+        raise ValueError(f'{usd_path}: springs and couplings act on movable joints; this object has none')
     layer = scene_edit_layer(path, exclude, moved) if exclude or moved else path
-    spawn = sim.UsdFileCfg(usd_path=str(joint_spring_layer(layer, springs) if springs else layer), scale=scale)
+    layer = joint_spring_layer(layer, springs) if springs else layer
+    spawn = sim.UsdFileCfg(usd_path=str(joint_coupling_layer(layer, couplings) if couplings else layer), scale=scale)
     if structure == 'articulation':
         if mass is not None:
             raise ValueError(f'{usd_path}: an articulated object takes its link masses from the USD')
         spawn.articulation_props = sim.ArticulationRootPropertiesCfg(fix_root_link=fix_root_link)
         initial = ArticulationCfg.InitialStateCfg()
-        if not (recorded_joint_order(path) or usd_joint_order(path)):
+        joints = recorded_joint_order(path) or usd_joint_order(path)
+        if not joints:
             # Parts held by fixed joints only: the default '.*' joint pattern would match nothing.
             initial.joint_pos, initial.joint_vel = {}, {}
-        return ArticulationCfg(prim_path="", spawn=spawn, init_state=initial, actuators={})
+        elif outside := usd_zero_outside_limits(path):
+            # A joint that cannot be at 0 starts at its nearest limit (a scene's initial_state may set others).
+            initial.joint_pos = {name: outside.get(name, 0.) for name in joints}
+        return ArticulationCfg(prim_path="", spawn=spawn, init_state=initial, actuators=_pd_actuators(usd_path, actuators))
+    if actuators:
+        raise ValueError(f'{usd_path}: actuators drive movable joints; this object has none')
     if structure == 'static' and mass is None:
         return AssetBaseCfg(prim_path="", spawn=spawn)
     if mass is None and not fix_root_link and not usd_authored_mass(path):
@@ -239,7 +269,19 @@ def ball(radius: float = .12, mass: float = .2,
     return RigidObjectCfg(prim_path='', spawn=spawn)
 
 
-def height_scanner(pattern, **parameters):
+def contact_sensor(update_period: float = 0.0, history_length: int = 0, track_air_time: bool = False,
+                   force_threshold: float | None = None, **parameters):
+    """Isaac Lab's ContactSensor on the mount body (or every body its pattern matches): net contact force
+    per body, the last ``history_length`` steps, and air/contact time when ``track_air_time``."""
+    from isaaclab.sensors import ContactSensorCfg
+    if force_threshold is not None:  # else Isaac Lab's own default
+        parameters["force_threshold"] = force_threshold
+    return ContactSensorCfg(prim_path="", update_period=update_period, history_length=history_length,
+                            track_air_time=track_air_time, **parameters)
+
+
+def height_scanner(pattern: dict, update_period: float = 0.0, max_distance: float = 1e6,
+                   ray_alignment: Literal['base', 'yaw', 'world'] = 'base', **parameters):
     """Isaac Lab 3's RayCaster (on Newton its shape-BVH NewtonRaycastSensor) with a grid pattern.
 
     The scene builder sets the mount body, the sensor pose as offset and ``global_world_only``
@@ -251,7 +293,8 @@ def height_scanner(pattern, **parameters):
     grid = dict(pattern)
     grid['size'] = tuple(grid['size'])
     # The sensor tracks its mount body prim; Lab 3 deprecates spawning a sensor-frame child.
-    return RayCasterCfg(prim_path='', spawn=None, **parameters, pattern_cfg=patterns.GridPatternCfg(**grid))
+    return RayCasterCfg(prim_path='', spawn=None, update_period=update_period, max_distance=max_distance,
+                        ray_alignment=ray_alignment, **parameters, pattern_cfg=patterns.GridPatternCfg(**grid))
 
 
 @checked(camera_parameters)
@@ -330,5 +373,5 @@ NO_SHAPES = ('dome_light', 'clear_sky')
 # Sensors this backend binds to a mount body; height_scanner also casts at ``meshes``.
 SENSORS = ('height_scanner', 'contact_sensor', 'frame_transformer', 'camera')
 RAY_SENSORS = ('height_scanner',)
-# Sensors that may also stand fixed in the world, without a mount: none, every sensor follows a body.
-FREE_SENSORS = ()
+# Sensors that may also stand fixed in the world, without a mount: a camera, spawned in its environment.
+FREE_SENSORS = ('camera',)

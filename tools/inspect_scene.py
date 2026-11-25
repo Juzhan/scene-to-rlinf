@@ -46,7 +46,10 @@ def native_interface(native):
         if hasattr(term.cfg, "control"):
             result["control"] = {
                 "train": term.cfg.control["train"],
-                "components": [{"name": key, "dimension": term.chain.outputs[key].shape[1],
+                # A layer returning a dict reports the size of each entry.
+                "components": [{"name": key, "dimension": (term.chain.outputs[key].shape[1]
+                                if not isinstance(term.chain.outputs[key], dict) else
+                                {part: list(tensor.shape[1:]) for part, tensor in term.chain.outputs[key].items()}),
                                 "period_s": value["period"],
                                 "trained": key == term.cfg.control["train"]}
                                for key, value in term.cfg.control["components"].items()],

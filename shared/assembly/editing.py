@@ -58,6 +58,14 @@ def _merge(target, patch):
     for key, value in patch.items():
         if key in ("reset", "initial_state", "motion"):
             target[key] = deepcopy(value)
+        elif key == "parameters" and isinstance(value, dict):
+            # Each parameter is one value (a joint -> coupling map is replaced, not merged); None removes it.
+            parameters = target[key] = deepcopy(target.get(key) or {})
+            for name, item in value.items():
+                if item is None:
+                    parameters.pop(name, None)
+                else:
+                    parameters[name] = deepcopy(item)
         elif isinstance(value, dict) and isinstance(target.get(key), dict):
             # Detach YAML aliases: one instance's edit must not edit another.
             target[key] = deepcopy(target[key])
@@ -101,6 +109,16 @@ def _rename_in_place(value, rename):
 def _check_name(name):
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
         raise ValueError("Names must start with a letter or underscore and contain only letters, digits or underscores")
+
+
+def policy_section(data):
+    """``(section, layers, inputs key)`` of a scene: the ``policy:`` with its ``layers`` (``inputs``), or the older
+    ``control:`` with its ``components`` (``observations``); ``(None, {}, None)`` without either."""
+    if 'policy' in data:
+        return data['policy'], data['policy'].get('layers', {}), 'inputs'
+    if 'control' in data:
+        return data['control'], data['control'].get('components', {}), 'observations'
+    return None, {}, None
 
 
 class SceneDocument:
@@ -207,7 +225,9 @@ class SceneDocument:
         if path not in self.targets:
             raise ValueError(f"Unknown entity: {path}")
         allowed = {"pose", "parameters", "tags", "initial_state", "reset", "mount", "meshes", "kinematic",
-                   "motion", "visible"}
+                   "motion", "visible", "kind", "gravity_compensation"}
+        if changes.get("kind", "robot") not in ("robot", "entity"):
+            raise ValueError("kind can only switch between robot (driven by the policy) and entity")
         if self.entities[path].get("kind") == "abstract":
             allowed = {"pose", "tags", "reset", "mount", "shape", "size", "motion"}
         if changes.keys() - allowed:
@@ -252,7 +272,12 @@ class SceneDocument:
                 raise ValueError("visible is true or false")
             if changes["visible"]:  # The default: written only when false.
                 changes["visible"] = None
-        for key in ("reset", "mount", "meshes", "kinematic", "motion", "visible"):
+        if "gravity_compensation" in changes:
+            if not isinstance(changes["gravity_compensation"], bool):
+                raise ValueError("gravity_compensation is true or false")
+            if not changes["gravity_compensation"]:  # The default: written only when true.
+                changes["gravity_compensation"] = None
+        for key in ("reset", "mount", "meshes", "kinematic", "motion", "visible", "gravity_compensation"):
             # None clears an optional rule (static, unmounted entity, no ray targets, dynamic body, no motion,
             # rendered).
             if key in changes and changes[key] is None and self.targets[path][1] is None:
@@ -301,12 +326,20 @@ class SceneDocument:
     def removal_effects(self, removed):
         """Control targets and observations that removing the ``removed`` paths takes with it."""
         keys, _, dropped = self._removal_filter(removed)
-        control = self.data.get('control', {})
-        terms = [term for component in control.get('components', {}).values() for term in component['observations']]
+        control, layers, key = policy_section(self.data)
+        control = control or {}
+        terms = [term for component in layers.values() for term in component.get(key, [])]
         for value in self.data.get('observations', {}).values():
             terms += value.get('terms', []) if isinstance(value, dict) else value
-        return {'outputs': sorted(name for name, binding in control.get('output', {}).items()
-                                  if binding['asset_name'] in keys),
+        if 'output' in control:
+            outputs = sorted(name for name, binding in control['output'].items() if binding['asset_name'] in keys)
+        else:  # automatic targets: the removed robots (control.automatic_outputs)
+            from .control import actuated
+            modes = control.get('modes', {})
+            outputs = sorted(key for path, entry in self.entities.items()
+                             if (key := path.split('/', 1)[1].replace('/', '__')) in keys
+                             and actuated(entry) and modes.get(key) != 'none') if control else []
+        return {'outputs': outputs,
                 'observations': sorted({term for term in terms if dropped(term)})}
 
     def remove_entities(self, paths):
@@ -373,8 +406,9 @@ class SceneDocument:
             if (joint.get('parent') or {}).get('entity') in removed and joint['child']['entity'] not in removed:
                 raise ValueError(f"{joint['child']['entity']} 固定在被删除的实体上；请先解除连接"
                                  "（网页编辑器删除时会自动保留其位置）")
-        for role, component in self.data.get('control', {}).get('components', {}).items():
-            if component['observations'] and all(dropped(term) for term in component['observations']):
+        _, layers, key = policy_section(self.data)
+        for role, component in layers.items():
+            if component.get(key) and all(dropped(term) for term in component[key]):
                 raise ValueError(f"删除后 {role} 没有任何观察输入；请先在观察页为 {role} 选择其他输入，再删除")
         def container(path):
             parent = dirname(path)
@@ -438,9 +472,10 @@ class SceneDocument:
                     value.get('overrides', {}).pop(term, None)
             else:
                 self.data['observations'][profile] = kept
-        control = self.data.get('control', {})
-        for component in control.get('components', {}).values():
-            component['observations'] = [term for term in component['observations'] if not dropped(term)]
+        control, layers, key = policy_section(self.data)
+        control = control or {}
+        for component in layers.values():
+            component[key] = [term for term in component.get(key, []) if not dropped(term)]
             if isinstance(component.get('history'), dict):
                 component['history'] = {k: v for k, v in component['history'].items() if not dropped(k)}
                 if not component['history']:
@@ -448,6 +483,10 @@ class SceneDocument:
         for name, binding in list(control.get('output', {}).items()):
             if binding['asset_name'] in keys:
                 del control['output'][name]
+        for name in [name for name in control.get('modes', {}) if name in keys]:
+            del control['modes'][name]
+        if 'modes' in control and not control['modes']:
+            del control['modes']
         for name, action in list(self.data.get('actions', {}).items()):
             if action.get('asset_name') in keys:
                 del self.data['actions'][name]
@@ -473,6 +512,68 @@ class SceneDocument:
                         return 'entity__' + new_key + text[len('entity__' + old_key):]
                 return text
             _rename_in_place(self.data, rename)
+        self._index()
+
+    def rename_entity(self, path, name):
+        """Rename the entity at ``path`` to ``name`` and every reference to it: paths (mounts, parents, regions,
+        authoring), observation names (``name.joint_position``), control modes and native keys. A plain string
+        equal to the old name is left alone unless it is a mapping key: a factory may share it (franka_panda).
+        Policy and task code read ``obs.<name>`` and must follow by hand."""
+        from posixpath import dirname
+        if path not in self.entities:
+            raise ValueError(f'场景中没有 {path}')
+        if not (name.isascii() and name.isidentifier()) or name.startswith('_'):
+            raise ValueError(f'实体名须是 Python 标识符（字母、数字、下划线，不以下划线开头）：{name!r}')
+        raw, inner = self.targets[path]
+        if inner is not None:
+            raise ValueError(f'{path} 由模板定义，请在模板中改名')
+        new = dirname(path) + '/' + name
+        if new == path:
+            return
+        if new in self.entities:
+            raise ValueError(f'已有实体 {new}')
+        world = self.data.get('name', 'world') + '/'
+        old_relative, new_relative = path.removeprefix(world), new.removeprefix(world)
+        old_dot, new_dot = old_relative.replace('/', '.'), new_relative.replace('/', '.')
+        old_key, new_key = old_relative.replace('/', '__'), new_relative.replace('/', '__')
+
+        def value(text):
+            if text == path or text.startswith(path + '/'):
+                return new + text[len(path):]
+            if text.startswith(old_dot + '.'):
+                return new_dot + text[len(old_dot):]
+            if text.startswith(old_key + '__'):
+                return new_key + text[len(old_key):]
+            if text.startswith('entity__' + old_key + '__'):
+                return 'entity__' + new_key + text[len('entity__' + old_key):]
+            return text
+
+        def walk(item):
+            if isinstance(item, dict):
+                for index, key in enumerate(list(item)):
+                    child = walk(item[key])
+                    renamed = (new_key if key == old_key else value(key)) if isinstance(key, str) else key
+                    if renamed != key:
+                        del item[key]
+                        if hasattr(item, 'insert'):
+                            item.insert(index, renamed, child)
+                        else:
+                            item[renamed] = child
+                    elif child is not item[key]:
+                        item[key] = child
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    renamed = walk(child)
+                    if renamed is not child:
+                        item[index] = renamed
+            elif isinstance(item, str):
+                renamed = value(item)
+                return item if renamed == item else renamed
+            return item
+        raw['name'] = name
+        labels = self.data.get('authoring', {}).get('labels', {})
+        labels.pop(path, None)  # it is shown by its new name
+        walk(self.data)
         self._index()
 
     def set_layout_parent(self, path, value):
@@ -528,18 +629,55 @@ class SceneDocument:
             groups[name] = deepcopy(value)
         self._index()
 
+    def add_layer(self, name, *, model, period, inputs):
+        """Split a one-layer policy: a new layer ``name`` before it, which it then reads (scene.yaml only; the
+        code of the new layer is policy.py's)."""
+        policy = self.data.get('policy')
+        if policy is None:
+            raise ValueError('只有 policy: 写法的项目能增加一层（control: 是旧写法）')
+        layers = policy['layers']
+        if len(layers) != 1:
+            raise ValueError('策略已经有两层')
+        if not isinstance(name, str) or not name.isidentifier() or not name.isascii() or name.startswith('_') \
+                or name in layers or name in ('simulation', 'input') \
+                or any(path.split('/', 1)[-1].replace('/', '__') == name for path in self.entities):
+            raise ValueError(f'层名 {name!r} 须为英文标识符，且不与实体或已有的层重名')
+        if not isinstance(inputs, list) or not inputs:
+            raise ValueError('新的一层至少读一项输入')
+        existing = next(iter(layers))
+        layers.insert(0, name, {'model': model, 'period': period, 'inputs': list(inputs)})
+        if name not in layers[existing]['inputs']:
+            layers[existing]['inputs'].append(name)
+        policy['train'] = policy.get('train', existing)
+
+    def remove_layer(self, name):
+        """Merge a two-layer policy back into the other layer (scene.yaml only; policy.py keeps the code)."""
+        policy = self.data.get('policy')
+        if policy is None or name not in policy.get('layers', {}) or len(policy['layers']) != 2:
+            raise ValueError('只能从两层的策略中去掉一层')
+        layers = policy['layers']
+        remaining = next(key for key in layers if key != name)
+        layers[remaining]['inputs'] = [token for token in layers[remaining]['inputs']
+                                       if token.partition('.')[0] != name]
+        if not layers[remaining]['inputs']:
+            raise ValueError(f'去掉 {name} 后 {remaining} 没有输入；先给 {remaining} 选择其他输入')
+        del layers[name]
+        policy.pop('train', None)
+
     def set_observations(self, profile, terms):
         if terms and set(terms).intersection(self.data.get('variables', {})):
             raise ValueError('Select basic information; compute model features in policy.py')
-        if 'control' in self.data:
-            control = self.data['control']
-            role = control['train'] if profile == 'states' else profile
-            if role not in control['components']:
-                raise ValueError('Select planner or executor observations')
+        control, layers, key = policy_section(self.data)
+        if control is not None:
+            role = (control.get('train') or next(iter(layers))) if profile == 'states' else profile
+            if role not in layers:
+                raise ValueError(f'Select the inputs of one of {list(layers)}')
             if not isinstance(terms, list) or not terms or len(set(terms)) != len(terms):
                 raise ValueError('Choose a nonempty ordered list of unique observations')
-            component = control['components'][role]
-            component['observations'] = list(terms)
+            component = layers[role]
+            from .layers import layer_tokens
+            terms = layer_tokens(terms, layers) if key == 'inputs' else list(terms)
+            component[key] = list(terms)
             if isinstance(component.get('history'), dict):
                 # A deselected observation takes its window with it; kept ones keep their length.
                 component['history'] = {k: v for k, v in component['history'].items() if k in terms}
@@ -754,6 +892,7 @@ class SceneDocument:
                              "camera_only": node.get("camera_only", False),
                              "kinematic": bool(node.get("kinematic", False)), "scope": meta.get("scope"),
                              "motion": _plain(node.get("motion")), "visible": node.get("visible", True) is not False,
+                             "gravity_compensation": node.get("gravity_compensation", False) is True,
                              "display_pose": display_pose,
                              "pose_authored": "pose" in node, "parameters": node.get("parameters", {}),
                              "tags": node.get("tags", []), "mount": mount, "meshes": list(node.get("meshes", [])),
@@ -764,8 +903,10 @@ class SceneDocument:
                              "transform_frame": "body-local" if mount else "parent-local"})
         return {"scene": str(self.path), "name": self.data.get("name", "world"),
                 "revision": self.revision, "entities": entities, "catalog": catalog,
-                "observations": _plain({role: component.get("observations", []) for role, component in self.data["control"]["components"].items()} if "control" in self.data else self.data.get("observations", {})),
-                "control": _plain(self.data.get("control", {})),
+                "observations": _plain({role: component.get("observations", []) for role, component in self._control().get("components", {}).items()}
+                                       if self._control() else self.data.get("observations", {})),
+                "control": _plain(self._control()),
+                "policy": _plain(self.data.get("policy")),
                 "actions": _plain(self.data.get("actions", {})),
                 "task": _plain(self.data.get("task", {})),
                 "variables": _plain(self.data.get("variables", {})),
@@ -775,6 +916,13 @@ class SceneDocument:
                 "layout_groups": _plain(self.data.get("authoring", {}).get("groups", {})),
                 "layout_parents": _plain(self.data.get("authoring", {}).get("parents", {})),
                 "interface": self._interface()}
+
+    def _control(self):
+        """The internal control mapping (layers.control_from_policy for a ``policy:``), {} without a policy."""
+        if 'policy' in self.data:
+            from .layers import control_from_policy
+            return control_from_policy(_plain(self.data['policy']), self.path.parent)
+        return self.data.get('control', {})
 
     def _interface(self):
         from .interfaces import load_interface
@@ -841,7 +989,7 @@ def _preview(node, directory, metadata=None):
 
 def apply_edits(path, payload):
     """Apply explicit edits from a CLI/Blender snapshot; fail on external changes."""
-    allowed = {"control_train", "components", "revision", "entities", "visualization", "observations", "actions", "rewards", "task", "variables", "add_entities", "connections", "layout_groups", "remove_entities", "layout_parents", "labels", "selectable"}
+    allowed = {"layers", "control_train", "control_modes", "components", "revision", "entities", "visualization", "observations", "actions", "rewards", "task", "variables", "add_entities", "connections", "layout_groups", "remove_entities", "layout_parents", "labels", "selectable", "rename"}
     if not isinstance(payload, dict) or payload.keys() - allowed:
         raise ValueError("Unknown edit payload fields; expected revision, entities, visualization, observations, actions, components, rewards, add_entities, connections or layout_groups")
     document = SceneDocument(path)
@@ -867,17 +1015,40 @@ def apply_edits(path, payload):
         validate_evaluation(evaluation_config(document.data))
     for change in payload.get("entities", []):
         document.set_entity(change["path"], change["changes"], frame=change.get("frame", "local"))
+    if 'layers' in payload:  # {'add': {name, model, period, inputs}} or {'remove': name}
+        change = payload['layers']
+        if 'add' in change:
+            document.add_layer(**change['add'])
+        if 'remove' in change:
+            document.remove_layer(change['remove'])
     if 'control_train' in payload:
-        control = document.data.get('control', {})
+        control, layers, _ = policy_section(document.data)
         role = payload['control_train']
-        if role not in control.get('components', {}):
-            raise ValueError('Select an existing planner or executor')
+        if role not in layers:
+            raise ValueError(f'Select one of the layers {list(layers)}')
         control['train'] = role
         document.data.get('world', {}).pop('decimation', None)
+    if 'control_modes' in payload:
+        from .control import CONTROL_MODES
+        control, _, _ = policy_section(document.data)
+        if control is None or 'output' in control:
+            raise ValueError('control.modes applies to automatic robot control; this scene lists control.output')
+        modes = control.setdefault('modes', {})
+        for robot, mode in payload['control_modes'].items():
+            if mode not in (*CONTROL_MODES, 'none'):
+                raise ValueError(f'{robot}: control mode must be one of {", ".join((*CONTROL_MODES, "none"))}')
+            if mode == 'joint_position':  # the default
+                modes.pop(robot, None)
+            else:
+                modes[robot] = mode
+        if not modes:
+            del control['modes']
     for role, fields in payload.get('components', {}).items():
-        component = document.data.get('control', {}).get('components', {}).get(role)
-        if component is None or not isinstance(fields, dict) or fields.keys() - {'period', 'dimension'}:
-            raise ValueError('组件只能修改 period 与 dimension')
+        _, layers, key = policy_section(document.data)
+        component = layers.get(role)
+        editable = {'period'} if key == 'inputs' else {'period', 'dimension'}  # a policy layer's sizes come from its model
+        if component is None or not isinstance(fields, dict) or fields.keys() - editable:
+            raise ValueError('组件只能修改 ' + ' 与 '.join(sorted(editable)))
         from .control import period_steps
         dt = float(document.data.get('simulation', {}).get('dt', .005))
         if 'period' in fields:
@@ -908,6 +1079,9 @@ def apply_edits(path, payload):
         if not isinstance(value, dict) or value.keys() - {"abstract"}:
             raise ValueError("visualization edits support abstract")
         document.set_visualization(value.get("abstract", []))
+    # Last, as every other edit names entities by their current paths: {path: new name}.
+    for entity, name in (payload.get("rename") or {}).items():
+        document.rename_entity(entity, name)
     # Resolve all names/references before writing, so a bad edit leaves the
     # original YAML intact. The simulator still validates native tensor shapes.
     document.snapshot()

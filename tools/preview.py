@@ -23,7 +23,8 @@ def parse_options(arguments, operation):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=600)
-    parser.add_argument("--actions", choices=("zero", "random", "policy"))
+    parser.add_argument("--actions", choices=("hold", "zero", "random", "policy"),
+                        help="hold (default): repeat the executor's initial action (its initial pose); zero: all-zero actions")
     parser.add_argument("--random-scale", type=float, default=0.1)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--snapshot", type=Path, help="Use a saved project's frozen source (handled by run.py)")
@@ -32,6 +33,9 @@ def parse_options(arguments, operation):
     parser.add_argument("--allow-legacy-checkpoint", action="store_true", help="Explicitly accept weights without saved interface metadata")
     parser.add_argument("--camera-eye", type=float, nargs=3)
     parser.add_argument("--camera-target", type=float, nargs=3)
+    parser.add_argument("--camera", help="Show (view) or record the scene camera of this name, as its renderer draws it for the policy")
+    parser.add_argument("--camera-render", action="store_true",
+                        help="Draw the preview viewpoint with the scene cameras' renderer (Newton Warp or OVRTX) instead of the GL viewer")
     options, overrides = parser.parse_known_args(arguments)
     if not 1 <= options.num_envs <= 16:
         parser.error("--num-envs must be between 1 and 16")
@@ -48,7 +52,7 @@ def parse_options(arguments, operation):
             parser.error(f"Checkpoint not found: {options.checkpoint}")
         if options.actions not in (None, "policy"):
             parser.error("--checkpoint requires policy actions")
-    options.actions = options.actions or ("policy" if options.checkpoint else "zero")
+    options.actions = options.actions or ("policy" if options.checkpoint else "hold")
     return options, overrides
 
 
@@ -113,6 +117,10 @@ def preview(cfg, options, *, recording):
             viewer["eye"] = tuple(options.camera_eye)
         if options.camera_target is not None:
             viewer["lookat"] = tuple(options.camera_target)
+        if options.camera:
+            viewer["scene_cameras"] = True  # the scene's cameras render, whatever its enable_cameras says
+        if options.camera_render:
+            viewer["render"] = "camera"  # the backend draws the viewpoint through a camera (and errs if it cannot)
         constructor = constructor or make_simulation
         environment, owner = constructor(
             parameters, options.num_envs, cfg.env.train.seed, cfg.env.train.max_episode_steps,
@@ -136,6 +144,19 @@ def preview(cfg, options, *, recording):
             from omni.appwindow import get_default_app_window
 
             subscription = get_default_app_window().get_window_close_event_stream().create_subscription_to_pop(request_stop)
+        if options.camera and not hasattr(native, "camera_image"):
+            raise ValueError("--camera needs a backend that renders scene cameras for preview (isaaclab3)")
+        if options.camera_render and not hasattr(native, "show_preview"):
+            raise ValueError("--camera-render needs a backend that renders the viewpoint through a camera (isaaclab3)")
+        if options.camera:
+            native.camera_image(options.camera)  # an unknown name fails before the run starts
+
+        def camera_frame():
+            image = native.camera_image(options.camera)
+            # Small sensor images are scaled up by whole pixels for the video, keeping their pixels visible.
+            factor = max(1, 640 // image.shape[1])
+            return image.repeat(factor, axis=0).repeat(factor, axis=1) if factor > 1 else image
+
         dimension = native.action_manager.total_action_dim
         if dimension != parameters.action_dim:
             raise ValueError(f"Configured action_dim={parameters.action_dim}, actual={dimension}")
@@ -160,17 +181,26 @@ def preview(cfg, options, *, recording):
             else:
                 print("WARNING: policy preview uses an untrained model", flush=True)
         generator = torch.Generator(device=environment.device).manual_seed(cfg.env.train.seed)
+        # The assembly control chain (shared/assembly/policy_runtime): its initial executor action, when the
+        # executor is the trained component whose actions the preview stands in for.
+        chain = getattr(native, "_assembly_control_chain", None)
+        if chain is not None and chain.selected != "executor":
+            chain = None
         if recording:
             import imageio.v2 as imageio
 
             for _ in range(30):
                 if application is not None:
                     native.sim.render()
-                frame = native.render()
+                frame = camera_frame() if options.camera else native.render()
                 if frame is not None and frame.size and frame.std() > 1:
                     break
             else:
-                raise RuntimeError("Renderer did not produce a nonblank frame")
+                if not options.camera:
+                    raise RuntimeError("Renderer did not produce a nonblank frame")
+                # A scene camera may well see one flat colour (a wall, the inside of its own housing).
+                print(f"WARNING: camera {options.camera} sees a single colour; check where it is mounted and where it looks",
+                      flush=True)
             imageio.imwrite(destination / "first_frame.png", frame)
             video = destination / "preview.mp4"
             writer = imageio.get_writer(str(video), fps=1 / native.step_dt,
@@ -195,6 +225,8 @@ def preview(cfg, options, *, recording):
                 elif options.actions == "random":
                     actions = (2 * torch.rand((options.num_envs, dimension), device=environment.device,
                                              generator=generator) - 1) * options.random_scale
+                elif options.actions == "hold" and getattr(chain, "initial_output", None) is not None:
+                    actions = chain.initial_output.clone()  # the executor's initial action, every step
                 else:
                     actions = torch.zeros((options.num_envs, dimension), device=environment.device)
                 if not torch.isfinite(actions).all():
@@ -215,9 +247,13 @@ def preview(cfg, options, *, recording):
                 report["resets"] += int((terminated | truncated).sum())
                 report["terminated"] += int(terminated.sum())
                 report["truncated"] += int(truncated.sum())
+                if options.camera and not recording:
+                    native.show_image(native.camera_image(options.camera))
+                elif options.camera_render and not recording:
+                    native.show_preview()
                 if writer is not None:
-                    frame = native.render()
-                    if frame is None or not frame.size or frame.std() <= 1:
+                    frame = camera_frame() if options.camera else native.render()
+                    if frame is None or not frame.size or (frame.std() <= 1 and not options.camera):
                         raise RuntimeError("Renderer returned a blank frame")
                     writer.append_data(frame)
                 # A backend that draws its own window reports when the user closed it.

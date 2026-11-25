@@ -66,15 +66,16 @@ class PreparedScene:
     backend: str = DEFAULT_BACKEND
 
 
-def project_registry(package=None, *, factories=None, terms=None, tasks=None, backend=DEFAULT_BACKEND):
+def project_registry(package=None, *, factories=None, terms=None, tasks=None, backend=DEFAULT_BACKEND, prefer=None):
     """Discover optional project assets.py and terms.py; never invoke factories.
 
     ``backend=None`` is the static view used for generated types and the catalog: asset names of every
-    backend (the default backend's factories win a shared name), terms as on the default backend.
-    Preparing a scene for one backend still rejects an asset that backend lacks."""
+    backend (``prefer``'s factories, the project's backend, win a shared name, else the default backend's),
+    terms as on the default backend. Preparing a scene for one backend still rejects an asset that backend lacks."""
     from .assets import BACKENDS, factories_for
 
-    chosen = (*(name for name in BACKENDS if name != DEFAULT_BACKEND), DEFAULT_BACKEND) if backend is None else (backend,)
+    last = prefer if prefer in BACKENDS else DEFAULT_BACKEND
+    chosen = (*(name for name in BACKENDS if name != last), last) if backend is None else (backend,)
     assets, registered_terms, registered_tasks = {}, {}, {}
     for name in chosen:
         assets.update(factories_for(name))
@@ -111,6 +112,8 @@ def project_registry(package=None, *, factories=None, terms=None, tasks=None, ba
 def _selected_sources(settings):
     """Observation sources chosen in observation groups and control components."""
     from shared.backends.isaac.task_config import _selection
+    from .layers import normalize
+    settings = normalize(settings)
     sources = [name for group, selection in settings.get('observations', {}).items()
                for name in _selection(selection, f'observations.{group}')[0]]
     if 'control' in settings:
@@ -197,8 +200,17 @@ def prepare_scene(parameters, *, scene_config, project_package=None, factories=N
             evaluation = evaluation_config(settings)
         from .control import compile_control
         from .robot import robot_frames
-        settings['_robot_frames'] = robot_frames(load_world_spec(path, cameras=False, factories=assets))
-        settings, registered_terms = compile_control(settings, registered_terms, project_package=project_package, backend=backend)
+        # The recipe's actor.model (configs/state_ppo.yaml hands it to the environment as init_params.model): a fixed
+        # layer, or the trained one's trial step, gets it as ``config`` like the trained model in the workers.
+        model = parameters.get('model')
+        if model is not None and not isinstance(model, dict):
+            from omegaconf import OmegaConf
+            model = OmegaConf.to_container(model, resolve=True)
+        settings['_model_config'] = model
+        world = load_world_spec(path, cameras=False, factories=assets)
+        settings['_robot_frames'] = robot_frames(world)
+        settings, registered_terms = compile_control(settings, registered_terms, project_package=project_package,
+                                                     backend=backend, world=world)
         application = {"headless": True, "enable_cameras": False, **settings.get("application", {})}
         if headless is not None:
             application["headless"] = headless
@@ -228,9 +240,11 @@ def check_project(cfg, *, scene_config, project_package=None, **registries):
     environment = cfg.env.eval if cfg.runner.only_eval else cfg.env.train
     prepared = prepare_scene(environment.init_params, scene_config=scene_config,
                              project_package=project_package, **registries)
-    if prepared.settings.get("control"):
+    from .layout import load_scene_config
+    authored = load_scene_config(scene_config).get("control", {}).get("output")
+    if authored:  # automatic targets (no control.output) drive all joints of each robot
         from .control import require_listed_joints
-        require_listed_joints(prepared.settings["control"]["output"])
+        require_listed_joints(authored)
     from shared.backends.isaac.scene import scene_metadata
     index = prepared.description.index()
     metadata = scene_metadata(prepared.description)
@@ -293,13 +307,24 @@ class Project:
         policy = import_module(self.package + ".policy")
         from .layout import load_scene_config
         settings = load_scene_config(self.scene_config)
+        layered = False
         if 'control' in settings:
             from .control import component_config, load_factory
             control = component_config(settings['control'], self.package)
             selected = control['components'][control['train']]
-            factory = load_factory(selected['model'])
-            def build_selected(config, torch_dtype):
-                return factory(config=config, torch_dtype=torch_dtype, **selected.get('parameters', {}))
+            layered = control.get('layers') is True
+            if layered:
+                from .policy_runtime import build_layer
+                drives = control['train'] == control['driver']
+                def build_selected(config, torch_dtype):
+                    # Weights of the trained layer are a checkpoint of the whole adapter (below).
+                    trained = {**selected, 'parameters': {k: v for k, v in selected.get('parameters', {}).items() if k != 'weights'}}
+                    return build_layer(trained, actions=config.action_dim if drives else None,
+                                       model_config=config).to(dtype=torch_dtype)
+            else:
+                factory = load_factory(selected['model'])
+                def build_selected(config, torch_dtype):
+                    return factory(config=config, torch_dtype=torch_dtype, **selected.get('parameters', {}))
             build = build_selected
         else:
             build = policy.build_model
@@ -315,18 +340,31 @@ class Project:
                 shapes = config.get('observation_shapes')
                 if not shapes:
                     raise ValueError('Inspect the scene before constructing the object policy')
-                # Materialize project LazyLinear layers before FSDP/optimizers.
-                was_training = model.training
-                model.eval()
+                import math
+                # action_std: the initial spread of the sampled actions, in the units of the layer's actions.
+                result = ObjectPolicy(model, schema.Obs, config.get('collect_gaussian_stats', False),
+                                      action_dim=config.action_dim, hidden=config.get('hidden_dims') or (256, 128),
+                                      log_std=math.log(float(config.get('action_std', .5))))
+                result.to(dtype=torch_dtype)
+                # Materialize LazyLinear layers (the project's and the default critic) before FSDP/optimizers.
+                was_training = result.training
+                result.eval()
                 with torch.no_grad():
                     dtypes = config.get('observation_dtypes', {})
                     samples = {}
                     for key, shape in shapes.items():
                         dtype = getattr(torch, dtypes.get(key) or 'float32')
                         samples[key] = torch.zeros((1, *shape), dtype=torch_dtype if dtype.is_floating_point else dtype)
-                    model(schema.Obs(samples))
-                model.train(was_training)
-                result = ObjectPolicy(model, schema.Obs, config.get('collect_gaussian_stats', False))
+                    result._evaluate(samples)
+                result.train(was_training)
+                weights = selected.get('parameters', {}).get('weights') if layered else None
+                if weights:
+                    from .policy_runtime import weights_path
+                    state = torch.load(weights_path(weights, selected['model']), map_location='cpu', weights_only=True)
+                    if not result.legacy and 'model.actor_logstd' in state:
+                        # Saved by a model that owned its action noise: now the adapter's log_std.
+                        state['log_std'] = state.pop('model.actor_logstd')
+                    result.load_state_dict(state, strict=True)
                 checkpoint = config.get('initial_checkpoint')
                 if checkpoint:
                     import torch

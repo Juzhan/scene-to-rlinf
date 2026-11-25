@@ -10,12 +10,81 @@ class SceneInfo_base_contact(ObjectView):
     contact_force_samples: Tensor  # ['B', None, None, 3], float, N, environment, 接触传感器采样窗口
 
 
+class SceneInfo_body_input_body(ObjectView):
+    output: Tensor  # ['B', None], float, 本步输出（动作）
+
+
+class SceneInfo_body_input_command(ObjectView):
+    ee_target: Tensor  # ['B', 3], float, 末端目标（m），Piper 基座坐标系
+    velocity: Tensor  # ['B', 3], float, 机身速度指令 vx、vy（m/s）、wz（rad/s），机身坐标系
+
+
+class SceneInfo_body_input_feet_contact(ObjectView):
+    contact_force: Tensor  # ['B', None, 3], float, N, environment, 各刚体接触力
+
+
+class SceneInfo_body_input_piperx_tcp(ObjectView):
+    position: Tensor  # ['B', 3], float, m, environment, 坐标系位置（tcp）
+
+
+class SceneInfo_body_input_piperx(ObjectView):
+    joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
+    joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
+    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
+    position: Tensor  # ['B', 3], float, m, environment, 根部位置
+    tcp: SceneInfo_body_input_piperx_tcp
+
+
+class SceneInfo_body_input_robot(ObjectView):
+    angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
+    joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
+    linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
+    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
+
+
+class SceneInfo_body_input(ObjectView):
+    body: SceneInfo_body_input_body
+    command: SceneInfo_body_input_command
+    feet_contact: SceneInfo_body_input_feet_contact
+    piperx: SceneInfo_body_input_piperx
+    robot: SceneInfo_body_input_robot
+
+
+class SceneInfo_body(ObjectView):
+    input: SceneInfo_body_input
+    output: Tensor  # ['B', None], float, 本步输出（动作）
+    previous_output: Tensor  # ['B', None], float, 上一步输出（动作）
+
+
 class SceneInfo_camera(ObjectView):
     rgb: Tensor  # ['B', 120, 160, 3], uint8, RGB, RGB 图像（独立图像通道）
 
 
+class SceneInfo_command_input_ee_workspace(ObjectView):
+    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 朝向
+    position: Tensor  # ['B', 3], float, m, environment, 位置
+    size: Tensor  # ['B', 3], float, m, ee_workspace, 尺寸（全长）
+
+
+class SceneInfo_command_input_piperx(ObjectView):
+    position: Tensor  # ['B', 3], float, m, environment, 根部位置
+
+
+class SceneInfo_command_input(ObjectView):
+    ee_workspace: SceneInfo_command_input_ee_workspace
+    piperx: SceneInfo_command_input_piperx
+
+
+class SceneInfo_command(ObjectView):
+    ee_target: Tensor  # ['B', 3], float, 末端目标（m），Piper 基座坐标系
+    input: SceneInfo_command_input
+    velocity: Tensor  # ['B', 3], float, 机身速度指令 vx、vy（m/s）、wz（rad/s），机身坐标系
+
+
 class SceneInfo_dex_cube(ObjectView):
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, dex_cube/root, 包围盒（本体坐标的最小角, 最大角）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
@@ -25,59 +94,6 @@ class SceneInfo_ee_workspace(ObjectView):
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 朝向
     position: Tensor  # ['B', 3], float, m, environment, 位置
     size: Tensor  # ['B', 3], float, m, ee_workspace, 尺寸（全长）
-
-
-class SceneInfo_executor_input_executor(ObjectView):
-    output: Tensor  # ['B', 18], float, 本步输出（解码前动作）
-
-
-class SceneInfo_executor_input_feet_contact(ObjectView):
-    contact_force: Tensor  # ['B', None, 3], float, N, environment, 各刚体接触力
-
-
-class SceneInfo_executor_input_piperx_tcp(ObjectView):
-    position: Tensor  # ['B', 3], float, m, environment, 坐标系位置（tcp）
-
-
-class SceneInfo_executor_input_piperx(ObjectView):
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
-    joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
-    joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
-    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
-    position: Tensor  # ['B', 3], float, m, environment, 根部位置
-    tcp: SceneInfo_executor_input_piperx_tcp
-
-
-class SceneInfo_executor_input_planner(ObjectView):
-    output: Tensor  # ['B', 6], float, 本步输出（解码前动作）
-
-
-class SceneInfo_executor_input_robot(ObjectView):
-    angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
-    joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
-    joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
-    linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
-    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
-
-
-class SceneInfo_executor_input_simulation(ObjectView):
-    gravity: Tensor  # ['B', 3], float, m/s^2, environment, 环境重力加速度
-
-
-class SceneInfo_executor_input(ObjectView):
-    executor: SceneInfo_executor_input_executor
-    feet_contact: SceneInfo_executor_input_feet_contact
-    piperx: SceneInfo_executor_input_piperx
-    planner: SceneInfo_executor_input_planner
-    robot: SceneInfo_executor_input_robot
-    simulation: SceneInfo_executor_input_simulation
-
-
-class SceneInfo_executor(ObjectView):
-    input: SceneInfo_executor_input
-    output: Tensor  # ['B', 18], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 18], float, 上一步输出（解码前动作）
 
 
 class SceneInfo_feet_contact(ObjectView):
@@ -94,9 +110,11 @@ class SceneInfo_piperx(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：tcp
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, piperx/root, 包围盒（本体坐标的最小角, 最大角）
     default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_effort: Tensor  # ['B', None], float, 关节实际力 / 力矩
+    joint_limits: Tensor  # ['B', None, 2], float, 关节范围（下限, 上限）
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -105,34 +123,15 @@ class SceneInfo_piperx(RobotView):
     tcp: SceneInfo_piperx_tcp
 
 
-class SceneInfo_planner_input_ee_workspace(ObjectView):
-    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 朝向
-    position: Tensor  # ['B', 3], float, m, environment, 位置
-    size: Tensor  # ['B', 3], float, m, ee_workspace, 尺寸（全长）
-
-
-class SceneInfo_planner_input_piperx(ObjectView):
-    position: Tensor  # ['B', 3], float, m, environment, 根部位置
-
-
-class SceneInfo_planner_input(ObjectView):
-    ee_workspace: SceneInfo_planner_input_ee_workspace
-    piperx: SceneInfo_planner_input_piperx
-
-
-class SceneInfo_planner(ObjectView):
-    input: SceneInfo_planner_input
-    output: Tensor  # ['B', 6], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 6], float, 上一步输出（解码前动作）
-
-
 class SceneInfo_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, robot/root, 包围盒（本体坐标的最小角, 最大角）
     default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_effort: Tensor  # ['B', None], float, 关节实际力 / 力矩
+    joint_limits: Tensor  # ['B', None, 2], float, 关节范围（下限, 上限）
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -146,98 +145,100 @@ class SceneInfo_simulation(ObjectView):
     time: Tensor  # ['B', 1], s
 
 
+class SceneInfo_terrain_rough_40m(ObjectView):
+    bounds: Tensor  # ['B', 2, 3], float, m, terrain_rough_40m/root, 包围盒（本体坐标的最小角, 最大角）
+    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
+    position: Tensor  # ['B', 3], float, m, environment, 根部位置
+
+
 class SceneInfo(ObjectView):
     base_contact: SceneInfo_base_contact
+    body: SceneInfo_body
     camera: SceneInfo_camera
+    command: SceneInfo_command
     dex_cube: SceneInfo_dex_cube
     ee_workspace: SceneInfo_ee_workspace
-    executor: SceneInfo_executor
     feet_contact: SceneInfo_feet_contact
     piperx: SceneInfo_piperx
-    planner: SceneInfo_planner
     robot: SceneInfo_robot
     simulation: SceneInfo_simulation
+    terrain_rough_40m: SceneInfo_terrain_rough_40m
 
 
-class PlannerObs_ee_workspace(ObjectView):
+class CommandObs_ee_workspace(ObjectView):
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 朝向
     position: Tensor  # ['B', 3], float, m, environment, 位置
     size: Tensor  # ['B', 3], float, m, ee_workspace, 尺寸（全长）
 
 
-class PlannerObs_piperx(RobotView):
+class CommandObs_piperx(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：tcp
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
 
 
-class PlannerObs(ObjectView):
-    ee_workspace: PlannerObs_ee_workspace
-    piperx: PlannerObs_piperx
+class CommandObs(ObjectView):
+    ee_workspace: CommandObs_ee_workspace
+    piperx: CommandObs_piperx
 
 
-class ExecutorObs_executor(ObjectView):
-    output: Tensor  # ['B', 18], float, 本步输出（解码前动作）
+class BodyObs_body(ObjectView):
+    output: Tensor  # ['B', None], float, 本步输出（动作）
 
 
-class ExecutorObs_feet_contact(ObjectView):
+class BodyObs_command(ObjectView):
+    ee_target: Tensor  # ['B', 3], float, 末端目标（m），Piper 基座坐标系
+    velocity: Tensor  # ['B', 3], float, 机身速度指令 vx、vy（m/s）、wz（rad/s），机身坐标系
+
+
+class BodyObs_feet_contact(ObjectView):
     contact_force: Tensor  # ['B', None, 3], float, N, environment, 各刚体接触力
 
 
-class ExecutorObs_piperx_tcp(ObjectView):
+class BodyObs_piperx_tcp(ObjectView):
     position: Tensor  # ['B', 3], float, m, environment, 坐标系位置（tcp）
 
 
-class ExecutorObs_piperx(RobotView):
+class BodyObs_piperx(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：tcp
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
-    tcp: ExecutorObs_piperx_tcp
+    tcp: BodyObs_piperx_tcp
 
 
-class ExecutorObs_planner(ObjectView):
-    output: Tensor  # ['B', 6], float, 本步输出（解码前动作）
-
-
-class ExecutorObs_robot(RobotView):
+class BodyObs_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
 
 
-class ExecutorObs_simulation(ObjectView):
-    gravity: Tensor  # ['B', 3], float, m/s^2, environment, 环境重力加速度
+class BodyObs(ObjectView):
+    body: BodyObs_body
+    command: BodyObs_command
+    feet_contact: BodyObs_feet_contact
+    piperx: BodyObs_piperx
+    robot: BodyObs_robot
 
 
-class ExecutorObs(ObjectView):
-    executor: ExecutorObs_executor
-    feet_contact: ExecutorObs_feet_contact
-    piperx: ExecutorObs_piperx
-    planner: ExecutorObs_planner
-    robot: ExecutorObs_robot
-    simulation: ExecutorObs_simulation
+Obs = BodyObs
+SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'robot.joint_limits', 'robot.bounds', 'piperx.position', 'piperx.orientation', 'piperx.linear_velocity', 'piperx.angular_velocity', 'piperx.joint_position', 'piperx.joint_velocity', 'piperx.joint_effort', 'piperx.default_joint_position', 'piperx.default_joint_velocity', 'piperx.joint_limits', 'piperx.bounds', 'base_contact.contact_force_samples', 'base_contact.contact_force', 'feet_contact.contact_force_samples', 'feet_contact.contact_force', 'dex_cube.position', 'dex_cube.orientation', 'dex_cube.linear_velocity', 'dex_cube.angular_velocity', 'dex_cube.bounds', 'camera.rgb', 'terrain_rough_40m.position', 'terrain_rough_40m.orientation', 'terrain_rough_40m.bounds', 'piperx.tcp.position', 'piperx.tcp.orientation', 'simulation.gravity', 'ee_workspace.position', 'ee_workspace.orientation', 'ee_workspace.size', 'command.velocity', 'command.ee_target', 'body.output', 'body.previous_output', 'simulation.step_dt', 'simulation.time', 'command.input.piperx.position', 'command.input.ee_workspace.position', 'command.input.ee_workspace.size', 'command.input.ee_workspace.orientation', 'body.input.robot.linear_velocity', 'body.input.robot.angular_velocity', 'body.input.robot.orientation', 'body.input.robot.joint_position', 'body.input.robot.joint_velocity', 'body.input.command.velocity', 'body.input.command.ee_target', 'body.input.body.output', 'body.input.piperx.orientation', 'body.input.feet_contact.contact_force', 'body.input.piperx.position', 'body.input.piperx.joint_position', 'body.input.piperx.joint_velocity', 'body.input.piperx.tcp.position')
 
 
-Obs = ExecutorObs
-SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'piperx.position', 'piperx.orientation', 'piperx.linear_velocity', 'piperx.angular_velocity', 'piperx.joint_position', 'piperx.joint_velocity', 'piperx.joint_effort', 'piperx.default_joint_position', 'piperx.default_joint_velocity', 'base_contact.contact_force_samples', 'base_contact.contact_force', 'feet_contact.contact_force_samples', 'feet_contact.contact_force', 'dex_cube.position', 'dex_cube.orientation', 'dex_cube.linear_velocity', 'dex_cube.angular_velocity', 'camera.rgb', 'piperx.tcp.position', 'piperx.tcp.orientation', 'simulation.gravity', 'ee_workspace.position', 'ee_workspace.orientation', 'ee_workspace.size', 'planner.output', 'planner.previous_output', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.piperx.position', 'planner.input.ee_workspace.position', 'planner.input.ee_workspace.size', 'planner.input.ee_workspace.orientation', 'executor.input.robot.linear_velocity', 'executor.input.robot.angular_velocity', 'executor.input.robot.orientation', 'executor.input.simulation.gravity', 'executor.input.robot.joint_position', 'executor.input.robot.default_joint_position', 'executor.input.robot.joint_velocity', 'executor.input.planner.output', 'executor.input.executor.output', 'executor.input.piperx.orientation', 'executor.input.feet_contact.contact_force', 'executor.input.piperx.position', 'executor.input.piperx.joint_position', 'executor.input.piperx.joint_velocity', 'executor.input.piperx.tcp.position', 'executor.input.piperx.default_joint_position')
+# command 的 forward 返回字典（velocity、ee_target），下一层读 obs.command.<名字>
+Action = Tensor  # 被训练层 body 的 forward 返回：动作 ['B', 动作个数]；个数就是模型最后一层的大小，构造参数写 actions 时得到受控关节总数（默认 decode 的情形）
+# initial_action(obs) 返回同形状的 Action（复位后第一步之前的动作，缺省为 0）
 
 
-PlannerOutput = Tensor  # ['B', 6], 固定组件 forward 返回
-ExecutorOutput = Tensor  # ['B', 18], 训练组件 forward 返回 (ExecutorOutput 均值, Tensor ['B', 1] 价值)，模型另需参数 actor_logstd；build 的 config 即 train.yaml 的 actor.model（action_dim、hidden_dims 等）；解码前动作，initial 返回同形状
-
-
-class ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致
-    legs: Tensor  # ['B', 12], joint_position, robot: FL_hip_joint, FR_hip_joint, RL_hip_joint, RR_hip_joint, FL_thigh_joint, FR_thigh_joint, RL_thigh_joint, RR_thigh_joint, FL_calf_joint, FR_calf_joint, RL_calf_joint, RR_calf_joint
-    arm: Tensor  # ['B', 6], joint_position, piperx: joint1, joint2, joint3, joint4, joint5, joint6
+class Targets(TypedDict):  # decode_action(action, obs: BodyObs) 返回；实际单位，每台受控机器人一项
+    robot: Tensor  # ['B', 关节数], joint_position, robot 的全部关节，顺序同 robot.joint_position
+    piperx: Tensor  # ['B', 关节数], joint_position, piperx 的全部关节，顺序同 piperx.joint_position
 
 
 class TaskResult(TypedDict, total=False):  # evaluate(obs: SceneInfo) 返回；缺省 reward=0, success/failure=False

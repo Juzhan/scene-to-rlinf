@@ -11,7 +11,7 @@ def validate(description, settings, *, step_dt=None):
     # ``step_dt`` (decimation * dt) is known only for full projects; it bounds sensor update periods.
     from .assets import RAY_SENSORS, SENSORS
     allowed = {'schema_version', 'name', 'entities', 'connections', 'simulation',
-               'world', 'authoring', 'control', 'targets', 'application', 'observations', 'visualization'}
+               'world', 'authoring', 'control', 'policy', 'targets', 'application', 'observations', 'visualization'}
     extra = settings.keys() - allowed
     if extra:
         raise NotImplementedError(f'mjlab scene-only backend does not yet implement: {sorted(extra)}')
@@ -151,6 +151,8 @@ def build_scene_config(description, settings, factories):
             raise NotImplementedError(f'{path}: kinematic entities are only bound on isaaclab3')
         if not node.visible:
             raise NotImplementedError(f'{path}: visible: false (hidden from rendering) is only bound on isaaclab3')
+        if node.gravity_compensation:
+            raise NotImplementedError(f'{path}: gravity_compensation is only bound on isaaclab3')
         if node.reset is not None and not any(joint.type == mujoco.mjtJoint.mjJNT_FREE for joint in cfg.spec_fn().joints):
             raise ValueError(f'{path}: reset cannot move a fixed-base entity')
         entities[key] = cfg

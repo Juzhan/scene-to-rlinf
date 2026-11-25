@@ -12,6 +12,7 @@ physical constraints; only "physical" attachments write connections/mounts.
 """
 import argparse
 import atexit
+import collections
 import contextlib
 import copy
 import functools
@@ -26,6 +27,7 @@ from pathlib import Path
 import posixpath
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -50,8 +52,6 @@ from shared.assembly.visuals import (ExportWorker, SceneChanged, cache_path, ens
 
 CATEGORY_LABELS = {'robot': '机器人', 'object': '物体 / 设备', 'terrain': '地面 / 地形',
                    'sensor': '传感器', 'light': '照明', 'group': '组合', 'abstract': '抽象体', 'environment': '场景环境'}
-CONTROL_TYPES = {'joint_position': '关节位置 (rad / m)', 'joint_velocity': '关节速度 (rad/s / m/s)',
-                 'joint_effort': '关节力矩 / 力 (N·m / N)'}
 ABSTRACT_SHAPES = {'point': '点', 'direction': '方向', 'rectangle': '矩形', 'box': '长方体'}
 ABSTRACT_ICONS = {'point': 'point', 'direction': 'arrow-narrow-right', 'rectangle': 'square', 'box': 'box-model'}
 ABSTRACT_NOTES = {'point': '位置；可选作观察 position / orientation。',
@@ -81,10 +81,26 @@ TREE_ROW = ('[id="{id}"]{{height:1.65em!important;padding:0 6px 0 {pad}px!import
 # cameras look down -Z with +Y up; viser frustums and renders use OpenCV (+Z, -Y).
 CAMERA_FOCAL, CAMERA_APERTURE = 24.0, 20.955
 GL_TO_CV = np.diag([1.0, -1.0, -1.0, 1.0])
-GIZMO_SCALE = .35
+# A placed entity is set down this far (m) above the surface under it (_rest_on_surface): the editor's terrain
+# previews are simplified and lie 1-2 cm off the simulated surface.
+REST_CLEARANCE = .03
+GIZMO_PIXELS = 110  # the gizmo keeps this on-screen size (CSS pixels) at any zoom (viser's fixed pivot controls)
 # Entities a press-and-drag in the view slides over the floor; robots and terrain move only with the gizmo
 # so dragging across them still orbits the camera.
 DRAGGABLE = ('object', 'abstract')
+# Pressing on an object and dragging slides it (off: only the gizmo moves things, a drag on an object turns the view).
+BODY_DRAG = False
+# The "Newton" view style, after Newton's OpenGL viewer (newton/_src/viewer/gl/opengl.py): a sky fading from
+# blue to slate, a 1 m checker floor taking shadows, a sun at (0.2, -0.3, 0.8) casting them and a sky/ground
+# fill; colours lifted for three.js lighting (Newton renders with exposure 1.6).
+NEWTON_SKY = ((68, 161, 255), (40, 44, 55))
+NEWTON_SUN = (.2, -.3, .8)
+NEWTON_FLOOR = ((92, 96, 120), (66, 69, 88))
+NEWTON_FILL = ((204, 204, 217), (77, 77, 89))
+# Light intensities of the style (three.js units), set against frames of `run.sh view` at the same viewpoint:
+# Newton's GL viewer renders with exposure 1.6 and a strong hemispherical fill.
+NEWTON_LIGHT = {'sun': 3.0, 'fill': .7, 'environment': .25}
+FLOOR_SIZE = 120.0
 SHELF_PAGE = Path(__file__).with_name('asset_shelf.html')  # the add tab's asset shelf (an iframe)
 OUTLINER_PAGE = Path(__file__).with_name('scene_outliner.html')  # the scene tab's outliner (an iframe)
 # Physics of an object row (outliner toggle and inspector): label, outliner hint.
@@ -94,6 +110,27 @@ PHYSICS = {'dynamic': ('受力运动', '动态：受重力和接触力'),
            'static': ('静态', '静态几何：没有刚体；填写质量后才受力运动')}
 MOTIONS = {None: '不自行运动', 'wander': '区域内游走', 'path': '沿路径', 'custom': '自定义（Python 函数）'}
 SKETCH_BACKGROUND = (243, 245, 248)  # canvas of the editor's flat-shaded asset sketches
+
+
+def checker_floor(size=FLOOR_SIZE, cell=1.0):
+    """The two colours of a ``size`` square checker floor at z = 0: ``[(vertices, faces)] * 2``."""
+    count = int(round(size / cell))
+    corner = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], float) * cell
+    parts = []
+    for parity in (0, 1):
+        cells = [(i, j) for i in range(count) for j in range(count) if (i + j) % 2 == parity]
+        origins = (np.array(cells, float) - count / 2) * cell
+        vertices = (corner[None] + np.c_[origins, np.zeros(len(origins))][:, None]).reshape(-1, 3)
+        base = np.arange(len(cells))[:, None] * 4
+        faces = (base[:, None] + np.array([[0, 1, 2], [0, 2, 3]])[None]).reshape(-1, 3)
+        parts.append((vertices.astype(np.float32), faces.astype(np.int32)))
+    return parts
+
+
+def sky_gradient(top, bottom, height=256):
+    """A vertical background gradient image, ``top`` colour at the top."""
+    t = np.linspace(0., 1., height)[:, None, None]
+    return np.repeat((np.array(top) * (1 - t) + np.array(bottom) * t).astype(np.uint8), 4, axis=1)
 
 
 def _gizmo_handles():
@@ -130,6 +167,8 @@ def axes_svg(wxyz):
                      f'font-family="sans-serif" text-anchor="middle" dominant-baseline="central">{label}</text>')
     return ''.join(parts) + '</svg>'
 UNDO_LIMIT = 100
+CAMERA_SETTLE = .4  # s without edits before the camera view is rendered (it borrows the 3D canvas)
+CAMERA_VIEW_PARAMETERS = ('width', 'height', 'focal_length', 'clipping_range')  # what changes the editor's camera view
 THUMBNAILS = ROOT / '.cache' / 'asset_thumbnails'
 GALLERY_SCENE = ROOT / '.cache' / 'asset_gallery' / 'scene.yaml'
 # User-imported assets: named shared-factory presets, listed in the gallery.
@@ -167,13 +206,6 @@ h3{font-size:16px!important;margin-top:2px!important}
   overflow-wrap:anywhere}
 .rl-status.error{color:#c92a2a;background:#fff5f5}
 """
-OBSERVATION_CSS = ('{labels}{{white-space:pre-line;font-size:11.5px!important;line-height:1.35!important;color:#868e96!important}}'
-                   '{first}{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#212529}}')
-# Group folders holding a ticked input; `:checked` keeps it live without a server round trip.
-OBSERVATION_GROUP_CSS = ('._3o7djo0:has({checked}){{border-color:#a5d8ff!important}}'
-                         '._3o7djo0:has({checked}) > ._3o7djo1{{background:#e7f5ff!important;color:#1864ab!important;'
-                         'box-shadow:inset 3px 0 0 #339af0}}'
-                         '._3o7djo0:has({checked}) > ._3o7djo1:hover{{background:#d0ebff!important}}')
 # The view command under the save button. A srcdoc page so its copy button runs (viser HTML runs no
 # scripts); the clipboard API needs a secure origin, so a remote http editor falls back to execCommand.
 COMMAND_PAGE = '''<!doctype html><html><head><meta charset="utf-8"><style>
@@ -188,43 +220,16 @@ const b=document.getElementById('b'),text=document.getElementById('c').textConte
 b.onclick=async()=>{try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');
 t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}
 b.textContent='已复制';setTimeout(()=>b.textContent='复制',1200)};</script></body></html>'''
-# The innermost folder holding one of the selected entity's widgets, in the 观察/控制 tabs.
-LINK_CSS = ('._3o7djo0:has({ids}):not(:has(._3o7djo0 :is({ids}))){{border-color:#f59f00!important;'
-            'box-shadow:0 0 0 1px #f59f00}}'
-            '._3o7djo0:has({ids}):not(:has(._3o7djo0 :is({ids}))) > ._3o7djo1{{background:#fff4e0!important;color:#9a5b00!important}}')
-ROLE_PURPOSE = {'planner': '生成目标', 'executor': '输出控制动作'}
-# A button group used as a two-way switch: one button per module, its role and state written
-# under the name, the trained one filled. Viser gives the group no id; its (hidden) row label
-# points at the uuid.
-TRAIN_ROW = '.mantine-Flex-root:has(> div > p > label[for="{id}"])'
-TRAIN_SWITCH_CSS = ('{row}{{padding:10px 0 14px}}{row} > div:first-child{{display:none}}'
-                    '{row} > div:last-child{{flex:1 1 auto!important;width:100%}}'
-                    '{row} > div:last-child > .mantine-Flex-root{{flex-wrap:nowrap;gap:8px}}'
-                    '{row} button{{height:auto!important;min-width:0!important;padding:7px 6px!important;'
-                    '--button-bg:var(--mantine-color-default)!important;--button-hover:#f3f5f8!important;'
-                    '--button-color:var(--mantine-color-text)!important;--button-bd:1px solid #dee2e6!important}}'
-                    '{row} .mantine-Button-label{{flex-direction:column;height:auto;line-height:1.4;white-space:normal;'
-                    'font-size:13px;font-weight:600}}'
-                    '{row} .mantine-Button-label::after{{font-size:11px;font-weight:400;opacity:.8}}')
-TRAIN_BUTTON_CSS = '{row} button:nth-child({n}) .mantine-Button-label::after{{content:{caption}}}'
-TRAIN_ON_CSS = ('{row} button:nth-child({n}){{--button-bg:var(--mantine-color-orange-filled)!important;'
-                '--button-hover:var(--mantine-color-orange-filled-hover)!important;'
-                '--button-color:var(--mantine-color-white)!important;--button-bd:1px solid transparent!important}}')
-# The ✕ button sits before its folder; lift it onto the middle of that folder's 30px header,
-# left of the chevron. The 1px height keeps the folder's top margin (pinned to 6px) from
-# collapsing through the wrapper, so the header centre is 1 + 6 + 1 + 15 px below its top.
-CONTROL_REMOVE_CSS = ('div:has(> [id="{id}"]){{height:1px;padding:0!important;position:relative;z-index:3}}'
-                      'div:has(> [id="{id}"]) + div{{margin-top:6px!important}}'
-                      'button[id="{id}"][style]{{position:absolute;right:30px;top:23px;transform:translateY(-50%);'
-                      'width:22px!important;height:22px!important;min-width:0;padding:0!important;'
-                      '--button-bd:none!important;border-radius:4px}}'
-                      '[id="{id}"] .mantine-Button-inner{{justify-content:center}}'
-                      '[id="{id}"] .mantine-Button-label{{display:none}}'
-                      # Viser places the icon absolutely with a half-size offset; let it flow and centre.
-                      '[id="{id}"] .mantine-Button-section,[id="{id}"] .mantine-Button-section > div'
-                      '{{margin:0!important;width:auto!important;height:auto!important}}'
-                      '[id="{id}"] .mantine-Button-section svg{{position:static!important;transform:none!important;'
-                      'display:block;width:15px;height:15px}}')
+# Scene information that is never a policy input: simulator configuration, the same in every step and absent on a real
+# robot (the default joint pose of an asset). The Task can still read it; an older scene that selects it keeps it.
+NOT_INPUTS = ('.default_joint_position', '.default_joint_velocity')
+# Ways of looking at the scene in the tree: as it is, or as what one component reads (and, for the executor,
+# drives); the second tints the 3D view in the component's colour.
+LENSES = ('scene', 'observe')
+LENS_COLORS = {'planner': (46, 110, 220), 'executor': (124, 92, 230), 'control': (42, 157, 100)}
+ROBOT_MODES = {'joint_position': '关节位置', 'joint_velocity': '关节速度', 'joint_effort': '关节力矩', 'none': '不受策略控制'}
+
+
 def sketch_on_white(path):
     """PNG bytes of a shelf picture; editor sketches drawn on their grey canvas are brightened to white."""
     from PIL import Image
@@ -259,6 +264,15 @@ def _spawn_text(spawn, shown=3):
 
 def _resolve(owner, reference):
     return posixpath.normpath(posixpath.join(owner, reference)) if reference.startswith('.') else reference
+
+
+def camera_on_body(body):
+    """Default orientation (wxyz) of a camera mounted on ``body``: a ROS camera link (x forward, z up) is
+    looked through as such; any other link (a hand, a gripper) is looked along its +z, the usual approach
+    axis, instead of back into the arm. The camera node is OpenGL: it looks along -z with +y up."""
+    if 'camera' in body.lower():
+        return [0.5, 0.5, -0.5, -0.5]
+    return [0.0, 1.0, 0.0, 0.0]  # 180 degrees about x
 
 
 def _body_bound(category, factory, scene):
@@ -352,7 +366,7 @@ def ray_shape(shape, origin, direction):
         return _ray_sphere(origin, direction, np.array([shape['length'] / 2, 0.0, 0.0]), shape['length'] / 3)
     if kind == 'frustum':
         return _ray_sphere(origin, direction, np.array([0.0, 0.0, -.04]), .06)
-    if kind == 'grid':
+    if kind in ('grid', 'checker'):
         if abs(direction[2]) < 1e-9:
             return None
         t = -origin[2] / direction[2]
@@ -388,14 +402,6 @@ def observation_group(key, source, components=()):
     note = ('组件接口' if head in components else '仿真' if head == 'simulation' else
             source.get('group_label') if source.get('group_label') not in (None, head, '自定义 / 未声明来源') else '')
     return f'{head} · {note}' if note else head, name
-
-
-def observation_caption(meta):
-    """Description plus tensor shape and unit, as in the observation.py comment."""
-    info = meta.get('information') or {}
-    shape = 'B×' + '×'.join('N' if size is None else str(size) for size in info.get('shape', ())) if info.get('shape') else ''
-    parts = [meta.get('label', ''), shape, meta.get('units') or info.get('unit') or '']
-    return ' · '.join(str(part) for part in parts if part)
 
 
 class Node:
@@ -557,6 +563,10 @@ class _GlbView:
         with contextlib.suppress(Exception):
             self.glb.on_drag(callback)
 
+    def remove_drag_callback(self, callback='all'):
+        with contextlib.suppress(Exception):
+            self.glb.remove_drag_callback(callback)
+
 
 def mesh_instances(filename):
     """``{part name: (source part, 4x4 row-vector matrix)}`` of parts that copy another (one model)."""
@@ -663,6 +673,9 @@ class _Slot:
         pass
 
     def on_drag(self, callback):
+        pass
+
+    def remove_drag_callback(self, callback='all'):
         pass
 
 
@@ -802,9 +815,10 @@ def render_thumbnail(record, positions=None, size=128):
     return stream.getvalue()
 
 
-def load_library():
+def load_library(path=None):
+    """Shelf presets of a library file: the workspace's (maintainers' additions) by default."""
     try:
-        return json.loads(LIBRARY.read_text()).get('assets', [])
+        return json.loads(Path(path or LIBRARY).read_text()).get('assets', [])
     except (OSError, ValueError):
         return []
 
@@ -837,7 +851,7 @@ def usd_joints(path):
 
 def recorded_assets():
     """Library-style presets for objects imported under assets/ (e.g. ``run.py asset simready``):
-    usd_object, dynamic as their USD bodies and joints say. Robots stay with their own factories."""
+    usd_object, dynamic as their USD bodies and joints say; one whose drives hold positions is added as a robot."""
     items = []
     for path in sorted(ROOT.glob('assets/*/ASSET.json')):
         try:
@@ -846,8 +860,9 @@ def recorded_assets():
         except (OSError, ValueError, KeyError):
             continue
         note = f'SimReady {source.get("asset", path.parent.name)}（{source.get("license", "许可见 ASSET.json")}）'
-        note += f' · {len(joints)} 个被动关节，可读关节位置/速度' if joints else ' · 无关节'
-        item = {'id': 'asset_' + path.parent.name, 'label': path.parent.name, 'category': 'object',
+        note += f' · {len(joints)} 个关节，可读关节位置/速度；关节有驱动的按机器人添加' if joints else ' · 无关节'
+        # Whether its drives make it a robot is read when it is added (_add_choice), not for every card here.
+        item = {'id': 'asset_' + path.parent.name, 'label': path.parent.name, 'category': 'object', 'jointed': bool(joints),
                 'factory': 'usd_object', 'parameters': {'usd_path': usd}, 'note': note}
         parts = Path(record.get('source', '')).parts
         if parts[:2] == ('assets', 'simready') and len(parts) > 3:  # the official preview of its mirrored source
@@ -875,19 +890,28 @@ def action(method):
 class Editor:
     def __init__(self, scene, *, host='127.0.0.1', port=8080, native_preview=True, library_port=None):
         import viser
+        from tools.simready_library import viewer_problem
         self.scene = None
         self._edit(scene)
         atexit.register(self.discard_copy)
-        self.server = viser.ViserServer(host=host, port=port, label='RLinf 场景编辑器')
+        # With the patched page built, ``port`` is the editor's page (the library server) and viser's
+        # websocket and stock page take the next port; without it viser's own page is the editor. Port 0: any free.
+        self.patched = viewer_problem() is None
+        self.server = viser.ViserServer(host=host, port=port + 1 if self.patched and port else port, label='RLinf 场景编辑器')
         self.lock = threading.RLock()
         self.syncing = 0
         self.dragging = False
         self.selected = None
         self.drag_events, self.body_drag, self.placing = queue.Queue(), None, None
+        self.body_drags_off = False  # drag handlers removed while the gizmo shows (_sync_body_drags)
         self.draft = None
+        self.start_screen = False  # opened without a project: the app offers new (by template) or open (main --start)
         self.backend_problem = None  # Why the project's backend rejects the saved scene, if it does.
         self.export_thread = None
         self.export_again = None
+        self.after_export = []  # actions waiting for link names (a sensor added to a robot not exported yet)
+        self.snap = True  # objects moved level with the gizmo slide over and settle on surfaces (the tool bar's magnet)
+        self.gizmo_drag_z = None
         # Isaac starts only when an asset lacks cached meshes, then serves follow-up imports until idle.
         self.exporter, self.exporter_lock = None, threading.Lock()
         self.preview_restore, self.preview_key = None, None
@@ -895,12 +919,29 @@ class Editor:
         self.hidden = set()
         self.inspector_items, self.tree_rows = [], {}
         self.outliner_page, self.outliner_revision, self.tree_changed = False, 0, set()
+        self.lens, self.lens_role, self.tints, self.selected_joint, self.panel_revision = 'scene', None, {}, None, 0
+        self.last_status = {'id': 0, 'text': '', 'error': False}
+        # Every report, kept for the page's message list (ui/log): ids count up, the last error is marked.
+        self.messages, self.message_count, self.last_error = collections.deque(maxlen=200), 0, 0
+        self.boot = os.urandom(4).hex()  # this editor process: a page left open across a restart reloads (app.js renderTop)
+        self.gizmo_mode, self.scale_drag = 'move', None  # the view's gizmo: move, rotate or scale (set_gizmo_mode)
+        # viser's own panels are built only while shown (the app hides them; ui/classic); a hidden camera
+        # section would otherwise render the camera view on every edit.
+        self.classic = True
+        # The camera view the app shows: the selected camera, rendered once edits settle (_camera_renderer).
+        self.camera_frame, self.camera_revision, self.camera_error, self.camera_wanted_at = None, 0, None, 0.0
+        self.parent_picking = None  # entity whose parent the next click in the view chooses (entity and link)
+        self.parent_choice = None  # that click's choice, confirmed in the app's parent dialog
+        self.last_hit = None  # entity and link of the last click in the view
         self.motion_preview, self.path_marker, self.motion_drafts = None, None, {}
+        self.sensor_marker = []  # what the selected sensor measures, drawn in the view (_draw_sensor)
         # Objects of an imported scene (shared/assembly/composition.py): the one selected, and those hidden here.
         self.selected_object, self.hidden_objects = None, set()
         self.split_objects = {}  # entity -> scene objects drawn on their own to be moved
         self.also_selected = []  # multi-selection beyond self.selected (Ctrl/Shift-click in the outliner)
         self.show_textures = True  # draw exported textures and surface colours (surface_glb)
+        self.style, self.style_handles = 'newton', []  # view style: 'newton' or viser's 'default' (_apply_style)
+        self.pixel_ratio = 1.0  # canvas pixels per CSS pixel of the page, reported by app.js (_gizmo_unit)
         self.cutaway = None  # (entity path, height): objects of that scene above it are hidden while focused
         # Entities waiting for their native mesh: {path: {'target', 'shown', 'start', 'handle'}}; the placeholder
         # box fills up from the bottom as the exporter reports progress (_animate_loading).
@@ -918,7 +959,7 @@ class Editor:
         threading.Thread(target=self._camera_renderer, daemon=True).start()
         threading.Thread(target=self._drag_worker, daemon=True).start()
         threading.Thread(target=self._animate_loading, daemon=True).start()
-        self._start_library(host, library_port or self.server.get_port() + 1)
+        self._start_library(host, library_port or (port if self.patched else self.server.get_port() + 1))
         threading.Thread(target=self._load_simready, daemon=True).start()
         threading.Thread(target=self._load_environments, args=(True,), daemon=True).start()
 
@@ -961,7 +1002,8 @@ class Editor:
             self.previous = previous_visuals(self.scene)
             self.preview_restore = None  # Previews refer to the nodes being replaced.
             self.pending = {'actions': {}, 'resets': {}, 'meshes': {}, 'shapes': {}, 'kinematic': {}, 'shown': None,
-                            'components': {}, 'motion': {}, 'visible': {}, 'simulation': {}, 'selectable': {}}
+                            'components': {}, 'motion': {}, 'visible': {}, 'simulation': {}, 'selectable': {},
+                            'modes': {}}
             self.motion_drafts = {}  # motions being edited, not yet complete (e.g. a path of one point)
             self._show_command()
             self._show_simulation()
@@ -975,7 +1017,6 @@ class Editor:
             if state:
                 self.observation_enabled = dict.fromkeys(state['observations'], True)
                 self.train_role = state['train']
-                self._rebuild_observations()
             self._refresh_lists()
             keep = state['selected'] if state else self.selected
             if keep != self.selected:
@@ -985,6 +1026,14 @@ class Editor:
                 self.select(keep)
             else:
                 self._rebuild_inspector()
+            if self.lens not in LENSES or self.lens_role not in self.observation_order:
+                self.lens, self.lens_role = 'scene', None
+            self.tints = {}  # freshly drawn shapes carry their own colours
+            self._apply_tints()
+            for path in self.parameters:
+                if path in self.items:
+                    self._show_scale(path)
+            self.panel_revision += 1
             self._check_backend()
             self.report(f'已加载 {len(self.snapshot["entities"])} 个实体 · {self.target.parent.name}/{self.target.name}')
         threading.Thread(target=self._harvest_thumbnails, daemon=True).start()
@@ -1003,7 +1052,7 @@ class Editor:
             problem = None  # A project asset needing the simulator SDK is checked by run.py check.
         except Exception as error:  # noqa: BLE001 - shown in the page, never blocks saving
             problem = f'{backend} 后端不接受当前场景：{error}'
-        if problem and problem != self.backend_problem:
+        if problem and problem != self.backend_problem and self.classic:
             for client in self.server.get_clients().values():
                 client.add_notification('已保存，但无法训练', problem, color='yellow', auto_close_seconds=15)
         self.backend_problem = problem
@@ -1048,7 +1097,9 @@ class Editor:
                     'fixed': None, 'joint': None, 'grouped': False, 'layout_parent': None, 'pending': None,
                     'note': (item.get('preview') or {}).get('note', ''), 'kinematics': None}
             self.info[item['path']] = info
-            if record and record.get('path'):
+            if item.get('factory') == 'ground_plane':  # an infinite plane: drawn as Newton's viewer draws it
+                node.shape = {'type': 'checker', 'size': FLOOR_SIZE}
+            elif record and record.get('path'):
                 self._attach_mesh(item, info, record, stale)
             else:
                 self._proxy(item, node)
@@ -1190,8 +1241,8 @@ class Editor:
             color = parameters.get('color')
             box(tuple(parameters.get('size') or (1., 1., 1.)),
                 color=tuple(round(255 * c) for c in color) if color else COLORS['proxy'])
-        elif factory in ('terrain', 'ground_plane'):
-            node.shape = {'type': 'grid', 'size': 4.0 if factory == 'terrain' else 2.0}
+        elif factory == 'terrain':
+            node.shape = {'type': 'grid', 'size': 4.0}
         elif usd_placeholder(item) is not None:  # an imported USD: a box of its authored extent
             low, high = usd_placeholder(item)
             box(tuple(np.maximum(high - low, .005)), tuple((low + high) / 2))
@@ -1211,11 +1262,11 @@ class Editor:
     def parameter_values(self, item):
         """Factory defaults, saved parameters, then unsaved edits (when they parse)."""
         defaults = {name: field.get('default') for name, field in self.asset_entry(item['factory']).get('parameters', {}).items()}
-        try:
-            pending = json.loads(self.parameters.get(item['path'], '{}'))
+        try:  # an edit holds all the parameters (_set_parameter): one it removed is gone, not the saved value
+            pending = json.loads(self.parameters[item['path']]) if item['path'] in self.parameters else None
         except ValueError:
-            pending = {}
-        return {**defaults, **item.get('parameters', {}), **(pending if isinstance(pending, dict) else {})}
+            pending = None
+        return {**defaults, **(pending if isinstance(pending, dict) else item.get('parameters', {}))}
 
     def camera_optics(self, item):
         parameters = self.parameter_values(item)
@@ -1307,10 +1358,13 @@ class Editor:
         scene = self.server.scene
         if not hasattr(self, 'emitted'):
             scene.reset()
-            scene.add_grid('/floor_grid', width=10, height=10, cell_size=.5, section_size=1.0,
-                           cell_color=(220, 220, 220), section_color=(170, 170, 170))
-            self.gizmo = scene.add_transform_controls('/gizmo', scale=GIZMO_SCALE, depth_test=False, visible=False)
+            self.floor_grid = scene.add_grid('/floor_grid', width=10, height=10, cell_size=.5, section_size=1.0,
+                                             cell_color=(220, 220, 220), section_color=(170, 170, 170))
+            self._apply_style()
+            self.gizmo = scene.add_transform_controls('/gizmo', scale=GIZMO_PIXELS, fixed=True, depth_test=False,
+                                                      visible=False)
             self.gizmo.on_update(self._gizmo_moved)
+            self.set_gizmo_mode(getattr(self, 'gizmo_mode', 'move'))
             self.emitted = {}
         self.handles = {}
         order, seen = [], set()
@@ -1364,6 +1418,7 @@ class Editor:
         for path, info in self.info.items():
             if info.get('objects'):
                 self._show_objects(path)  # removed (exclude) and editor-hidden scene objects
+        self._sync_floor_grid()
         # Deepest first: a parent's removal already takes its children.
         for name in sorted(previous, key=len, reverse=True):
             if previous[name]['frame'] is None:
@@ -1371,6 +1426,14 @@ class Editor:
             with contextlib.suppress(Exception), warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 previous[name]['frame'].remove()
+
+    def _sync_floor_grid(self):
+        """The faint reference grid at z = 0 shows only while no ground plane is shown: it is not a surface,
+        and the ground plane entity (selectable, hideable) draws the floor itself."""
+        grounds = [path for path, item in self.items.items() if item['factory'] == 'ground_plane']
+        visible = all(('entity', path) in self.hidden for path in grounds)
+        if self.floor_grid.visible != visible:
+            self.floor_grid.visible = visible
 
     def _draw_batches(self):
         """Batched meshes of models with several copies (``_Batch``), under their entity's frame; one of an
@@ -1394,6 +1457,29 @@ class Editor:
         for handle, _ in previous.values():
             with contextlib.suppress(Exception):
                 handle.remove()
+
+    def _apply_style(self):
+        """Lights, floor and background of the view style (NEWTON_* for 'newton', viser's own for 'default')."""
+        scene = self.server.scene
+        for handle in self.style_handles:
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self.style_handles = []
+        newton = self.style == 'newton'
+        if not newton:
+            scene.configure_default_lights(enabled=True, cast_shadow=True)
+            scene.configure_environment_map('warehouse')
+            scene.set_background_image(None)
+            return
+        sun = np.asarray(NEWTON_SUN, float)
+        scene.configure_default_lights(enabled=False)
+        scene.configure_environment_map('warehouse', environment_intensity=NEWTON_LIGHT['environment'])  # a little sheen
+        self.style_handles = [
+            scene.add_light_directional('/style/sun', intensity=NEWTON_LIGHT['sun'], cast_shadow=True,
+                                        position=tuple(10 * sun / np.linalg.norm(sun))),
+            scene.add_light_hemisphere('/style/fill', sky_color=NEWTON_FILL[0], ground_color=NEWTON_FILL[1],
+                                       intensity=NEWTON_LIGHT['fill'], position=(0., 0., 1.))]
+        scene.set_background_image(sky_gradient(*NEWTON_SKY))
 
     def _set_textures(self, on):
         if self.show_textures != on:
@@ -1425,7 +1511,7 @@ class Editor:
         shape, scene = node.shape, self.server.scene
         if not shape:
             return
-        name, color = node.name + '/v', COLORS['selected'] if highlight else shape.get('color')
+        name, color = node.name + '/v', COLORS['selected'] if highlight else self._rest_color(node.owner, node)
         kind = shape['type']
         if shape.get('batch') is not None:  # a copy drawn by its entity's batched mesh (_Batch)
             node.handle = _Slot(shape['batch'], node.slot)
@@ -1474,6 +1560,12 @@ class Editor:
             handle = scene.add_camera_frustum(name, fov=shape['fov'], aspect=shape['aspect'], scale=.08,
                                               color=COLORS['selected'] if highlight else COLORS['sensor'],
                                               wxyz=_wxyz(GL_TO_CV))
+        elif kind == 'checker':  # not tinted when selected: the outline shows it
+            (light, faces), (dark, dark_faces) = checker_floor(shape['size'])
+            handle = scene.add_mesh_simple(name, light, faces, color=NEWTON_FLOOR[0], cast_shadow=False,
+                                           receive_shadow=True, **faint)
+            scene.add_mesh_simple(name + '/dark', dark, dark_faces, color=NEWTON_FLOOR[1], cast_shadow=False,
+                                  receive_shadow=True, **faint)
         elif kind == 'grid':
             handle = scene.add_grid(name, width=shape['size'], height=shape['size'], cell_size=.25,
                                     cell_color=(150, 160, 170), section_color=(90, 100, 110))
@@ -1488,16 +1580,20 @@ class Editor:
         # moved get a drag handler instead: pressing on one and dragging slides it (see _drag).
         node.handle = handle
         if kind in ('mesh', 'box', 'sphere') and node.owner and node.owner[0] == 'entity' \
-                and self.items.get(node.owner[1], {}).get('category') in DRAGGABLE:
+                and self._body_draggable(node.owner[1]):
             async def dragged(event, owner=node.owner):  # async: phases arrive in order
                 self.drag_events.put((owner, event.phase, event.start_position, event.end_position,
                                       event.client.camera.position))
-            handle.on_drag(dragged)
+            self.__dict__.setdefault('body_drags', {})[node.name] = (handle, dragged)
+            if not self.body_drags_off:
+                handle.on_drag(dragged)
 
     def _update_frame(self, node):
         handle = self.handles.get(id(node))
         if handle is not None:
             handle.position, handle.wxyz = _xyz(node.local), _wxyz(node.local)
+        if node is self._node_of(self.selected):
+            self.panel_revision += 1  # the app's position fields follow a drag
 
     def _highlight(self, owner, on):
         node = self._node_of(owner)
@@ -1510,7 +1606,7 @@ class Editor:
             for mesh in self.info[owner[1]]['meshes']:
                 lit = self.part_holds(owner[1], mesh.object, names)
                 if mesh.handle is not None and getattr(mesh, 'lit', False) != lit and mesh.shape.get('color') is not None:
-                    mesh.handle.color = COLORS['selected'] if lit else mesh.shape.get('color')
+                    mesh.handle.color = COLORS['selected'] if lit else self._rest_color(owner, mesh)
                     mesh.lit = lit
                     entry = self.emitted.get(mesh.name)
                     if entry is not None:
@@ -1523,11 +1619,11 @@ class Editor:
                 continue
             if self._solid(shaped):
                 # Recolour in place: re-adding the node would end a drag that is selecting it.
-                shaped.handle.color = COLORS['selected'] if on else shaped.shape.get('color')
+                shaped.handle.color = COLORS['selected'] if on else self._rest_color(owner, shaped)
                 entry = self.emitted.get(shaped.name)
                 if entry is not None:
                     entry['highlighted'] = on
-            else:
+            elif shaped.shape['type'] != 'checker':  # the ground's ~1 MB floor is not resent on selection
                 self._draw_shape(shaped, highlight=on)
 
     def _client_connected(self, client):
@@ -1592,11 +1688,22 @@ class Editor:
         """Whether the ray passes over a drawn gizmo handle (arrows, plane squares, rotation arcs)."""
         origin = np.asarray(origin, float)
         direction = np.asarray(direction, float) / np.linalg.norm(direction)
-        points = (GIZMO_HANDLES * GIZMO_SCALE) @ F.quat_matrix(self.gizmo.wxyz)[:3, :3].T + np.asarray(self.gizmo.position)
+        unit = self._gizmo_unit(origin)
+        points = (GIZMO_HANDLES * unit) @ F.quat_matrix(self.gizmo.wxyz)[:3, :3].T + np.asarray(self.gizmo.position)
         along = np.clip((points - origin) @ direction, 0.0, None)
         miss = np.linalg.norm(origin + along[:, None] * direction - points, axis=1)
-        # Handles keep a constant on-screen width: tolerance grows with distance.
-        return bool(np.any(miss < .012 + .02 * along))
+        return bool(np.any(miss < .07 * unit))  # ~8 px around the drawn handles
+
+    def _gizmo_unit(self, origin):
+        """World length of the gizmo's unit seen from ``origin``: GIZMO_PIXELS CSS pixels at its distance, as
+        drei's calculateScaleFactor sizes fixed pivot controls (vertical fov, canvas height / pixel ratio)."""
+        distance = float(np.linalg.norm(np.asarray(self.gizmo.position) - origin))
+        clients = [client for client in self.server.get_clients().values() if client.camera.image_height]
+        if not clients:
+            return GIZMO_PIXELS * distance / 800
+        camera = min(clients, key=lambda client: np.linalg.norm(np.asarray(client.camera.position) - origin)).camera
+        height = camera.image_height / self.pixel_ratio
+        return GIZMO_PIXELS * 2 * distance * np.tan(camera.fov / 2) / height
 
     @action
     def _scene_clicked(self, event):
@@ -1609,14 +1716,43 @@ class Editor:
             self.cancel_placement()
             placing['add']([round(float(value), 4) for value in point])
             return
+        if self.parent_picking:
+            self._pick_parent(origin, event.ray_direction)
+            return
         if self.gizmo.visible and self._near_gizmo(origin, event.ray_direction):
             return  # Clicks on the transform handles never select what lies behind them.
         owner = self.pick(origin, event.ray_direction, self.selected)
         node = getattr(self, 'hit_nodes', {}).get(owner)
+        # The link under the pointer, for the context menu (a sensor added there).
+        self.last_hit = {'path': owner[1], 'body': self.hit_body(owner[1], node)} if owner and owner[0] == 'entity' else None
         if owner and getattr(node, 'object', None):  # a part of an imported scene: select that object
             self.select_object(owner[1], node.object)
             return
         self.select(owner)
+
+    def hit_body(self, path, node):
+        """The link of ``path`` that a picked mesh belongs to ('' for its root)."""
+        bodies = {id(body): name for name, body in self.info[path]['bodies'].items()}
+        while node is not None:
+            if id(node) in bodies:
+                return bodies[id(node)]
+            node = node.parent
+        return ''
+
+    def _pick_parent(self, origin, direction):
+        """The click that chooses the parent of ``parent_picking``: the entity under the pointer, at the link
+        clicked when it has links."""
+        source, self.parent_picking = self.parent_picking, None
+        owner = self.pick(origin, direction, None)
+        if owner is None or owner[0] != 'entity' or owner[1] == source or source not in self.items:
+            self.report('没有点到其他物体，已取消选择父物体')
+            return
+        body = self.hit_body(owner[1], getattr(self, 'hit_nodes', {}).get(owner))
+        self.select.__wrapped__(self, ('entity', source))
+        # The app asks how (relation, link, keep the place or move there) before anything changes.
+        self.parent_choice = {'id': time.time(), 'target': owner[1], 'body': body or None}
+        self.panel_revision += 1
+        self.outliner_revision += 1
 
     def _node_of(self, owner):
         if not owner:
@@ -1637,6 +1773,7 @@ class Editor:
                     self._highlight(other, False)
             self.also_selected = []
         if owner != self.selected or scene_object != self.selected_object:
+            self.selected_joint = None
             self._end_preview()  # Switching away abandons an unapplied preview.
             self.open_section, self.undo_tag = None, None
             if self.cutaway:
@@ -1656,7 +1793,14 @@ class Editor:
         self._rebuild_inspector()
         self._style_tree()
         self._draw_motion_path()
-        self._show_links()
+        self._draw_sensor()
+        self.panel_revision += 1
+        # A newly selected camera is rendered; a reload selecting it again (an edit) keeps its last view.
+        camera = self.selected[1] if self._camera_selected() else None
+        if camera and camera != getattr(self, 'camera_selected_path', None):
+            self.camera_frame = None
+            self.request_camera_view()
+        self.camera_selected_path = camera
 
     def selection(self):
         """Selected owners, the active one (gizmo, inspector) last."""
@@ -1687,14 +1831,28 @@ class Editor:
         if len(owners) == 1:
             self._delete(owners[0][1])
         elif owners:
-            names = '、'.join(f'`{self.items[o[1]]["label"]}`' for o in owners)
+            paths = [o[1] for o in owners]
             modal = self.server.gui.add_modal('删除实体')
             with modal:
-                self.server.gui.add_markdown(f'删除 {len(owners)} 个实体：{names}？\n\n挂在它们上面的传感器等一起删除；'
-                                             '可用 Ctrl-Z 撤回。')
+                self.server.gui.add_markdown('\n\n'.join(self.deletion_message(paths)))
                 self.server.gui.add_button('删除', color='red', icon='trash').on_click(
-                    lambda _: (modal.close(), self.guarded(self._remove_many)([o[1] for o in owners])))
+                    lambda _: (modal.close(), self.guarded(self.delete_entities)(paths)))
                 self.server.gui.add_button('取消', icon='x').on_click(lambda _: modal.close())
+
+    def delete_entities(self, paths):
+        """Delete confirmed entities: one with its plan, several one after another (one undo step)."""
+        paths = [path for path in paths if path in self.items]
+        if len(paths) == 1:
+            self._remove(paths[0], self.deletion_plan(paths[0]))
+        elif paths:
+            self._remove_many(paths)
+
+    def deletion_message(self, paths):
+        """Markdown lines that say what deleting these entities also changes, for the confirmation."""
+        if len(paths) == 1:
+            return self._deletion_lines(paths[0])
+        names = '、'.join(f'`{self.items[path]["label"]}`' for path in paths)
+        return [f'删除 {len(paths)} 个实体：{names}？', '挂在它们上面的传感器等一起删除；可用 Ctrl-Z 撤回。']
 
     def _remove_many(self, paths):
         self.checkpoint()
@@ -1731,6 +1889,7 @@ class Editor:
             return
         self.hidden ^= {owner}
         self.handles[id(node)].visible = owner not in self.hidden
+        self._sync_floor_grid()
         self.outliner_revision += 1
         self._label_tree()
         if owner == self.selected and self.hidden_box is not None and self.hidden_box.value != (owner in self.hidden):
@@ -2096,11 +2255,18 @@ class Editor:
                 if path not in self.items:
                     raise KeyError(f'场景中没有 {path}')
                 return {'revision': self.outliner_revision, 'rows': self.object_rows(path)}
+            if name == 'signals':
+                role = query.get('role') or self.lens_role or self.train_role
+                return {'revision': self.outliner_revision, 'role': role, 'groups': self.observation_groups(role)}
+            if name == 'panel':
+                if query.get('revision') == str(self.panel_revision):
+                    return {'revision': self.panel_revision}
+                return {'revision': self.panel_revision, **self.panel_context()}
             if name != 'state':
                 raise KeyError(f'未知的场景列表请求 {name}')
             if query.get('revision') == str(self.outliner_revision):
                 return {'revision': self.outliner_revision}
-            rows = []
+            rows, uses, modes = [], self.observation_uses(), self.robot_modes()
             for owner, depth in self.tree_entries():
                 kind, path = owner
                 row = {'id': f'{kind}:{path}', 'depth': depth, 'icon': self._row_icon(owner), 'changed': owner in self.tree_changed,
@@ -2131,14 +2297,34 @@ class Editor:
                     motion = self.current_motion(path)
                     if motion:
                         row['motion'] = MOTIONS[motion['type']]
+                    native = item.get('native_key')
+                    row['uses'] = uses.get(native, {})
+                    row['mode'] = modes.get(native)
+                    # Robots and jointed objects (a microwave door, a drawer) unfold to their joints.
+                    row['joints'] = self.joint_rows(path) if row['mode'] or item['category'] in ('robot', 'object') else []
+                    if self.selected_joint and self.selected_joint[0] == path and owner == self.selected:
+                        row['selected_joint'] = self.selected_joint[1]
                 else:
                     row.update(label=path, note='', hint='布局组合（仅摆放）')
                 rows.append(row)
-            return {'revision': self.outliner_revision, 'rows': rows}
+            # Quantities that are not scene entities (simulation, a component's output) in the observe lens.
+            return {'revision': self.outliner_revision, 'rows': rows, **self.lens_state()}
 
     def outliner_post(self, name, request):
         with self.lock:
             try:
+                if name in ('lens', 'observe', 'train', 'component'):  # about the policy, not one row
+                    if name == 'lens':
+                        self.set_lens(request.get('lens'), request.get('role'))
+                    elif name == 'observe':
+                        self.set_observation.__wrapped__(self, request.get('role'), request.get('key'), request.get('on'))
+                    elif name == 'train':
+                        self._set_train.__wrapped__(self, request.get('role'))
+                    else:
+                        self.set_component.__wrapped__(self, request.get('role'), request.get('field'), request.get('value'))
+                    self.outliner_revision += 1
+                    self.panel_revision += 1
+                    return self.outliner_get('state', {})
                 kind, _, path = str(request.get('id', '')).partition(':')
                 owner = (kind, path)
                 if self._node_of(owner) is None:
@@ -2178,6 +2364,10 @@ class Editor:
                 elif name == 'focus':
                     self.select.__wrapped__(self, owner)
                     self.focus_selection.__wrapped__(self)
+                elif name == 'joint':
+                    self.select_joint(path, request.get('joint'))
+                elif name == 'mode':
+                    self.set_robot_mode.__wrapped__(self, self.items[path]['native_key'], request.get('mode'))
                 elif name == 'bind':
                     if kind != 'entity':
                         raise ValueError('布局组合不能拖放绑定')
@@ -2185,13 +2375,1109 @@ class Editor:
                     target_kind, _, target_path = str(target or '').partition(':')
                     if target and (target_kind != 'entity' or target_path not in self.items):
                         raise ValueError('只能拖到场景中的实体上')
-                    self.bind(path, target_path if target else None)
+                    if target and request.get('body'):
+                        # Dropped on a link row: attached at that link, physically when both can be.
+                        if self.selected != owner:
+                            self.select.__wrapped__(self, owner)
+                        self._ui_attach({'target': target_path, 'body': request['body'], 'mode': 'auto'})
+                    else:
+                        self.bind(path, target_path if target else None)
                 else:
                     raise KeyError(f'未知的场景列表请求 {name}')
             except Exception as error:
                 self.report(f'⚠️ {error}', error=True)
                 raise
             return self.outliner_get('state', {})
+
+    # ------------------------------------------- lenses: what the scene feeds the policy (outliner + panels)
+    # The outliner shows the scene as it is (scene), as each component's inputs (observe), as what the
+    # task reads (task) or as what the policy drives (policy). The page holds no state of its own: the lens,
+    # the observation selection and the control modes live here and tint the 3D view.
+    def native_path(self, key):
+        return next((path for path, item in self.items.items() if item.get('native_key') == key), None)
+
+    def observation_uses(self):
+        """native key -> {role: number of its selected observations}."""
+        uses = {}
+        for (role, key), on in self.observation_enabled.items():
+            if on:
+                counts = uses.setdefault(key.partition('.')[0], {})
+                counts[role] = counts.get(role, 0) + 1
+        return uses
+
+    def robot_modes(self):
+        """native key -> control mode of every robot (``none``: not driven by the policy). Older scenes with
+        control.output: the asset of each binding and its type."""
+        from shared.assembly.control import actuated
+        control = self.snapshot.get('control') or {}
+        if not control:
+            return {}
+        if 'output' in control:
+            return {binding['asset_name']: binding['type'] for binding in self.bindings().values()}
+        modes = {**control.get('modes', {}), **self.pending['modes']}
+        return {item['native_key']: modes.get(item['native_key']) or 'joint_position'
+                for item in self.items.values() if item.get('native_key') and actuated(item)}
+
+    def joint_rows(self, path):
+        """Movable joints of an entity in its kinematic tree: name, the link it moves, type, depth and column in
+        its joint readings (target order). Fixed links fold into their parent and a serial chain stays at one
+        depth; only a branch (the two fingers of a gripper) indents."""
+        joints = ((self.info.get(path) or {}).get('kinematics') or {}).get('joints') or []
+        order = list(self.initial_display(path).get('joint_positions', {}))
+        children, children_of = {joint['child'] for joint in joints}, {}
+        for joint in joints:
+            children_of.setdefault(joint['parent'], []).append(joint)
+
+        def movable_below(link):
+            for joint in children_of.get(link, ()):
+                if joint.get('type') in (None, 'fixed'):
+                    yield from movable_below(joint['child'])
+                else:
+                    yield joint
+        rows = []
+
+        def walk(link, depth, root):
+            below = list(movable_below(link))
+            depth += len(below) > 1 and not root
+            for joint in below:
+                rows.append({'name': joint['name'], 'link': joint['child'], 'type': joint['type'], 'depth': depth,
+                             'index': order.index(joint['name']) if joint['name'] in order else None})
+                walk(joint['child'], depth, False)
+        for root in [link for link in children_of if link not in children]:
+            walk(root, 0, True)
+        return rows
+
+    def observation_groups(self, role):
+        """The observable quantities, grouped by what they read (an entity, the simulation, a component),
+        with their selection for ``role``. A component reads earlier components' outputs, not later ones."""
+        components = (self.snapshot.get('control') or {}).get('components', {})
+        roles = list(self.observation_order)
+        hidden = roles[roles.index(role):] if role in roles else ()
+        groups, order = {}, self.observation_order.get(role, [])
+        for key in [key for key in self.observation_meta if key in order] + [key for key in order if key not in self.observation_meta]:
+            enabled = bool(self.observation_enabled.get((role, key)))
+            native = key.partition('.')[0]
+            if native in hidden and not enabled:
+                continue
+            meta = self.observation_meta.get(key, {})
+            source = meta.get('source_groups', {}).get('default', {})
+            label, name = observation_group(key, source, components)
+            info = meta.get('information') or {}
+            group = groups.setdefault(native, {'key': native, 'label': label, 'path': self.native_path(native), 'rows': []})
+            group['rows'].append({
+                'key': key, 'name': name, 'label': meta.get('label', ''), 'enabled': enabled,
+                'available': bool(source.get('available', meta.get('available', enabled)) and meta.get('observation_selectable', True)) or enabled,
+                'shape': 'B×' + '×'.join('N' if size is None else str(size) for size in info.get('shape', ())) if info.get('shape') else '',
+                'unit': meta.get('units') or info.get('unit') or '', 'description': meta.get('description', '')})
+        return list(groups.values())
+
+    def _lens_tints(self):
+        """Entity path -> colour the current lens paints it (the selection colour still wins)."""
+        if self.lens != 'observe' or not self.lens_role:
+            return {}
+        uses, color = self.observation_uses(), LENS_COLORS[self.role_slot(self.lens_role)]
+        driven = ({key for key, mode in self.robot_modes().items() if mode != 'none'}
+                  if self.role_slot(self.lens_role) == 'executor' else set())
+        return {path: color for path, item in self.items.items()
+                if uses.get(item.get('native_key'), {}).get(self.lens_role) or item.get('native_key') in driven}
+
+    def _rest_color(self, owner, shaped):
+        """Colour of a shape that is not selected: its lens tint, else its own."""
+        color = shaped.shape.get('color')
+        tint = self.tints.get(owner[1]) if owner and owner[0] == 'entity' and color is not None else None
+        # Half the tint over the model's own colour: the shape stays readable.
+        return tuple(int(.6 * t + .4 * c) for t, c in zip(tint, color)) if tint else color
+
+    def _apply_tints(self):
+        tints = self._lens_tints()
+        changed = {path for path in set(tints) | set(self.tints) if tints.get(path) != self.tints.get(path)}
+        self.tints = tints
+        selected = set(self.selection())
+        for path in changed:
+            if path not in self.info or ('entity', path) in selected:
+                continue
+            info = self.info[path]
+            for shaped in [info['node'], *info.get('meshes', ())]:
+                if not (shaped.shape and shaped.name):
+                    continue
+                if self._solid(shaped):
+                    shaped.handle.color = self._rest_color(('entity', path), shaped)
+                elif shaped.shape.get('type') != 'mesh':
+                    self._draw_shape(shaped)
+            self._flush_batches(path)
+
+    def role_slot(self, role):
+        """Colour slot of a policy layer: 'executor' for the one driving the robots, 'planner' for a layer before it
+        (older scenes name their components so)."""
+        if role in ('planner', 'executor'):
+            return role
+        control = self.snapshot.get('control') or {}
+        return 'executor' if role == (control.get('driver') or list(control.get('components', {}) or [None])[-1]) else 'planner'
+
+    def role_labels(self):
+        """Role -> {label, slot} for the app: a single layer is just 策略; layers keep their names."""
+        roles = list(self.observation_order)
+        names = {'planner': 'Planner', 'executor': 'Executor'}
+        # The badge in the tree: the layer's initial, two letters when the layers share one (plan / policy -> Pl / Po).
+        initials = [role[:1].upper() for role in roles]
+        marks = [role[:2].capitalize() if initials.count(role[:1].upper()) > 1 else role[:1].upper() for role in roles]
+        return {role: {'label': '策略' if len(roles) == 1 else names.get(role, role), 'slot': self.role_slot(role), 'mark': mark}
+                for role, mark in zip(roles, marks)}
+
+    def lens_state(self):
+        control = self.snapshot.get('control') or {}
+        return {'lens': self.lens, 'role': self.lens_role, 'train': self.train_role,
+                'roles': list(self.observation_order), 'role_labels': self.role_labels(),
+                'automatic': bool(control) and 'output' not in control,
+                'counts': {role: sum(1 for (r, _), on in self.observation_enabled.items() if on and r == role)
+                           for role in self.observation_order}}
+
+    def set_lens(self, lens, role=None):
+        if lens not in LENSES:
+            raise ValueError(f'未知的视图 {lens}')
+        if lens == 'observe':
+            role = role or self.lens_role or self.train_role
+            if role not in self.observation_order:
+                raise ValueError(f'这个场景的策略没有 {role}')
+            self.lens_role = role
+        self.lens = lens
+        self._apply_tints()
+        self.outliner_revision += 1
+        self.panel_revision += 1
+
+    @action
+    def set_observation(self, role, key, on):
+        if (role, key) not in {(r, k) for r, keys in self.observation_order.items() for k in keys}:
+            raise ValueError(f'{role} 没有可选的观察 {key}')
+        self.checkpoint()
+        for part in self.layer_parts(key):
+            self.observation_enabled[(role, part)] = bool(on)
+        self._apply_tints()
+        self.outliner_revision += 1
+        self.panel_revision += 1
+        self.report(f'{role} {"读取" if on else "不再读取"} {key}；保存后写入 scene.yaml')
+
+    def layer_parts(self, key):
+        """The quantities one choice selects: every entry of another layer's dict is read together (scene.yaml
+        names the layer), anything else alone."""
+        control = self.snapshot.get('control') or {}
+        head, _, tail = key.partition('.')
+        parts = ((control.get('structure') or {}).get(head) or {}).get('parts')
+        if control.get('layers') is True and parts and tail in parts:
+            return [f'{head}.{part}' for part in parts]
+        return [key]
+
+    @action
+    def set_robot_mode(self, key, mode):
+        if mode not in ROBOT_MODES:
+            raise ValueError(f'未知的控制方式 {mode}')
+        if key not in self.robot_modes():
+            raise ValueError(f'{key} 不是受策略控制的机器人')
+        if 'output' in (self.snapshot.get('control') or {}):
+            raise ValueError('此场景用 control.output 逐个列出控制目标（旧写法）；删除该段后按机器人自动控制')
+        self.checkpoint()
+        self.pending['modes'][key] = mode
+        self._apply_tints()
+        self.outliner_revision += 1
+        self.panel_revision += 1
+        self.report(f'{key}：{ROBOT_MODES[mode]}；保存后写入 scene.yaml，decode_action 需与之一致')
+
+    @action
+    def set_component(self, role, field, value):
+        if role not in self.observation_order or field not in ('period', 'dimension'):
+            raise ValueError('只能修改组件的 period 与 dimension')
+        self.checkpoint(('component', role, field))
+        self.pending['components'].setdefault(role, {})[field] = str(value)
+        self.panel_revision += 1
+
+    def panel_context(self):
+        """What the tree and the properties read about the policy (ui_inspector, app.js): its components, the selected
+        entity's observations and control, the selected joint."""
+        control = self.snapshot.get('control') or {}
+        components = control.get('components', {})
+        context = {'lens': self.lens, 'role': self.lens_role, 'train': self.train_role, 'has_control': bool(control),
+                   'automatic': bool(control) and 'output' not in control, 'task': (Path(self.scene).parent / 'task.py').is_file()}
+        modes = self.robot_modes()
+        labels = self.role_labels()
+        structure = control.get('structure') or {}
+        context['layered'] = control.get('layers') is True
+        context['components'] = [{
+            'role': role, 'trained': role == self.train_role,
+            'returns': {key: structure.get(role, {}).get(key) for key in ('parts', 'notes')},
+            'period': str(self.pending['components'].get(role, {}).get('period', saved.get('period', ''))),
+            'inputs': [{'key': key, 'path': self.native_path(key.partition('.')[0])}
+                       for key in self.observation_order.get(role, []) if self.observation_enabled.get((role, key))]}
+            for role, saved in components.items()]
+        context['robots'] = [{'key': key, 'path': self.native_path(key), 'mode': mode,
+                              'joints': len(self.joint_rows(self.native_path(key))) if self.native_path(key) else None}
+                             for key, mode in modes.items()]
+        owner = self.selected
+        if owner and owner[0] == 'entity' and owner[1] in self.items:
+            path, item = owner[1], self.items[owner[1]]
+            native = item.get('native_key')
+            signals = {}
+            for role in self.observation_order:
+                for group in self.observation_groups(role):
+                    if group['key'] != native:
+                        continue
+                    for row in group['rows']:
+                        if row['key'].endswith(NOT_INPUTS):
+                            continue
+                        entry = signals.setdefault(row['key'], {**row, 'roles': {}})
+                        entry['roles'][role] = row['enabled'] if row['available'] else None
+            for entry in signals.values():
+                entry.pop('enabled', None)
+            context['entity'] = {'path': path, 'label': (self.labels.get(path) or item['label']).strip() or item['name'],
+                                 'native': native, 'category': item['category'], 'category_label': item['category_label'],
+                                 'signals': list(signals.values()), 'mode': modes.get(native),
+                                 'joints': self.joint_rows(path)}
+            if self.selected_joint and self.selected_joint[0] == path:
+                joint = next((row for row in ((self.info[path].get('kinematics') or {}).get('joints') or ())
+                              if row['name'] == self.selected_joint[1]), None)
+                if joint is not None:
+                    index = next((row['index'] for row in context['entity']['joints'] if row['name'] == joint['name']), None)
+                    context['joint'] = {'name': joint['name'], 'type': joint.get('type'), 'parent': joint.get('parent'),
+                                        'child': joint.get('child'), 'limits': joint.get('limits'), 'index': index,
+                                        'position': self.initial_display(path).get('joint_positions', {}).get(joint['name'])}
+        return context
+
+    def select_joint(self, path, joint):
+        if path not in self.items or joint not in {row['name'] for row in self.joint_rows(path)}:
+            raise ValueError(f'{path} 没有关节 {joint}')
+        if self.selected != ('entity', path):
+            self.select.__wrapped__(self, ('entity', path))
+        self.selected_joint = (path, joint)
+        self._light_link(path, joint)
+        self.panel_revision += 1
+
+    # ------------------------------------------------------- editor app (tools/editor_ui/app.js)
+    # The app replaces viser's panels: a top bar, the scene tree with its lenses on the left, the selection's
+    # properties on the right. It reads ui_get and edits through ui_post, which call the same methods as
+    # the 3D view; viser keeps the view, the gizmos and the clicks in it.
+    def ui_get(self, name, query):
+        with self.lock:
+            if name == 'state':
+                return self.ui_state()
+            if name == 'projects':
+                return self.ui_projects()
+            if name == 'log':
+                return {'messages': list(self.messages)}
+            if name == 'attach':
+                return self.attach_options(query.get('target', ''))
+            if name == 'delete':  # what deleting the selected entities also changes, before the user confirms
+                paths = [owner[1] for owner in self.selection() if owner[0] == 'entity']
+                if not paths:
+                    raise KeyError('先选中实体')
+                return {'paths': paths, 'lines': self.deletion_message(paths)}
+            if name == 'inspector':
+                if query.get('revision') == str(self.panel_revision):
+                    return {'revision': self.panel_revision}
+                return {'revision': self.panel_revision, **self.ui_inspector()}
+            raise KeyError(f'未知的界面请求 {name}')
+
+    def ui_state(self):
+        """The top bar: project, unsaved edits, undo/redo, the last report, engine choices."""
+        from shared.assembly.editing import simulation_settings
+        target = Path(self.target)
+        project = target.parent.name if target.name == 'scene.yaml' else target.name
+        simulation = {}
+        try:
+            _, choices, current = simulation_settings(self.target)
+            simulation = {name: {'value': self.pending['simulation'].get(name, current[name]),
+                                 'options': [[key, label] for key, (label, _) in options.items()]}
+                          for name, options in choices.items()}
+        except Exception:  # noqa: BLE001 - a scene without a readable recipe has no engine choice
+            pass
+        try:
+            dirty = self.unsaved()
+        except Exception:  # noqa: BLE001 - a pending edit that does not parse is still unsaved
+            dirty = True
+        command = self._preview_command()
+        return {'project': project, 'dirty': bool(dirty), 'undo': len(self.undo) > 0, 'redo': len(self.redo) > 0,
+                'boot': self.boot, 'status': self.last_status, 'last_error': self.last_error, 'jobs': self._job_cards(), 'simulation': simulation, 'command': command,
+                'textures': self.show_textures, 'style': self.style, 'outline': self._outlined(),
+                'problem': self.backend_problem, 'gizmo': self.gizmo_mode, 'snap': self.snap, 'start': self.start_screen,
+                'camera': self.camera_revision, 'picking': self.parent_picking, 'parent_choice': self.parent_choice, 'hit': self.last_hit, 'view': self.ui_view(), 'classic': self.classic,
+                'sensors': [[entry['id'], entry.get('label') or entry['id']] for entry in self.snapshot['catalog']['assets']
+                            if entry.get('category') == 'sensor']}
+
+    def ui_projects(self):
+        """Projects to open and templates to start one from (project menu)."""
+        from tools.create import MAINTAINED_TEMPLATES, TEMPLATE_LABELS
+        current = Path(self.target).resolve()
+        projects = [{'name': scene.parent.name, 'path': str(scene), 'current': scene.resolve() == current}
+                    for scene in sorted((ROOT / 'projects').glob('*/scene.yaml')) if not scene.parent.name.startswith('.')]
+        return {'projects': projects, 'templates': [[name, TEMPLATE_LABELS.get(name, name)] for name in MAINTAINED_TEMPLATES]}
+
+    def ui_camera(self):
+        """The selected camera's view as JPEG bytes (None until rendered)."""
+        with self.lock:
+            frame = self.camera_frame
+            return frame[1] if frame and self._camera_selected() and frame[0] == self.selected[1] else None
+
+    def ui_inspector(self):
+        """The selection as the right-hand panel shows it; empty when nothing is selected."""
+        owner = self.selected
+        node = self._node_of(owner)
+        if owner is None or node is None:
+            return {'owner': None, 'scene': self.ui_scene()}
+        kind, path = owner
+        data = {'owner': f'{kind}:{path}', 'kind': kind, 'locked': self._locked(owner), 'hidden': owner in self.hidden,
+                'position': [round(v, 5) for v in _xyz(node.local)],
+                'rotation': [round(v, 3) for v in F.matrix_euler(node.local)]}
+        if kind != 'entity':
+            return {**data, 'label': path, 'icon': 'stack-2', 'category': 'group'}
+        item, info = self.items[path], self.info[path]
+        data.update(label=(self.labels.get(path) or item['label']).strip() or item['name'], category=item['category'],
+                    category_label=item['category_label'], icon=self._row_icon(owner), path=path)
+        state = self.physics_state(path)
+        if state is not None:
+            data['physics'] = state[0]
+        if item['category'] == 'abstract' or (item.get('factory') and item['category'] not in ('sensor', 'light')):
+            data['render'] = self.render_visible(path)
+        if info['fixed']:
+            data['parent'] = {'kind': 'fixed', 'entity': info['fixed']['parent']['entity'],
+                              'body': info['fixed']['parent'].get('body')}
+        elif item.get('mount'):
+            data['parent'] = {'kind': 'follow' if item['category'] == 'abstract' else 'mount',
+                              'entity': _resolve(path, item['mount']['entity']), 'body': item['mount'].get('body')}
+        elif info['layout_parent']:
+            data['parent'] = {'kind': 'layout', 'entity': info['layout_parent']}
+        context = self.panel_context()
+        entity = context.get('entity') or {}
+        data['signals'] = entity.get('signals', [])
+        data['roles'] = list(self.observation_order)
+        data['role_labels'] = self.role_labels()
+        data['train'] = self.train_role
+        if entity.get('mode'):
+            data['mode'] = entity['mode']
+            data['automatic'] = context['automatic']
+            data['gravity'] = bool(item.get('gravity_compensation'))
+        joints = self.joint_rows(path)
+        # An imported asset with joints can be a robot (the policy drives its joints) or a passive object (a drawer).
+        if joints and item.get('factory') == 'usd_object' and item.get('kind') in ('robot', 'entity') and not item.get('kinematic'):
+            data['robot'] = item.get('kind') == 'robot'
+        if joints:
+            initial, authored = self.initial_display(path), item.get('initial_state', {})
+            limits = {row['name']: row.get('limits') for row in ((info.get('kinematics') or {}).get('joints') or ())}
+            pending = self.pending.get('initial', {}).get(path, {})
+            couplings = self._couplings(path)
+            for row in joints:
+                value = pending.get(row['name'], authored.get('joint_positions', {}).get(
+                    row['name'], initial.get('joint_positions', {}).get(row['name'])))
+                row.update(value=value, limits=limits.get(row['name']), follows=(couplings or {}).get(row['name']))
+            data['joints'] = joints
+            data['couplable'] = couplings is not None
+            data['selected_joint'] = self.selected_joint[1] if self.selected_joint and self.selected_joint[0] == path else None
+        if info.get('objects') and self.selected_object and self.selected_object[0] == path and self.selected_object[1]:
+            chosen = self.selected_object[1]
+            names, _ = self.object_targets(path, chosen)
+            excluded = self.excluded(path)
+            removed = all(any(_within(name, entry) for entry in excluded) for name in names)
+            data['object'] = {'id': chosen, 'label': self.object_label(path, chosen), 'count': len(names), 'removed': removed,
+                              'hidden': all((path, name) in self.hidden_objects for name in names),
+                              'extractable': names == [chosen] and info['objects'].get(chosen) == 'object' and not removed}
+        if info.get('objects'):
+            data['objects'] = {'total': sum(k == 'object' for k in info['objects'].values()), 'excluded': len(self.excluded(path))}
+        data['targets'] = [{'path': other['path'], 'label': other['label'], 'icon': self._row_icon(('entity', other['path']))}
+                           for other in self.snapshot['entities'] if other['path'] != path]
+        if data.get('parent'):
+            # The relation can change in place: physical (mount / follow / fix) or only laid out, at any link.
+            parent = data['parent']
+            if parent['kind'] == 'layout':
+                parent['body'] = (self.snapshot.get('layout_parents', {}).get(path) or {}).get('body') or ''
+            parent['bodies'] = self.bodies(parent['entity'])
+            capabilities = {entry['path']: entry.get('capabilities', []) for entry in self.snapshot['catalog']['entities']}
+            physical = '安装' if item['category'] == 'sensor' else '跟随' if item['category'] == 'abstract' else \
+                '固定' if all('root_state' in capabilities.get(p, []) for p in (path, parent['entity'])) else None
+            parent['modes'] = [*([['physical', physical]] if physical else []), ['layout', '仅摆放']]
+            parent['mode'] = 'layout' if parent['kind'] == 'layout' else 'physical'
+        motion = self.current_motion(path)
+        if item['category'] not in ('sensor', 'terrain', 'light') and not info['fixed'] and (motion or {}).get('type') != 'path' \
+                and not (item['category'] == 'abstract' and item.get('mount')):
+            reset = (self.pending['resets'][path] if path in self.pending['resets'] else item.get('reset')) or {}
+            data['reset'] = {'region': reset.get('region'), 'yaw': list(reset.get('yaw_range', (0.0, 0.0))),
+                             'interval': reset.get('interval'), 'abstract': item['category'] == 'abstract',
+                             'areas': [other['path'] for other in self.snapshot['entities']
+                                       if other['category'] == 'abstract' and other['path'] != path and not other.get('mount')
+                                       and not other.get('reset') and self.abstract_geometry(other['path'])[0] in ('rectangle', 'box')]}
+        movable = (item['category'] == 'abstract' and not item.get('mount')) or (
+            item['category'] == 'object' and item.get('scope') != 'global' and not info['fixed'] and not item.get('mount'))
+        if movable:
+            state = None if item['category'] == 'abstract' else self.physics_state(path)
+            blocked = path in self._regions() or (state is not None and (state[1] or state[0] == 'static'))
+            draft = self.motion_drafts.get(path) or copy.deepcopy(motion or {})
+            reset = self.pending['resets'][path] if path in self.pending['resets'] else item.get('reset')
+            data['motion'] = {'blocked': blocked, 'draft': draft, 'own_region': (reset or {}).get('region'),
+                              'areas': sorted(other for other in self._areas() if other != path)}
+        if item['category'] == 'abstract':
+            shape, size = self.abstract_geometry(path)
+            data['shape'] = {'shape': shape, 'size': list(size)}
+        elif item.get('factory'):
+            schema = self.asset_entry(item['factory']).get('parameters', {})
+            if schema and not item.get('parameters', {}).keys() - schema.keys():
+                values = self.parameter_values(item)
+                mounted = _resolve(path, item['mount']['entity']) if (item.get('mount') or {}).get('entity') else None
+                data['parameters'] = [{'name': name, 'label': field['label'], 'type': field['type'], 'value': values.get(name),
+                                       'options': field.get('options'), 'option_labels': field.get('option_labels', {}),
+                                       'length': field.get('length'), 'nullable': field.get('nullable', False),
+                                       # a body of the entity the sensor is on (frame_transformer.target_body)
+                                       **({'bodies': self.bodies(mounted)} if field.get('mount_body') and mounted in self.items else {})}
+                                      for name, field in schema.items() if name != 'scale']
+            else:
+                data['parameters_json'] = self.parameters.get(path, json.dumps(item.get('parameters', {}), ensure_ascii=False, indent=1))
+            data['scale'] = self.scale_value(path)
+        if item.get('factory') == 'camera':
+            width, height, _ = self.camera_optics(item)
+            data['camera'] = {'width': width, 'height': height, 'revision': self.camera_revision, 'error': self.camera_error}
+        return data
+
+    def ui_scene(self):
+        """The right-hand panel with nothing selected: the policy (which component trains, its rhythm and every
+        input it reads, scene entities and outside quantities alike) and the robots it drives."""
+        context = self.panel_context()
+
+        def inputs(role):
+            """Input groups of a component: each scene entity (labelled as in the tree) or outside source
+            (the simulation, earlier components) with its quantities; ``read`` when any is selected."""
+            out = []
+            for group in self.observation_groups(role):
+                # The simulation's own quantities (gravity, a constant) are never a useful input: not shown at all; an
+                # older scene that still reads gravity keeps it in scene.yaml.
+                if group['key'] == 'simulation':
+                    continue
+                rows = [row for row in group['rows'] if (row['available'] or row['enabled']) and not row['key'].endswith(NOT_INPUTS)]
+                if not rows:
+                    continue
+                path = group['path'] if group['path'] in self.items else None
+                entry = {'key': group['key'], 'label': group['label'], 'path': path, 'rows': rows,
+                         'read': sum(row['enabled'] for row in rows),
+                         'abstract': bool(path) and self.items[path].get('kind') == 'abstract'}
+                if path:
+                    entry.update(label=(self.labels.get(path) or self.items[path]['label']).strip() or self.items[path]['name'],
+                                 icon=self._row_icon(('entity', path)))
+                out.append(entry)
+            return sorted(out, key=lambda g: g['path'] is None)  # scene entities, then outside the scene
+        return {'components': [{**component, 'inputs': inputs(component['role'])} for component in context['components']],
+                'robots': context['robots'], 'automatic': context['automatic'], 'lens': self.lens, 'role': self.lens_role,
+                'layered': context['layered'],
+                'entities': len(self.items)}
+
+    def _entity_switch(self, changes, message, control_modes=None):
+        """One field of the selected entity from a switch in its properties: one undo step."""
+        path = self._selected_path()
+        payload = self.collect()
+        payload['entities'].append({'path': path, 'frame': 'local', 'changes': changes})
+        if control_modes:
+            payload['control_modes'] = {**payload.get('control_modes', {}), **control_modes}
+        self._apply(payload)
+        self.report(f'{self.items[path].get("native_key")} {message}')
+
+    def _ui_robot(self, request):
+        """An imported asset with joints becomes a robot (kind: robot; its joints are driven by the policy) or a passive
+        object again. In a scene with a policy a new robot starts undriven (modes: none) until decode_action returns its
+        targets, as when one is added."""
+        on, control = bool(request.get('on')), self.snapshot.get('control') or {}
+        key = self.items[self._selected_path()].get('native_key')
+        undriven = {key: 'none'} if on and control.get('components') and 'output' not in control else None
+        self._entity_switch({'kind': 'robot' if on else 'entity'},
+                            '作为机器人；先设为“不控制”：要让策略驱动它，在“控制”里改为“位置”，并在 decode_action 中返回它的目标'
+                            if on else '不再作为机器人，关节不受策略控制', undriven)
+
+    def _ui_gravity(self, request):
+        """gravity_compensation of the selected robot: its links carry no weight, as an arm's controller compensating
+        gravity keeps them, so its joints only track their targets."""
+        on = bool(request.get('on'))
+        self._entity_switch({'gravity_compensation': on},
+                            ('重力补偿：连杆不受重力，关节只管跟踪目标（像带重力补偿的机械臂控制器）' if on else '不再补偿重力')
+                            + '；保存后预览、训练按此仿真')
+
+    def _ui_split_policy(self, request):
+        """增加一层: a new fixed layer before the policy's only one, which then reads its result. scene.yaml gets the
+        layer (in the working copy, one undo step); policy.py gets a starting class right away that hands on the
+        chosen input (``source``, one of the policy's scene inputs), named and described after it, for the user to
+        replace with the layer's own computation."""
+        import ast
+        from shared.assembly.layers import type_name
+        policy = self.snapshot.get('policy') or {}
+        layers = policy.get('layers') or {}
+        if len(layers) != 1:
+            raise ValueError('只有一层的策略（policy: 写法）才能再增加一层')
+        name, period = str(request.get('name', '')).strip(), float(request.get('period'))
+        existing = next(iter(layers))
+        scene_inputs = [t for t in layers[existing].get('inputs', []) if '.' in t and t.split('.')[0] not in layers]
+        token = request.get('source') or next(iter(scene_inputs), None)
+        if token is None:
+            raise ValueError(f'{existing} 还没有读场景里的东西；先给它选一项输入')
+        if token not in scene_inputs:
+            raise ValueError(f'{existing} 没有读 {token}')
+        # The part is named after what it hands on (destination.position -> destination_position) and described
+        # with that quantity's shape, unit and meaning, as observation.py describes it.
+        part = token.replace('.', '_')
+        meta = self.observation_meta.get(token, {})
+        info = meta.get('information') or {}
+        shape = ', '.join(['B', *('N' if size is None else str(size) for size in info.get('shape') or [])])
+        entity, _, field = token.partition('.')
+        meaning = (meta.get('label') or field).split('（')[0]
+        unit = meta.get('units') or info.get('unit')
+        note = f'[{shape}] {entity} 的{meaning}' + (f'（{unit}）' if unit else '')
+        source = Path(self.scene).parent / 'policy.py'
+        text = source.read_text()
+        taken = {node.name for node in ast.parse(text).body if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+        model = type_name(name)
+        while model in taken:
+            model += '_'
+        stub = (f'\n\n# ---- {name}：编辑器“增加一层”生成的起点，改成你的 ----\n'
+                'from typing import TYPE_CHECKING\nfrom torch import nn\n'
+                f'if TYPE_CHECKING:\n    from .observation import {type_name(name)}Obs\n\n\n'
+                f'class {model}(nn.Module):\n    """{name} 交给 {existing} 的结果"""\n'
+                f"    def forward(self, obs: '{type_name(name)}Obs') -> dict:\n"
+                f'        # {name} 的计算写在这里；现在原样交给 {existing}\n'
+                f"        return {{'{part}': obs.{token}}}  # {note}\n")
+        payload = self.collect()
+        payload['layers'] = {'add': {'name': name, 'model': f'.policy:{model}', 'period': period, 'inputs': [token]}}
+        source.write_text(text.rstrip('\n') + '\n' + stub)
+        try:
+            self._apply(payload)
+        except Exception:
+            source.write_text(text)
+            raise
+        self.report(f'策略增加一层：{name}（固定，每 {period:g} s）→ {existing}；policy.py 末尾加了 {model}，'
+                    f'{existing} 现在可以读 obs.{name}.{part}。保存后写入 scene.yaml')
+
+    def _ui_merge_policy(self, request):
+        """去掉一层: drop the first layer; the other keeps its inputs except that layer's result."""
+        policy = self.snapshot.get('policy') or {}
+        layers = list((policy.get('layers') or {}))
+        if len(layers) != 2:
+            raise ValueError('策略只有一层')
+        payload = self.collect()
+        payload['observations'].pop(layers[0], None)
+        payload['layers'] = {'remove': layers[0]}
+        self._apply(payload)
+        self.report(f'策略去掉了 {layers[0]}；policy.py 里它的代码保留，{layers[1]} 不再读 obs.{layers[0]}，'
+                    '如有用到请一并修改。保存后写入 scene.yaml')
+
+    def _ui_unread(self, request):
+        """A component stops reading every quantity of one input group (an entity, a component): one undo step."""
+        role, keys = request.get('role'), [str(key) for key in request.get('keys') or ()]
+        known = set(self.observation_order.get(role, ()))
+        if not keys or not set(keys) <= known:
+            raise ValueError(f'{role} 没有这些观察：{sorted(set(keys) - known)}')
+        self.checkpoint()
+        for key in keys:
+            self.observation_enabled[(role, key)] = False
+        self._apply_tints()
+        self.report(f'{role} 不再读取 {"、".join(keys)}；保存后写入 scene.yaml')
+
+    def _ui_snap(self, request):
+        """Snapping on or off: a dragged object slides over the surfaces under it and is set down on them."""
+        self.snap = bool(request.get('on', not self.snap))
+        self.report('吸附表面：开（拖动物体时贴着下方表面走）' if self.snap else '吸附表面：关（拖动物体保持高度）')
+
+    def _ui_drop(self, request):
+        """The selected entities set down on the highest surface under each (End, as in Unreal)."""
+        paths = [owner[1] for owner in self.selection() if owner[0] == 'entity'
+                 and self.items[owner[1]]['category'] in ('robot', 'object') and not self._locked(owner)]
+        if not paths:
+            raise ValueError('选中机器人或物体后再落到表面')
+        self.checkpoint()
+        notes = [self._rest_on_surface(path) for path in paths]
+        self._place_gizmo()
+        self.request_camera_view()
+        self.report(f'已落到下方表面：{"、".join(self.items[p]["name"] for p in paths)}{"".join(notes)}')
+
+    def _ui_gizmo(self, request):
+        self.set_gizmo_mode(request.get('mode'))
+
+    def _ui_pick_parent(self, request):
+        """Arm (or cancel) the next click in the view as the selection's parent."""
+        self.parent_picking = self._selected_path() if request.get('on', True) else None
+        if self.parent_picking:
+            self.report('在视图中点击父物体（机器人点在哪个连杆就装在哪个连杆上），Esc 取消')
+
+    def _ui_group(self, request):
+        """The selected entities become one layout group (placed together, no physical joint), Ctrl+G."""
+        paths = [path for kind, path in self.selection() if kind == 'entity']
+        if len(paths) < 2:
+            raise ValueError('按住 Ctrl 选两个以上的物体，例如桌子和机械臂')
+        for path in paths:
+            info = self.info[path]
+            if info['fixed'] or self.items[path].get('mount') or info['grouped']:
+                raise ValueError(f'{self.items[path]["label"]} 已有父物体或已在组合里')
+        taken = set(self.snapshot.get('layout_groups', {}))
+        name = next(f'group_{index}' for index in range(1, len(taken) + 2) if f'group_{index}' not in taken)
+        self._save_first()
+        self.checkpoint()
+        self._apply({'revision': self.snapshot['revision'], 'layout_groups': {name: {'entities': paths}}},
+                    select=('group', name), record=False)
+        self.report(f'已组成布局组合 {name}（只一起摆放，不建物理连接）')
+
+    def _ui_ungroup(self, request):
+        if not self.selected or self.selected[0] != 'group':
+            raise ValueError('先选中一个布局组合')
+        self._save_first()
+        self.checkpoint()
+        self._apply({'revision': self.snapshot['revision'], 'layout_groups': {self.selected[1]: None}},
+                    select=None, record=False)
+
+    def _ui_new_project(self, request):
+        from shared.assembly.starter import DEFAULT_TEMPLATE
+        self.new_name.value, self.new_template.value = str(request.get('name', '')).strip(), request.get('template') or DEFAULT_TEMPLATE
+        self._new_environment.__wrapped__(self)
+
+    def _ui_start_done(self, request):
+        """The start screen was closed: keep editing the blank project."""
+        self.start_screen = False
+
+    def _ui_open_project(self, request):
+        self.open_path.value = str(request.get('path', ''))
+        self._open_environment.__wrapped__(self)
+
+    def _ui_classic(self, request):
+        """The app shows viser's own panels (or hides them): only then are they kept up to date."""
+        self.classic = bool(request.get('on'))
+        self._rebuild_inspector()
+
+    def _ui_camera(self, request):
+        self.request_camera_view()
+
+    def _ui_camera_view(self, request):
+        """The selected camera takes the 3D view's place and direction (then fine-tune it in 变换)."""
+        path = self._selected_path()
+        if self.items[path].get('factory') != 'camera':
+            raise ValueError('先选中一台相机')
+        clients = list(self.server.get_clients().values())
+        if not clients:
+            raise ValueError('没有打开的 3D 视图')
+        view = clients[0].camera  # OpenCV axes: it looks along +z; the camera node is OpenGL (looks along -z)
+        world = F.transform(view.position, F.quat_matrix(view.wxyz)) @ np.linalg.inv(GL_TO_CV)
+        node = self.info[path]['node']
+        local = np.linalg.inv(node.parent.world()) @ world if node.parent is not None else world
+        self._ui_pose({'position': [float(v) for v in _xyz(local)], 'rotation': [float(v) for v in F.matrix_euler(local)]})
+
+    def _ui_scale(self, request):
+        path = self._selected_path()
+        self.checkpoint(('scale', path))
+        value = request.get('value')
+        self.set_scale(path, value if isinstance(value, list) else [value] * 3)
+
+    def attach_options(self, target):
+        """How the selection can hang on ``target`` (the parent dialog): relations, links and link groups,
+        and what an unchosen relation and link default to."""
+        path = self._selected_path()
+        if target not in self.items or target == path:
+            raise ValueError('选另一个实体作父物体')
+        item, target_item = self.items[path], self.items[target]
+        capabilities = {entry['path']: entry.get('capabilities', []) for entry in self.snapshot['catalog']['entities']}
+        both = all('root_state' in capabilities.get(p, []) for p in (path, target))
+        physical = '安装' if item['category'] == 'sensor' else '跟随' if item['category'] == 'abstract' else '固定' if both else None
+        bodies = self.bodies(target)
+        # A contact sensor may cover every link sharing a name suffix (the four feet).
+        contact = 'contact_forces' in capabilities.get(path, []) or item.get('factory') == 'contact_sensor'
+        groups = [[pattern, label] for label, pattern in _body_groups(bodies).items()] if contact else []
+        mode = 'physical' if physical and (item['category'] in ('abstract', 'sensor') or both) else 'layout'
+        root = self.initial_display(target).get('root_body', '') if target_item['category'] in ('robot', 'object') else ''
+        return {'target': target, 'label': (self.labels.get(target) or target_item['label']), 'bodies': bodies, 'groups': groups,
+                'modes': [*([['physical', physical]] if physical else []), ['layout', '仅摆放']], 'mode': mode,
+                'body': root if mode == 'physical' and item['category'] != 'abstract' else '',
+                'linkable': item['category'] != 'abstract'}
+
+    def _ui_attach(self, request):
+        """Parent the selection on ``target``: physically (a sensor on a body, an abstract entity following the
+        root, two physical assets fixed together) or only laid out with it; ``place`` keeps where it is
+        (``keep``), moves it to the parent's origin keeping its turn (``origin``) or onto the parent's frame
+        (``align``)."""
+        path, target = self._selected_path(), request.get('target')
+        self.parent_choice = None
+        if target not in self.items or target == path:
+            raise ValueError('选另一个实体作父物体')
+        item = self.items[path]
+        capabilities = {entry['path']: entry.get('capabilities', []) for entry in self.snapshot['catalog']['entities']}
+        mode = request.get('mode') or 'auto'
+        if mode == 'auto':
+            physical = item['category'] in ('abstract', 'sensor') or all('root_state' in capabilities.get(p, []) for p in (path, target))
+        else:
+            physical = mode == 'physical'
+        body = request.get('body')
+        if body is None:
+            body = '' if not physical or item['category'] == 'abstract' else self.initial_display(target).get('root_body', '')
+        matrix, place = None, request.get('place') or 'keep'
+        if place in ('origin', 'align'):
+            parent, child = self.body_node(target, body).world(), self.info[path]['node'].world()
+            matrix = np.eye(4)
+            if place == 'origin':
+                matrix[:3, :3] = parent[:3, :3].T @ child[:3, :3]
+        elif place != 'keep':
+            raise ValueError(f'未知的放置方式 {place}')
+        self.attach_to(path, target, body, physical, matrix)
+
+    def ui_view(self):
+        """The view's orientation (wxyz) for the app's axes widget."""
+        clients = list(self.server.get_clients().values())
+        return [float(v) for v in clients[0].camera.wxyz] if clients else None
+
+    def _ui_view(self, request):
+        """Look along an axis (``+x`` looks from +X towards the target, Blender's numpad views) or orbit by
+        ``dx``/``dy`` pixels dragged on the axes widget, around the point the view looks at."""
+        for client in self.server.get_clients().values():
+            camera = client.camera
+            target = np.asarray(camera.look_at, float)
+            offset = np.asarray(camera.position, float) - target
+            distance = max(float(np.linalg.norm(offset)), 1e-3)
+            axis = request.get('axis')
+            if axis:
+                index, sign = 'xyz'.index(axis[1]), 1.0 if axis[0] == '+' else -1.0
+                direction = np.zeros(3)
+                direction[index] = sign
+                if index == 2:
+                    direction += np.array([0.0, -1e-3, 0.0])  # straight down: keep a heading for the up vector
+            else:
+                yaw, pitch = -float(request.get('dx', 0)) * .01, -float(request.get('dy', 0)) * .01
+                direction = offset / distance
+                turn = F.axis_angle((0.0, 0.0, 1.0), yaw)
+                direction = turn @ direction
+                right = np.cross(direction, [0.0, 0.0, 1.0])
+                if np.linalg.norm(right) > 1e-6:
+                    tilted = F.axis_angle(right / np.linalg.norm(right), pitch) @ direction
+                    if abs(tilted[2]) < .995:
+                        direction = tilted
+            # One message: position then look_at sent apart would show the view shifted for a frame.
+            with client.atomic():
+                camera.up_direction = (0.0, 0.0, 1.0)
+                # viser shifts look_at along with position, so the target is set last.
+                camera.position = tuple(target + distance * direction / np.linalg.norm(direction))
+                camera.look_at = tuple(target)
+
+    def _ui_parent_choice(self, request):
+        self.parent_choice = None
+
+    def _ui_add_sensor(self, request):
+        """A sensor on ``target`` (at ``body``, else its root link), from the context menu: a camera, a contact
+        sensor, a height scanner, a frame transformer measuring ``body``; it is selected to be placed."""
+        factory, target, body = request.get('factory'), request.get('target'), request.get('body')
+        entry = next((item for item in self.snapshot['catalog']['assets'] if item['id'] == factory and item.get('category') == 'sensor'), None)
+        if entry is None:
+            raise ValueError(f'没有传感器 {factory}')
+        if target not in self.items:
+            raise ValueError('在机器人或物体上右键添加传感器')
+        if not self.initial_display(target).get('root_body'):
+            # Its link names come from the native export: export now, add the sensor once they are known.
+            self.after_export.append(lambda: self._ui_add_sensor(request))
+            if not (self.export_thread and self.export_thread.is_alive()):
+                self.start_export()
+            self.report(f'正在解析 {self.items[target]["label"]} 的连杆（导出原生网格），完成后自动添加{entry.get("label", factory)}')
+            return
+        root = self._root_body(target)
+        parameters = {key: copy.deepcopy(field['example']) for key, field in entry.get('parameters', {}).items()
+                      if field.get('required') and 'example' in field}
+        if any(field.get('mount_body') for field in entry.get('parameters', {}).values()):
+            # A frame transformer sits on the root and measures the link it was asked for.
+            parameters.update({key: body or root for key, field in entry['parameters'].items() if field.get('mount_body')})
+            body = root
+        # Named for what it is on: franka_panda_camera, go2_contact.
+        base = self.items[target]['name'] + '_' + {'camera': 'camera', 'contact_sensor': 'contact', 'height_scanner': 'height_scan',
+                                                  'frame_transformer': 'frame'}.get(factory, factory)
+        taken = {item['name'] for item in self.snapshot['entities']}
+        name = next(f'{base}_{index}' if index else base for index in range(len(taken) + 1)
+                    if (f'{base}_{index}' if index else base) not in taken)
+        entity = {'name': name, 'factory': factory, 'kind': 'sensor', 'parameters': parameters,
+                  'mount': {'entity': target, 'body': body or root}}
+        if factory == 'height_scanner':
+            entity['pose'] = {'position': [0.0, 0.0, 0.5], 'orientation': [1, 0, 0, 0]}  # rays start above the body
+        elif factory == 'camera':
+            entity['pose'] = {'position': [0.0, 0.0, 0.0], 'orientation': camera_on_body(entity['mount']['body'])}
+        self._save_first()
+        self._add_entity(entity, entry)
+
+    def _ui_reset(self, request):
+        path = self._selected_path()
+        self.checkpoint()
+        if not request.get('region'):
+            self.pending['resets'][path] = None
+            return
+        value = {'region': request['region'], 'yaw_range': [float(v) for v in request.get('yaw', (0.0, 0.0))]}
+        if request.get('interval'):
+            value['interval'] = float(request['interval'])
+        self.pending['resets'][path] = value
+
+    def _ui_motion(self, request):
+        path = self._selected_path()
+        self.checkpoint(('motion', path))
+        self._store_motion(path, request.get('motion'))
+
+    def _ui_motion_point(self, request):
+        path, what = self._selected_path(), request.get('what')
+        if what == 'add':
+            self._arm_path_point(path)
+            return
+        draft = dict(self.motion_drafts.get(path) or self.current_motion(path) or {})
+        points = list(draft.get('points', []))
+        draft['points'] = points[:-1] if what == 'pop' else []
+        self.checkpoint()
+        self._store_motion(path, draft)
+
+    def _ui_motion_preview(self, request):
+        self.preview_motion(self._selected_path())
+
+    def _ui_parameter(self, request):
+        path, name = self._selected_path(), request.get('name')
+        if name not in self.asset_entry(self.items[path]['factory']).get('parameters', {}):
+            raise ValueError(f'没有参数 {name}')
+        self.checkpoint(('parameters', path, name))
+        self._set_parameter(path, name, request.get('value'))
+        if self.items[path]['category'] == 'sensor':
+            # What a sensor reads (a camera's images, their size) is in the catalog: fold the edit into the
+            # working copy so the observation list follows at once.
+            self._apply(self.collect(), record=False)
+        if self.items[path].get('factory') == 'camera' and name in CAMERA_VIEW_PARAMETERS:
+            self.request_camera_view()
+        self._draw_sensor()
+
+    def _ui_parameters_json(self, request):
+        path, text = self._selected_path(), str(request.get('text', ''))
+        json.loads(text)  # reported to the page when it does not parse
+        self.checkpoint(('parameters', path))
+        self.parameters[path] = text
+
+    def _ui_shape(self, request):
+        path = self._selected_path()
+        shape = request.get('shape')
+        if shape not in ABSTRACT_SHAPES:
+            raise ValueError(f'未知的形状 {shape}')
+        old, size = self.abstract_geometry(path)
+        values = [float(v) for v in request['size']] if request.get('size') and shape == old else \
+            {'point': [], 'direction': [], 'rectangle': (list(size) + [.5, .5])[:2], 'box': (list(size) + [.5, .5, .5])[:3]}[shape]
+        self.checkpoint(('shape', path))
+        self.pending['shapes'][path] = (shape, values)
+        self._abstract_shape(path)
+        self._draw_shape(self.info[path]['node'], highlight=True)
+
+    def ui_post(self, name, request):
+        with self.lock:
+            try:
+                handler = getattr(self, f'_ui_{name}', None)
+                if handler is None:
+                    raise KeyError(f'未知的界面操作 {name}')
+                handler(request)
+            except Exception as error:
+                self.report(f'⚠️ {error}', error=True)
+                raise
+            if name in ('view', 'viewport'):  # only the camera or the window changed: nothing to redraw
+                return {}
+            self.panel_revision += 1
+            self.outliner_revision += 1
+            return {'state': self.ui_state()}
+
+    def _outlined(self):
+        """viser names of the selected nodes, outlined by the patched client (tools/viser_client)."""
+        nodes = [self._node_of(owner) for owner in [self.selected, *self.also_selected] if owner]
+        return [node.name for node in nodes if node is not None and getattr(node, 'name', None)]
+
+    def _ui_viewport(self, request):
+        self.pixel_ratio = min(max(float(request.get('pixel_ratio') or 1.0), .25), 8.)
+
+    def _ui_save(self, request):
+        self.save.__wrapped__(self)
+
+    def _ui_undo(self, request):
+        self.undo_edit.__wrapped__(self)
+
+    def _ui_redo(self, request):
+        self.redo_edit.__wrapped__(self)
+
+    def _ui_reload(self, request):
+        self.reload.__wrapped__(self)
+
+    def _ui_refresh_native(self, request):
+        self._refresh_native()
+
+    def _ui_textures(self, request):
+        self._set_textures(bool(request.get('on')))
+
+    def _ui_style(self, request):
+        style = request.get('style')
+        if style not in ('newton', 'default'):
+            raise ValueError(f'未知的显示风格 {style}')
+        if style != self.style:
+            self.style = style
+            self._apply_style()
+
+    def _ui_simulation(self, request):
+        from shared.assembly.editing import simulation_settings
+        _, choices, current = simulation_settings(self.target)
+        name, value = request.get('name'), request.get('value')
+        if name not in choices or value not in choices[name]:
+            raise ValueError(f'没有这个选项：{name} = {value}')
+        self.checkpoint()
+        if value == current[name]:
+            self.pending['simulation'].pop(name, None)
+        else:
+            self.pending['simulation'][name] = value
+        self.report(f'{choices[name][value][0]}；保存后写入 train.yaml')
+
+    def _ui_pose(self, request):
+        node = self._node_of(self.selected)
+        if node is None:
+            raise ValueError('先选中一个对象')
+        if self._locked(self.selected):
+            raise ValueError('这个对象的位置由它的父物体决定')
+        self._end_preview()
+        self.checkpoint(('move', self.selected))
+        position = [float(v) for v in request.get('position', _xyz(node.local))]
+        rotation = [float(v) for v in request.get('rotation', F.matrix_euler(node.local))]
+        node.local = F.transform(position, F.euler_matrix(rotation))
+        self._update_frame(node)
+        self._place_gizmo()
+        self.request_camera_view()
+
+    def _ui_label(self, request):
+        """The name field: an identifier renames the entity (its obs.<name> and every reference in scene.yaml);
+        anything else (spaces, Chinese) is only the name shown in the editor."""
+        path = self._selected_path()
+        value = str(request.get('value', '')).strip()
+        if not value:
+            raise ValueError('名称不能为空')
+        old = self.items[path]['name']
+        if value == old:
+            self.labels.pop(path, None)
+            return
+        if not (value.isascii() and value.isidentifier() and not value.startswith('_')):
+            self.checkpoint(('label', path))
+            self.labels[path] = value
+            self.report(f'显示名改为 {value}；代码里仍是 obs.{old}（实体名须是字母、数字、下划线）')
+            return
+        self.labels.pop(path, None)
+        new = path.rsplit('/', 1)[0] + '/' + value
+        self._apply({**self.collect(), 'rename': {path: value}}, select=('entity', new))
+        self.report(f'{old} 改名为 {value}；policy.py / task.py 里的 obs.{old} 需改为 obs.{value}')
+
+    def _ui_physics(self, request):
+        path = self._selected_path()
+        if (self.physics_state(path) or (None,))[0] != request.get('mode'):
+            self.toggle_physics(path)
+
+    def _ui_render(self, request):
+        self.toggle_render(self._selected_path())
+
+    def _ui_hidden(self, request):
+        self.toggle_hidden.__wrapped__(self, self.selected)
+
+    def _ui_focus(self, request):
+        self.focus_selection.__wrapped__(self)
+
+    def _ui_delete(self, request):
+        # The app asked ui/delete (deletion_message) and the user confirmed in its own dialog.
+        self.delete_entities(request['paths'])
+
+    def _ui_parent(self, request):
+        target = request.get('target')
+        if target is not None and target not in self.items:
+            raise ValueError('只能选场景中的实体')
+        self.bind(self._selected_path(), target)
+
+    def _ui_initial(self, request):
+        """A joint's initial value: dragging previews the pose, releasing writes initial_state."""
+        path, joint, value = self._selected_path(), request.get('joint'), float(request.get('value'))
+        info = self.info[path]
+        kinematics = info.get('kinematics') or {'frames': {}, 'joints': []}
+        if joint not in {row['name'] for row in kinematics['joints']}:
+            raise ValueError(f'{path} 没有关节 {joint}')
+        values = {name: float(v) for name, v in self.initial_display(path).get('joint_positions', {}).items()}
+        authored = self.items[path].get('initial_state', {})
+        values.update({name: float(v) for name, v in authored.get('joint_positions', {}).items()})
+        values.update(self.pending.setdefault('initial', {}).get(path, {}))
+        values[joint] = value
+        self.pending['initial'].setdefault(path, {})[joint] = value
+        for name, linked in self._coupled_values(path, joint, value).items():
+            values[name] = self.pending['initial'][path][name] = linked
+        current = F.forward_kinematics(kinematics['frames'], kinematics['joints'], values)
+        for body, matrix in current.items():
+            if body in info['bodies']:
+                info['bodies'][body].local = matrix
+                self._update_frame(info['bodies'][body])
+        if request.get('commit'):
+            self.checkpoint()
+            joints = self.pending['initial'].pop(path)
+            payload = self.collect()
+            state = {**authored, 'joint_positions': {**authored.get('joint_positions', {}), **values}}
+            state['joint_positions'].update(joints)
+            entry = next((e for e in payload['entities'] if e['path'] == path), None)
+            if entry is None:
+                payload['entities'].append({'path': path, 'changes': {'initial_state': state}})
+            else:
+                entry['changes']['initial_state'] = state
+            self._apply(payload)
+            self.report(f'{joint} 初始值 {value:.3f}')
+
+    def _couplings(self, path):
+        """{follower: {leader, ratio, offset}} of an entity whose factory takes ``couplings``; None if it takes none."""
+        item = self.items[path]
+        if 'couplings' not in self.asset_entry(item.get('factory')).get('parameters', {}):
+            return None
+        return dict(self.parameter_values(item).get('couplings') or {})
+
+    def _coupled_values(self, path, joint, value):
+        """Positions the couplings give other joints when ``joint`` is at ``value``: its followers, or its leader
+        and that leader's other followers when it follows one."""
+        couplings, values, dragged = self._couplings(path) or {}, {}, joint
+        if joint in couplings:
+            link = couplings[joint]
+            joint = link['leader']
+            value = values[joint] = (value - link.get('offset', 0.)) / (link.get('ratio', 1.) or 1.)
+        for follower, link in couplings.items():
+            if link['leader'] == joint and follower != dragged:
+                values[follower] = link.get('ratio', 1.) * value + link.get('offset', 0.)
+        return values
+
+    def _ui_coupling(self, request):
+        """A joint follows another (``leader``, follower = ratio * leader + offset), or no longer (no leader)."""
+        path, joint = self._selected_path(), request.get('joint')
+        couplings = self._couplings(path)
+        if couplings is None:
+            raise ValueError('这个实体的工厂没有 couplings 参数（导入的带关节物体才有）')
+        names = {row['name'] for row in self.joint_rows(path)}
+        if joint not in names:
+            raise ValueError(f'{path} 没有关节 {joint}')
+        leader = request.get('leader')
+        if leader:
+            if leader not in names or leader == joint:
+                raise ValueError('请选另一个关节作为主动关节')
+            if leader in couplings or any(link['leader'] == joint for link in couplings.values()):
+                raise ValueError(f'{leader if leader in couplings else joint} 已在另一组联动中；一个关节只能跟随，或被跟随')
+            ratio, offset = float(request.get('ratio', 1.)), float(request.get('offset', 0.))
+            if not np.isfinite([ratio, offset]).all() or ratio == 0:
+                raise ValueError('比例须是非零有限数，偏移须是有限数')
+            couplings[joint] = {'leader': leader, 'ratio': ratio, **({'offset': offset} if offset else {})}
+        else:
+            couplings.pop(joint, None)
+        self.checkpoint()
+        self._set_parameter(path, 'couplings', couplings or None)
+        self.report(f'{joint} ' + (f'跟随 {leader}（×{couplings[joint]["ratio"]:g}）' if leader else '不再联动')
+                    + '；仿真中由物理引擎保持，保存后写入 scene.yaml')
+
+    def _ui_object(self, request):
+        """The selected object of an imported scene: remove or restore, hide, take out."""
+        path = self._selected_path()
+        chosen = self.selected_object[1] if self.selected_object and self.selected_object[0] == path else None
+        if chosen is None:
+            raise ValueError('先在场景中选一个物体')
+        names, target = self.object_targets(path, chosen)
+        what = request.get('what')
+        if what == 'exclude':
+            removed = all(any(_within(n, e) for e in self.excluded(path)) for n in names)
+            self.set_excluded(path, target, not removed)
+        elif what == 'hidden':
+            self.hide_objects(path, names)
+        elif what == 'extract':
+            self.extract_object(path, chosen)
+        else:
+            raise KeyError(f'未知的物体操作 {what}')
+
+    def _selected_path(self):
+        if not self.selected or self.selected[0] != 'entity':
+            raise ValueError('先选中一个实体')
+        return self.selected[1]
 
     @action
     def focus_selection(self):
@@ -2240,7 +3526,26 @@ class Editor:
             client.camera.position = tuple(centre + direction * distance)
             client.camera.look_at = tuple(centre)
 
+    def _sync_body_drags(self):
+        """Pressing on a body and dragging slides it only while nothing is selected. viser gives the nearest
+        draggable node every hover and press under the pointer, and the gizmo sits at the selection's origin,
+        behind its surface (or inside an abstract box around it): with drags on, its handles neither light up
+        nor move. A drag in progress keeps its node until it ends (_drag)."""
+        off = bool(self.gizmo.visible)
+        if off == self.body_drags_off or self.body_drag is not None:
+            return
+        self.body_drags_off = off
+        for handle, dragged in list(getattr(self, 'body_drags', {}).values()):
+            try:
+                handle.remove_drag_callback('all') if off else handle.on_drag(dragged)
+            except Exception:  # noqa: BLE001 - a node removed meanwhile
+                pass
+
     def _place_gizmo(self):
+        self._place_gizmo_only()
+        self._sync_body_drags()
+
+    def _place_gizmo_only(self):
         node = self._node_of(self.selected)
         movable = self._movable_object()
         if movable is not None and not self._locked(self.selected):  # one object of an imported scene
@@ -2260,11 +3565,16 @@ class Editor:
     def _gizmo_moved(self, event):
         # Never write the gizmo pose while the user drags it (jitter feedback).
         self.dragging = getattr(event, 'phase', 'end') in ('start', 'update')
-        if not self.dragging:
+        if not self.dragging and getattr(self, 'gizmo_moved', False):
+            # A drag ended: render the camera view once (the gizmo also echoes pose updates that move nothing).
+            self.gizmo_moved = False
             self.request_camera_view()
         with self.lock:
             node = self._node_of(self.selected)
             if node is None or self._locked(self.selected) or self.preview_restore:
+                return
+            if self.gizmo_mode == 'scale':
+                self._gizmo_scaled(node)
                 return
             world = F.transform(self.gizmo.position, F.quat_matrix(self.gizmo.wxyz))
             movable = self._movable_object()
@@ -2277,11 +3587,18 @@ class Editor:
                     self.undo_tag = None
                 self.move_object(*movable, pose)
                 return
-            if np.allclose(world, node.world(), atol=1e-7):
+            if self.dragging and self.gizmo_drag_z is None:
+                self.gizmo_drag_z = float(node.world()[2, 3])  # where this drag started, to tell a level move
+            planar = self.gizmo_drag_z is not None and abs(world[2, 3] - self.gizmo_drag_z) < 1e-6
+            if not self.dragging:
+                self.gizmo_drag_z = None
+            if np.allclose(world, node.world(), atol=1e-7) and not (self.snap and planar and not self.dragging):
                 return
             self.checkpoint(('move', self.selected))
+            self.gizmo_moved = self.dragging
             if not self.dragging:
                 self.undo_tag = None  # The next drag is a separate step.
+                self.request_camera_view()
             delta = world @ np.linalg.inv(node.world())
             # The rest of a multi-selection moves along (rigidly, as one), skipping what moves with another.
             others = [self._node_of(o) for o in self.also_selected if not self._locked(o)]
@@ -2294,7 +3611,107 @@ class Editor:
                 moved = delta @ before
                 other.local = np.linalg.inv(other.parent.world()) @ moved if other.parent else moved
                 self._update_frame(other)
+            path = self.selected[1] if self.selected[0] == 'entity' else None
+            if self.snap and planar and not others and path and self.items[path]['category'] in ('robot', 'object'):
+                # Snapping: moved level (an X or Y arrow, the XY square), it slides over the table or terrain under
+                # it, coarsely while dragged; released, it is set down and the gizmo comes to it.
+                if self.dragging:
+                    points = self._world_points(path)
+                    if points is not None:
+                        self._settle(path, points, grid=3)
+                else:
+                    note = self._rest_on_surface(path)
+                    self._place_gizmo()
+                    if note:
+                        self.report(f'已移动 {self.items[path]["name"]}{note}')
             self._sync_pose_fields(node)
+
+    # --------------------------------------------------------------- gizmo modes and scale
+    def set_gizmo_mode(self, mode):
+        """The view's gizmo moves (arrows and planes), rotates (rings) or scales (arrows read as stretch)."""
+        if mode not in ('move', 'rotate', 'scale'):
+            raise ValueError(f'未知的操作模式 {mode}')
+        self.gizmo_mode = mode
+        from tools.simready_library import viewer_problem
+        # The patched viewer (tools/viser_client) scales with handles at the axis ends when every other handle is
+        # off (_ui_gizmo_scale); viser's own page still reads the arrows as stretch (_gizmo_scaled).
+        handles = mode == 'scale' and viewer_problem() is None
+        self.gizmo.disable_rotations = mode != 'rotate'
+        self.gizmo.disable_axes = mode == 'rotate' or handles
+        self.gizmo.disable_sliders = mode != 'move'
+
+    def scale_value(self, path):
+        """The ``scale`` parameter of an entity's factory as three factors, or None when it has none."""
+        item = self.items.get(path) or {}
+        if not item.get('factory') or 'scale' not in self.asset_entry(item['factory']).get('parameters', {}):
+            return None
+        value = self.parameter_values(item).get('scale', 1.0)
+        return [float(v) for v in value] if isinstance(value, (list, tuple)) else [float(value)] * 3
+
+    def _show_scale(self, path):
+        """Draw the entity at its unsaved scale: the editor mesh was exported at the saved one."""
+        current = self.scale_value(path)
+        if current is None:
+            return
+        saved = self.items[path].get('parameters', {}).get('scale', self.asset_entry(self.items[path]['factory'])['parameters']['scale'].get('default', 1.0))
+        saved = [float(v) for v in saved] if isinstance(saved, (list, tuple)) else [float(saved or 1.0)] * 3
+        ratio = tuple(c / s if s else 1.0 for c, s in zip(current, saved))
+        for shaped in [self.info[path]['node'], *self.info[path].get('meshes', ())]:
+            handle = getattr(shaped, 'handle', None)
+            target = getattr(handle, 'glb', handle)
+            if target is not None and hasattr(target, 'scale') and not isinstance(handle, _Slot):
+                with contextlib.suppress(Exception):
+                    target.scale = ratio
+                    if getattr(handle, 'overlay', None) is not None:
+                        handle.overlay.scale = ratio
+
+    def set_scale(self, path, value):
+        current = self.scale_value(path)
+        if current is None:
+            raise ValueError(f'{path} 没有缩放参数')
+        uniform = not isinstance(self.parameter_values(self.items[path]).get('scale', 1.0), (list, tuple))
+        value = [round(max(float(v), 1e-4), 5) for v in value]
+        self._set_parameter(path, 'scale', value[0] if uniform and len(set(value)) == 1 else value)
+        self._show_scale(path)
+
+    def _ui_gizmo_scale(self, request):
+        """A scale handle of the patched viewer dragged: ``factors`` (x, y, z) from where the drag started."""
+        path = self.selected[1] if self.selected and self.selected[0] == 'entity' else None
+        base = self.scale_value(path) if path else None
+        if base is None:
+            raise ValueError('选中的对象没有缩放参数')
+        if request.get('phase') == 'start' or self.scale_drag is None or self.scale_drag[0] != path:
+            self.checkpoint(('scale', path))
+            self.scale_drag = (path, base, None)
+        factors = request.get('factors')
+        if factors:
+            factors = np.clip(np.asarray(factors, float), 1e-3, 1e3)
+            if not isinstance(self.parameter_values(self.items[path]).get('scale', 1.0), (list, tuple)):
+                factors = np.full(3, factors[np.argmax(np.abs(np.log(factors)))])  # one factor: the dragged axis
+            self.set_scale(path, [b * f for b, f in zip(self.scale_drag[1], factors)])
+        if request.get('phase') == 'end':
+            self.scale_drag, self.undo_tag = None, None
+
+    def _gizmo_scaled(self, node):
+        """Scale mode: how far an arrow is dragged, in the object's frame, stretches it along that axis."""
+        path = self.selected[1] if self.selected and self.selected[0] == 'entity' else None
+        base = self.scale_value(path) if path else None
+        if base is None:
+            return
+        if self.scale_drag is None or self.scale_drag[0] != path:
+            self.checkpoint(('scale', path))
+            self.scale_drag = (path, base, node.world().copy())
+        _, start, anchor = self.scale_drag
+        offset = anchor[:3, :3].T @ (np.asarray(self.gizmo.position) - anchor[:3, 3])
+        factors = np.exp(offset / .25)
+        uniform = not isinstance(self.parameter_values(self.items[path]).get('scale', 1.0), (list, tuple))
+        if uniform:
+            factors = np.full(3, float(np.exp(offset.sum() / .25)))
+        self.set_scale(path, [b * f for b, f in zip(start, factors)])
+        self.panel_revision += 1
+        if not self.dragging:
+            self.scale_drag, self.undo_tag = None, None
+            self.gizmo.position = _xyz(node.world())  # the arrows return to the object
 
     def _sync_pose_fields(self, node):
         if not getattr(self, 'pose_fields', None):
@@ -2316,25 +3733,40 @@ class Editor:
             except Exception as error:  # noqa: BLE001 - reported, the next drag starts fresh
                 traceback.print_exc()
                 self.body_drag = None
+                self._sync_body_drags()
                 self.report(f'拖动失败：{error}', error=True)
+
+    def _body_draggable(self, path):
+        """Whether pressing on ``path`` and dragging slides it: props and abstract shapes, not static geometry
+        (ground, terrain tiles, imported scenes), which a press meant for the camera or the gizmo would
+        otherwise move; those move with the gizmo once selected."""
+        item = self.items.get(path, {})
+        if not BODY_DRAG or item.get('category') not in DRAGGABLE or item.get('scope') == 'global':
+            return False
+        state = self.physics_state(path) if item.get('category') == 'object' else None
+        return not (state and state[0] == 'static')
 
     def _drag(self, owner, phase, grab, pointer, camera):
         with self.lock:
             if phase == 'start':
                 node = self._node_of(owner)
                 if node is None or self._locked(owner) or self.preview_restore or self.placing \
-                        or (owner[0] == 'entity' and not self.selectable(owner[1])):
+                        or (owner[0] == 'entity' and not (self.selectable(owner[1]) and self._body_draggable(owner[1]))):
                     return
+                if self.gizmo.visible and self._near_gizmo(camera, grab - camera):
+                    return  # a press on a transform handle: the gizmo moves the selection, not what lies behind
+                # Set first: selecting shows the gizmo, which turns drags off once this one ends.
+                self.body_drag = {'owner': owner, 'grab': grab, 'world': node.world().copy()}
                 if owner != self.selected:
                     self.select(owner)
                 self.checkpoint(('drag', owner, time.monotonic()))  # each drag is one undo step
-                self.body_drag = {'owner': owner, 'grab': grab, 'world': node.world().copy()}
                 return
             drag = self.body_drag
             if drag is None or drag['owner'] != owner:
                 return
             if phase == 'end':
                 self.body_drag, self.undo_tag = None, None
+                self._sync_body_drags()
             # `pointer` lies on the pointer ray (viser's camera-facing drag plane); meet the grab height.
             ray = pointer - camera
             if abs(ray[2]) > 1e-6:
@@ -2346,20 +3778,28 @@ class Editor:
                     world[:2, 3] += (hit - drag['grab'])[:2]
                     node.local = np.linalg.inv(node.parent.world()) @ world if node.parent else world
                     self._update_frame(node)
+                    if self.snap and owner[0] == 'entity' and phase != 'end':
+                        # Snapping: it slides over what lies under it (a table top, terrain), coarsely while dragged.
+                        points = self._world_points(owner[1])
+                        if points is not None:
+                            self._settle(owner[1], points, grid=3)
                     self._place_gizmo()
                     self._sync_pose_fields(node)
             if phase == 'end':
+                note = self._rest_on_surface(owner[1]) if self.snap and owner[0] == 'entity' else ''
+                self._place_gizmo()
                 self.request_camera_view()
-                self.report(f'已移动 {self.items[owner[1]]["name"]}（保存后写入 scene.yaml）')
+                self.report(f'已移动 {self.items[owner[1]]["name"]}{note}（保存后写入 scene.yaml）')
 
-    def surface_point(self, origin, direction):
-        """Where a view ray first meets a robot, object or terrain surface, else the floor (z = 0)."""
+    def surface_point(self, origin, direction, exclude=None, floor=True):
+        """Where a view ray first meets a robot, object or terrain surface (other than entity ``exclude``),
+        else (``floor``) the floor z = 0."""
         origin = np.asarray(origin, float)
         direction = np.asarray(direction, float) / np.linalg.norm(direction)
         hidden = {id(self._node_of(owner)) for owner in self.hidden}
         nearest = None
         for node in self.nodes:
-            if not node.shape or not node.owner or node.owner[0] != 'entity' \
+            if not node.shape or not node.owner or node.owner[0] != 'entity' or node.owner[1] == exclude \
                     or self.items[node.owner[1]]['category'] not in ('robot', 'object', 'terrain') \
                     or hidden and any(id(n) in hidden for n in (node, *node.ancestors())):
                 continue
@@ -2367,9 +3807,116 @@ class Editor:
             distance = ray_shape(node.shape, inverse[:3, :3] @ origin + inverse[:3, 3], inverse[:3, :3] @ direction)
             if distance is not None and (nearest is None or distance < nearest):
                 nearest = distance
-        if nearest is None and direction[2] < -1e-6:
+        if nearest is None and floor and direction[2] < -1e-6:
             nearest = -origin[2] / direction[2]
         return None if nearest is None else origin + nearest * direction
+
+    def _world_points(self, path):
+        """Points of an entity's drawn shapes (exported meshes, else placeholder boxes) in the world, or None."""
+        points = []
+        for mesh in self.info.get(path, {}).get('meshes', []):
+            shape = mesh.shape or {}
+            if shape.get('type') == 'mesh':
+                local = np.asarray(shape['vertices'], float)
+            elif shape.get('type') == 'box':
+                local = np.array([[x, y, z] for x in (-.5, .5) for y in (-.5, .5) for z in (-.5, .5)]) * np.asarray(shape['size'], float)
+            else:
+                continue
+            world = mesh.world()
+            points.append(local @ world[:3, :3].T + world[:3, 3])
+        return np.concatenate(points) if points else None
+
+    def _rest_on_surface(self, path):
+        """Set a placed entity down: its lowest point REST_CLEARANCE above the highest surface under its
+        footprint (terrain bumps, a table), found by a grid of vertical rays cast from just above it. Starting
+        inside a triangle terrain, the engine throws a body out (a 1.5 t helmet 7 cm into rough terrain flew
+        1.9 m) or lets it fall through. Returns a note for the status line ('' when nothing to say)."""
+        points = self._world_points(path)
+        node = self.info.get(path, {}).get('node')
+        if points is None or node is None:
+            return ''
+        shift = self._settle(path, points)
+        low, high = points.min(0) + (0, 0, shift), points.max(0) + (0, 0, shift)
+        # Bodies overlapping at the start are pushed apart by the engine: name them so they can be moved.
+        points = points + (0, 0, shift)
+        return self._overlap_note(path, points, low, high)
+
+    def _settle(self, path, points, grid=7):
+        """Move entity ``path`` (its drawn ``points``) up or down onto the highest surface under it, REST_CLEARANCE
+        above; ``grid`` x ``grid`` rays sample its footprint. Returns the vertical shift (m)."""
+        node = self.info[path]['node']
+        low, high = points.min(0), points.max(0)
+
+        def ground_from(height):
+            hits = [self.surface_point([x, y, height], [0, 0, -1], exclude=path, floor=False)
+                    for x in np.linspace(low[0], high[0], grid) for y in np.linspace(low[1], high[1], grid)]
+            hits = [hit[2] for hit in hits if hit is not None]
+            return max(hits) if hits else None
+
+        # From just above it (not from a ceiling over it); sunk entirely under the ground: from high above.
+        ground = ground_from(high[2] + .05)
+        if ground is None:
+            ground = ground_from(high[2] + 100.0)
+        if ground is None:
+            ground = 0.0
+        shift = ground + REST_CLEARANCE - low[2]
+        if abs(shift) <= 1e-4:
+            return 0.0
+        world = node.world().copy()
+        world[2, 3] += shift
+        node.local = np.linalg.inv(node.parent.world()) @ world if node.parent else world
+        self._update_frame(node)
+        self._sync_pose_fields(node)
+        return shift
+
+    def _overlap_note(self, path, points, low, high):
+        """Status note naming what entity ``path`` (at ``points``) overlaps; '' when nothing."""
+        overlapping = []
+        for other, item in self.items.items():
+            if other == path or item.get('category') not in ('robot', 'object', 'terrain'):
+                continue
+            state = self.physics_state(other) if item['category'] == 'object' else None
+            if item['category'] == 'terrain' or item.get('scope') == 'global' or (state and state[0] == 'static'):
+                depth = self._static_penetration(points, other)  # a building or terrain: its surfaces, not its box
+                if depth > REST_CLEARANCE:
+                    overlapping.append(f'{item["name"]}（约 {depth:.2f} m）')
+                continue
+            other_points = self._world_points(other)
+            if other_points is not None and (np.minimum(high, other_points.max(0)) - np.maximum(low, other_points.min(0)) > .005).all():
+                overlapping.append(item['name'])
+        return f'；与 {"、".join(overlapping)} 重叠，仿真开始时会被弹开，请移开' if overlapping else ''
+
+    def _static_penetration(self, points, other):
+        """How deep (m) the triangles of static entity ``other`` reach into the convex hull of ``points``,
+        sampled on its drawn meshes (0 when they stay outside)."""
+        import trimesh
+        try:
+            hull = trimesh.Trimesh(points[::max(1, len(points) // 4000)]).convex_hull
+        except Exception:  # noqa: BLE001 - flat or degenerate shapes
+            return 0.0
+        low, high = hull.bounds
+        normals = hull.face_normals
+        offsets = np.einsum('ij,ij->i', normals, hull.vertices[hull.faces[:, 0]])
+        deepest = 0.0
+        for mesh in self.info.get(other, {}).get('meshes', []):
+            shape = mesh.shape or {}
+            if shape.get('type') != 'mesh':
+                continue
+            world = mesh.world()
+            triangles = (np.asarray(shape['vertices'], float) @ world[:3, :3].T + world[:3, 3])[np.asarray(shape['faces'])]
+            triangles = triangles[(triangles.max(1) > low).all(1) & (triangles.min(1) < high).all(1)]
+            for triangle in triangles:
+                # Samples about 5 cm apart: a wall or a column is a few large triangles.
+                edge = float(np.linalg.norm(triangle - np.roll(triangle, 1, axis=0), axis=1).max())
+                steps = np.linspace(0, 1, int(np.clip(np.ceil(edge / .05), 2, 80)) + 1)
+                a, b = np.meshgrid(steps, steps)
+                keep = a + b <= 1
+                samples = triangle[0] + a[keep][:, None] * (triangle[1] - triangle[0]) + b[keep][:, None] * (triangle[2] - triangle[0])
+                signed = samples @ normals.T - offsets
+                inside = (signed < 0).all(1)
+                if inside.any():
+                    deepest = max(deepest, float((-signed[inside].max(1)).max()))
+        return deepest
 
     def arm_placement(self, label, add):
         """The next click in the view adds `label` there through ``add(position)``; Esc cancels."""
@@ -2398,19 +3945,30 @@ class Editor:
         self.request_camera_view()
 
     # ------------------------------------------------------------- camera view
+    def _camera_selected(self):
+        owner = self.selected
+        return owner is not None and owner[0] == 'entity' and (self.items.get(owner[1]) or {}).get('factory') == 'camera'
+
     def request_camera_view(self):
-        if self.camera_image is not None:
+        if self.camera_image is not None or self._camera_selected():
+            self.camera_wanted_at = time.time()
             self.render_wanted.set()
 
     def _camera_renderer(self):
-        """Latest-request worker: a client render is a network round trip, so never under the lock."""
+        """Latest-request worker: a client render is a network round trip, so never under the lock. It waits
+        until edits settle: the browser draws the camera's view on the same canvas, so rendering during a
+        drag would make the 3D view flicker."""
         while True:
             self.render_wanted.wait()
             self.render_wanted.clear()
+            while self.dragging or time.time() - self.camera_wanted_at < CAMERA_SETTLE:
+                time.sleep(.05)
             try:
                 self._render_camera_view()
             except Exception as error:  # noqa: BLE001 - shown next to the image
                 with self.lock:
+                    self.camera_error = f'渲染失败：{error}'
+                    self.camera_revision += 1
                     if self.camera_image is not None:
                         self.camera_caption.content = f'<small>渲染失败：{error}</small>'
 
@@ -2418,16 +3976,23 @@ class Editor:
         with self.lock:
             clients = list(self.server.get_clients().values())
             owner, image = self.selected, self.camera_image
-            if image is None or self.dragging:
+            if (image is None and not self._camera_selected()) or self.dragging:
                 return
             if not clients:
-                self.camera_caption.content = '<small>没有打开的网页，无法渲染</small>'
+                self.camera_error = '没有打开的网页，无法渲染'
+                if image is not None:
+                    self.camera_caption.content = '<small>没有打开的网页，无法渲染</small>'
                 return
             node = self._node_of(owner)
             fov, aspect = camera_intrinsics(*self.camera_optics(self.items[owner[1]]))
             world = node.world() @ GL_TO_CV  # Isaac camera frame -> OpenCV render convention.
-            # The gizmo and the camera's own frustum sit at the eye and would fill the view.
-            hidden = [handle for handle in (self.gizmo, node.handle) if handle is not None and handle.visible]
+            # The gizmo and the camera's own frustum sit at the eye and would fill the view; what a camera does not
+            # see in simulation (abstract entities, sensors, entities with visible: false) stays out of it too.
+            unseen = [self.info[path] for path, item in self.items.items()
+                      if item['category'] in ('abstract', 'sensor') or not self.render_visible(path)]
+            handles = [self.gizmo, *self.sensor_marker,
+                       *(shaped.handle for info in unseen for shaped in (info['node'], *info.get('meshes', ())))]
+            hidden = [handle for handle in handles if handle is not None and handle.visible]
             for handle in hidden:
                 handle.visible = False
         try:
@@ -2440,7 +4005,13 @@ class Editor:
                     handle.visible = True
                 self._place_gizmo()
         with self.lock:
-            if self.camera_image is image and self.selected == owner:
+            if self.selected == owner:
+                from PIL import Image
+                stream = io.BytesIO()
+                Image.fromarray(np.asarray(frame)[..., :3]).save(stream, format='JPEG', quality=88)
+                self.camera_frame, self.camera_error = (owner[1], stream.getvalue()), None
+                self.camera_revision += 1
+            if image is not None and self.camera_image is image and self.selected == owner:
                 image.image = frame
                 self.camera_caption.content = ('<small>编辑器示意渲染：位姿与内参同 scene.yaml（复位姿态），'
                                                '画面不是 Isaac 传感器图像</small>')
@@ -2500,9 +4071,9 @@ class Editor:
                 if not isinstance(parameters, dict):
                     raise ValueError(f'{path}: 参数必须是 JSON 对象')
                 if parameters != item.get('parameters', {}):
-                    if item.get('parameters', {}).keys() - parameters.keys():
-                        raise ValueError('不支持删除参数；请编辑 YAML 后重新加载')
-                    changes['parameters'] = parameters
+                    # Removed ones go as None (editing._merge drops them).
+                    changes['parameters'] = {**{name: None for name in item.get('parameters', {}).keys() - parameters.keys()},
+                                             **parameters}
             if path in self.pending['resets']:
                 changes['reset'] = self.pending['resets'][path]
             if self.pending['kinematic'].get(path, item.get('kinematic', False)) != item.get('kinematic', False):
@@ -2540,6 +4111,11 @@ class Editor:
                 changed['dimension'] = dimension
             if changed:
                 payload.setdefault('components', {})[role] = changed
+        saved_modes = (control or {}).get('modes', {})
+        modes = {key: mode for key, mode in self.pending['modes'].items()
+                 if mode != (saved_modes.get(key) or 'joint_position')}
+        if modes:
+            payload['control_modes'] = modes
         for profile, order in self.observation_order.items():
             selected = [key for key in order if self.observation_enabled.get((profile, key))]
             if selected != list(control['components'][profile].get('observations', [])):
@@ -2740,12 +4316,47 @@ class Editor:
             if state is not None and float(fraction) > state['target']:
                 state['target'], state['start'] = float(fraction), time.time()
 
+    JOB_MARK = (.3, .3, .5)  # m: the stand-in for an asset being imported, before its size is known
+
+    def _draw_job_marks(self):
+        """Where a running import will appear: an outlined stand-in on the ground with its name, filling up over
+        the conversion (minutes for a URDF; the fill creeps, it does not measure). Gone when the job ends."""
+        import math
+        marks = self.__dict__.setdefault('job_marks', {})
+        running = {job['key']: job for job in self.jobs if job['running'] and job.get('position')}
+        for key in [key for key in marks if key not in running]:
+            for handle in marks.pop(key)['handles'].values():
+                with contextlib.suppress(Exception):
+                    handle.remove()
+        width, depth, height = self.JOB_MARK
+        for key, job in running.items():
+            x, y, _ = job['position']
+            mark = marks.get(key)
+            if mark is None:
+                name = f'/import_{re.sub(r"[^A-Za-z0-9_]", "_", key)}'
+                mark = marks[key] = {'name': name, 'shown': -1., 'handles': {
+                    'outline': self.server.scene.add_box(name + '/outline', color=(46, 110, 220), dimensions=self.JOB_MARK, wireframe=True,
+                                                         position=(x, y, height / 2), cast_shadow=False, receive_shadow=False),
+                    'label': self.server.scene.add_label(name + '/label', f'{job["name"]} 导入中…', position=(x, y, height + .05),
+                                                         anchor='bottom-center')}}
+            shown = .95 * (1 - math.exp(-(time.time() - job.get('started', time.time())) / 45))
+            if shown - mark['shown'] < .01:
+                continue
+            mark['shown'] = shown
+            fill = max(height * shown, 1e-3)
+            mark['handles']['fill'] = self.server.scene.add_box(  # the same name: replaced in place
+                mark['name'] + '/fill', color=(46, 110, 220), opacity=.55, dimensions=(width, depth, fill),
+                position=(x, y, fill / 2), cast_shadow=False, receive_shadow=False)
+
     def _animate_loading(self):
         """Raise each loading placeholder's fill towards its progress. Between reports (the exporter's start-up
         and scene build come as one step without a count) it creeps on, up to 40% or 20% past the last report."""
         import math
         while True:
             time.sleep(.12)
+            if getattr(self, 'job_marks', None) or any(job['running'] and job.get('position') for job in getattr(self, 'jobs', [])):
+                with self.lock:
+                    self._draw_job_marks()
             if not self.loading:
                 continue
             with self.lock:
@@ -2812,7 +4423,9 @@ class Editor:
             with self.lock:
                 self._stop_loading()
                 if error:
-                    self.report(f'原生网格导出失败：{error}', error=True)
+                    print(error, file=sys.stderr)
+                    # The page shows the reason (the last line); the whole output stays in the editor log.
+                    self.report(f'原生网格导出失败：{error.strip().splitlines()[-1]}', error=True)
                 elif scene != self.scene:
                     pass
                 elif self.preview_restore:
@@ -2825,11 +4438,30 @@ class Editor:
                     else:
                         self.load()
                         self.report(f'原生网格已更新（{time.time() - started:.0f}s）')
+                        waiting, self.after_export = self.after_export, []
+                        for later in waiting:
+                            self.guarded(later)()
         self.export_thread = threading.Thread(target=run, daemon=True)
         self.export_thread.start()
         self.report('后台导出原生网格（通常 5–20 秒），期间可继续编辑')
 
     # ---------------------------------------------------------------------- GUI
+    def _preview_command(self):
+        """The view command for the top bar: from this page's viewpoint, or through the selected camera sensor
+        (what its renderer draws for the policy), so the simulator shows what is being looked at here."""
+        command = getattr(self, 'shown_command', None)
+        if not command:
+            return command
+        item = self.items.get(self.selected[1]) if self.selected and self.selected[0] == 'entity' else None
+        if item and item.get('factory') == 'camera':
+            return f'{command} --camera {item["name"]}'
+        clients = list(self.server.get_clients().values())
+        if clients and clients[0].camera.image_height:
+            camera = clients[0].camera
+            numbers = lambda vector: ' '.join(f'{float(v):.2f}' for v in vector)
+            return f'{command} --camera-eye {numbers(camera.position)} --camera-target {numbers(camera.look_at)}'
+        return command
+
     def _show_command(self):
         """Under the save button: the command that runs this project's scene in the simulator (saved file)."""
         if not hasattr(self, 'command_strip'):
@@ -2890,12 +4522,23 @@ class Editor:
                 f'<small>后端 `{backend}`。训练、评估与 `run.sh view` 都按 train.yaml 运行；'
                 '命令行 `+env.train.init_params.physics=…` 可临时覆盖。</small>'))
 
-    def report(self, text, error=False):
+    def report(self, text, error=False, detail='', toast=True):
+        """Show ``text`` in the page (the toast) and keep it in the message list (ui/log), with ``detail`` (a
+        tool's output) there: a toast goes away, the list stays until the editor stops. ``toast=False`` only
+        lists it: a background job's steps, which its progress card already shows."""
+        self.message_count += 1
+        entry = {'id': self.message_count, 'text': text, 'error': bool(error)}
+        self.messages.append({**entry, 'time': time.time(), 'detail': detail})
+        if error:
+            self.last_error = entry['id']
+        if not toast:
+            return
+        self.last_status = entry
         if hasattr(self, 'status'):
             shown = text if not self.backend_problem else f'{text}\n⚠️ {self.backend_problem}'
             shown = shown.replace('&', '&amp;').replace('<', '&lt;').replace('\n', '<br>')
             self.status.content = f'<div class="rl-status{" error" if error else ""}">{shown}</div>'
-        if error:
+        if error and self.classic:  # the app shows its own toast
             for client in self.server.get_clients().values():
                 client.add_notification('操作未完成', text, color='red', auto_close_seconds=8)
 
@@ -2905,8 +4548,8 @@ class Editor:
         # Left (main panel): project controls (save, undo, run command, status), then the scene tree and
         # tools in tabs. Right: the selection's properties only.
         theme, self.axes_style = gui.add_html(''), gui.add_html('')
-        # The selected entity's folders in the 观察 and 控制 tabs (_show_links).
-        self.link_style, self.entity_widgets = gui.add_html(''), {}
+        # Loads the editor app (tools/editor_ui) into this page once the library server runs (_start_app).
+        self.app_frame = gui.add_html('')
         self.save_button = gui.add_button('已保存', icon='device-floppy', color='gray')
         self.save_button.on_click(lambda _: self.save())
         self.undo_button = gui.add_button('', icon='arrow-back-up', color='gray', hint='撤回 Ctrl+Z', disabled=True)
@@ -2926,8 +4569,6 @@ class Editor:
         self.status = gui.add_markdown('<div class="rl-status">加载中…</div>')
         panel = gui.add_tab_group()
         with panel.add_tab('场景', icon='list-tree'):
-            gui.add_markdown('<small>点击选中 · 双击聚焦 · 拖到另一行上绑定、拖到空白处解除 · '
-                             '行尾：锁定 / 物理 / 渲染 / 显示（悬停看说明）</small>')
             self.tree_style = gui.add_html('')
             # The outliner (tools/scene_outliner.html, served with the asset library) replaces these buttons
             # once the library server runs; they remain the tree if it cannot start.
@@ -2979,24 +4620,6 @@ class Editor:
                 self.group_folder = gui.add_folder(None)
                 self.group_boxes = {}
                 gui.add_button('组成布局组合', icon='stack-2').on_click(lambda _: self._create_group())
-        with panel.add_tab('观察', icon='eye'):
-            # Rebuilt per scene: training switch, then one page of input checkboxes per module.
-            self.observation_folder = gui.add_folder(None)
-            self.observation_items, self.observation_tabs, self.observation_boxes = [], {}, {}
-            self.period_fields, self.dimension_fields = {}, {}
-        with panel.add_tab('控制', icon='steering-wheel'):
-            # Like the observation tab: one folder per target, its joints as checkboxes.
-            self.control_folder = gui.add_folder(None)
-            self.control_items = []
-            self.target_add = gui.add_folder('＋ 新增控制目标', expand_by_default=False)
-            with self.target_add:
-                self.target_asset = gui.add_dropdown('机器人 (asset_name)', [NONE])
-                self.target_type = gui.add_dropdown('类型', list(CONTROL_TYPES.values()))
-                self.target_name = gui.add_text('名称', 'arm')
-                gui.add_button('添加（勾选尚未控制的全部关节）', icon='plus').on_click(lambda _: self._add_target())
-            gui.add_markdown('关节逐个列出，勾选顺序即动作维度顺序；实际单位目标，缩放与偏移在 policy.py 中计算。'
-                             '增删终点后请同步 decode_action 的返回值。保存后写入 scene.yaml。')
-            self.target_asset.on_update(lambda _: None if self.syncing else self._suggest_target_name())
         with panel.add_tab('项目', icon='folder'):
             # Physics engine and renderer: run-time choices of train.yaml (_show_simulation).
             self.simulation_folder = gui.add_folder('仿真（train.yaml）')
@@ -3036,7 +4659,6 @@ class Editor:
         self._rebuild_tree_gui()
         self._rebuild_group_choices()
         self._refresh_assets()
-        self._refresh_control()
 
     # -------------------------------------------------------------- scene tree
     def _tree_parent(self, owner, members):
@@ -3179,6 +4801,8 @@ class Editor:
 
     def _rebuild_inspector(self):
         self._clear_inspector()
+        if not self.classic:
+            return
         gui, owner = self.server.gui, self.selected
         with self.inspector:
             if owner is None:
@@ -3455,6 +5079,14 @@ class Editor:
 
     @action
     def _delete(self, path):
+        modal = self.server.gui.add_modal('删除实体')
+        with modal:
+            self.server.gui.add_markdown('\n\n'.join(self._deletion_lines(path)))
+            self.server.gui.add_button('删除', color='red', icon='trash').on_click(
+                lambda _: (modal.close(), self.delete_entities([path])))
+            self.server.gui.add_button('取消', icon='x').on_click(lambda _: modal.close())
+
+    def _deletion_lines(self, path):
         plan, label = self.deletion_plan(path), self.items[path]['label']
         names = lambda paths: '、'.join(f'`{self.items[p]["label"]}`' for p in paths)
         lines = [f'删除 **{label}**？']
@@ -3470,8 +5102,8 @@ class Editor:
             lines.append(f'不再在该区域内随机复位、固定在当前位置：{names(plan["unplaced"])}')
         effects = SceneDocument(self.scene).removal_effects(set(plan['removed']) | set(plan['dropped']))
         if effects['outputs']:
-            lines.append('删除控制目标：' + '、'.join(f'`{name}`' for name in effects['outputs']) +
-                         '（policy.py 的 decode_action 需同步；没有控制目标时无法训练）')
+            lines.append('不再受策略控制：' + '、'.join(f'`{name}`' for name in effects['outputs']) +
+                         '（policy.py 的 decode_action 需同步；没有受控机器人时无法训练）')
         if effects['observations']:
             lines.append('移除观察：' + '、'.join(f'`{term}`' for term in effects['observations']) +
                          '（policy.py / task.py 中对应的 obs 属性需同步删除）')
@@ -3490,12 +5122,7 @@ class Editor:
             lines.append('放回原场景：' + '、'.join(f'`{self.items[scene]["label"]}` 中的 `{prim.rpartition("/")[2]}`'
                                                 for scene, prim in filter(None, returned)))
         lines.append('可用 Ctrl-Z 撤回。')
-        modal = self.server.gui.add_modal('删除实体')
-        with modal:
-            self.server.gui.add_markdown('\n\n'.join(lines))
-            self.server.gui.add_button('删除', color='red', icon='trash').on_click(
-                lambda _: (modal.close(), self._remove(path, plan)))
-            self.server.gui.add_button('取消', icon='x').on_click(lambda _: modal.close())
+        return lines
 
     def _taken_from(self, path):
         """(scene entity, prim) an object was taken out of (``extract_object``), while that scene still
@@ -3586,10 +5213,15 @@ class Editor:
         parameters = json.loads(self.asset_parameters.value or '{}')
         if not isinstance(parameters, dict):
             raise ValueError('参数必须是 JSON 对象')
+        name = self.entity_name  # before _save_first: its reload offers a fresh default name
         self._save_first()
         entry = next(item for item in self.snapshot['catalog']['assets'] if item['id'] == factory)
-        category = entry.get('category', 'object')
-        name = self.entity_name
+        # A library entry can say what it is (an imported robot is a usd_object that the policy drives).
+        category = choice.get('category') if choice.get('category') == 'robot' else entry.get('category', 'object')
+        usd = parameters.get('usd_path') or (choice.get('parameters') or {}).get('usd_path')
+        if (choice.get('library') or {}).get('jointed') and usd:
+            from shared.asset_import import driven  # a SimReady robot (M20, Lite3) drives its joints
+            category = 'robot' if driven(ROOT / usd) else category
         entity = {'name': name, 'factory': factory, 'kind': category if category in ('robot', 'sensor') else 'entity',
                   'parameters': parameters}
         if category == 'sensor' and self.asset_mount.value != FREE:
@@ -3599,18 +5231,31 @@ class Editor:
                     parameters[key] = self._root_body(entity['mount']['entity'])
         elif position is not None or self.asset_placement.value == '指定位置':
             entity['pose'] = {'position': list(position or self.asset_position.value), 'orientation': [1, 0, 0, 0]}
-        self._add_entity(entity, entry)
+        self._add_entity(entity, entry, rest=position is not None and 'pose' in entity)
 
-    def _add_entity(self, entity, entry):
+    def _add_entity(self, entity, entry, *, rest=False):
+        """Add ``entity``; ``rest``: it was placed by a click, a drop or an import, so it is set down on what
+        lies under it (_rest_on_surface) instead of keeping the height of its origin."""
         retargeted = self._aim_rays(entity, 'height_scan' in entry.get('capabilities', []))
         self._apply({'revision': self.snapshot['revision'], 'add_entities': [entity], 'entities': retargeted})
         added = next((item for item in self.snapshot['entities']
                       if item['name'] == entity['name'] and item['factory'] == entity['factory']), None)
+        note = ''
         if added:
+            # A new robot would be driven by the policy at once, and decode_action does not return its
+            # targets yet: it joins undriven (control.modes none, one undo step with the addition).
+            key = self.items.get(added['path'], {}).get('native_key')
+            if key and self.robot_modes().get(key) == 'joint_position' and (self.snapshot.get('control') or {}).get('components'):
+                self._apply({'revision': self.snapshot['revision'], 'control_modes': {key: 'none'}}, record=False)
+                note = '；新机器人默认“不控制”（策略不驱动它）：要训练它，在“控制”里改为“位置”，并在 policy.py 的 decode_action 中返回它的目标'
+            if rest:
+                note += self._rest_on_surface(added['path'])
             self.select(('entity', added['path']))
-            if self.visual(added)[0] is None and added['category'] in ('robot', 'object', 'terrain'):
+            record, stale = self.visual(added)
+            # No mesh yet, or only the last one of something else under this name: export it.
+            if (record is None or stale) and added['category'] in ('robot', 'object', 'terrain'):
                 self.start_export()
-        self.report(f'已添加 {entity["name"]}')
+        self.report(f'已添加 {entity["name"]}{note}')
         self._describe_asset()  # a fresh name for the next one
 
     def _offer_mounts(self):
@@ -3699,14 +5344,16 @@ class Editor:
             entries[factory] = {'label': entry.get('label', factory), 'factory': factory, 'parameters': None,
                                 'category': entry.get('category', 'object'), 'entry': entry,
                                 'key': thumbnail_key(factory, {})}
-        for item in load_library() + terrain_tiles() + recorded_assets():
+        # This project's own imports first (projects/<name>/assets/library.json), then the workspace's.
+        own = [{**item, 'project': True} for item in load_library(self._project_library())] if not self.draft else []
+        for item in own + load_library() + terrain_tiles() + recorded_assets():
             entry = catalog.get(item.get('factory'))
             if entry:
-                if item.get('note'):
-                    entry = {**entry, 'description': item['note']}
+                if item.get('note') or item.get('project'):
+                    entry = {**entry, 'description': ('本项目导入 · ' if item.get('project') else '') + (item.get('note') or '')}
                 if item.get('category') in CATEGORY_LABELS:  # e.g. a terrain tile spawned by usd_object
                     entry = {**entry, 'category_label': CATEGORY_LABELS[item['category']]}
-                entries['library:' + item['id']] = {
+                entries[('project:' if item.get('project') else 'library:') + item['id']] = {
                     'label': item.get('label') or item['id'], 'factory': item['factory'], 'library': item,
                     'parameters': item.get('parameters', {}), 'category': item.get('category') or entry.get('category', 'object'),
                     'entry': entry, 'key': item.get('thumbnail') or thumbnail_key(item['factory'], item.get('parameters', {}))}
@@ -4034,15 +5681,17 @@ class Editor:
             self.library = Library(host, port, types.SimpleNamespace(
                 catalog=self.library_catalog, asset=self.library_asset, status=self.library_status, add=self.library_add,
                 shelf_get=self.shelf_get, shelf_post=self.shelf_post, shelf_picture=self.shelf_picture,
-                outliner_get=self.outliner_get, outliner_post=self.outliner_post,
+                outliner_get=self.outliner_get, outliner_post=self.outliner_post, ui_get=self.ui_get, ui_post=self.ui_post,
+                ui_camera=self.ui_camera, import_file=self.import_file, import_finish=self.import_finish, import_needs=self.import_needs,
                 origin_port=self.server.get_port()))
         except OSError as error:
             self.report(f'⚠️ SimReady 资产库未启动：{error}', error=True)
             return
         shown = 'localhost' if host in ('127.0.0.1', '0.0.0.0', '::', '') else host
-        self.library_url = f'http://{shown}:{self.library.port}/'
+        self.library_url = f'http://{shown}:{self.library.port}/library'
+        self.editor_url = f'http://{shown}:{self.library.port}/' if self.patched else None
         self.simready_link.content = f'<small>[在新标签页打开]({self.library_url}) · {self.library_url}</small>'
-        print(f'SimReady asset library: {self.library_url}')
+        print(f'SimReady asset library: {self.library_url}', flush=True)
         # srcdoc: the page shares the editor's origin, so it can reach the view for drops; it calls the
         # library server on the editor's host name (a remote browser needs that port forwarded too).
         page = SHELF_PAGE.read_text().replace('__LIBRARY_PORT__', str(self.library.port))
@@ -4057,6 +5706,23 @@ class Editor:
             self.outliner_frame.content = (f'<iframe srcdoc="{html.escape(page)}" title="场景列表" style="display:block;'
                                            'width:100%;height:calc(100vh - 300px);min-height:300px;border:0;'
                                            'background:transparent"></iframe>')
+            self._start_app()
+
+    def _start_app(self):
+        """Inject the editor app (tools/editor_ui/app.js, app.css) into viser's page: a hidden same-origin frame
+        adds them to the top document, where they replace viser's panels and leave it the 3D view."""
+        # The patched page loads the app itself; viser's stock page (its own port) goes there when it is
+        # built, else it gets the app injected.
+        loader = ('<script>const P = parent.document, base = `${parent.location.protocol}//${parent.location.hostname}:'
+                  f'{self.library.port}/`;'
+                  + ("if (!P.getElementById('rl-app-js')) parent.location.replace(base + parent.location.search);"
+                     if self.patched else '') +
+                  "if (!P.getElementById('rl-app-js')) {"
+                  "const css = P.createElement('link'); css.rel = 'stylesheet'; css.href = base + 'ui/app.css'; P.head.appendChild(css);"
+                  "const js = P.createElement('script'); js.id = 'rl-app-js'; js.src = base + 'ui/app.js'; js.dataset.api = base;"
+                  "P.head.appendChild(js);}</script>")
+        self.app_frame.content = (f'<iframe srcdoc="{html.escape(loader)}" title="editor app" '
+                                  'style="width:0;height:0;border:0;position:absolute"></iframe>')
 
     def _open_library(self, client):
         """The browser in a near-full-screen dialog over the editor."""
@@ -4154,11 +5820,29 @@ class Editor:
             raise ValueError(f'{key} 仍在准备中')
         if name in {item['name'] for item in self.snapshot['entities']} | {job['name'] for job in running}:
             raise ValueError(f'场景中已有（或正在添加）实体 {name}')
-        job = {'key': key, 'name': name, 'running': True, 'error': False, 'done': 0, 'total': 0, 'message': message}
+        job = {'key': key, 'name': name, 'running': True, 'error': False, 'done': 0, 'total': 0, 'message': message,
+               'started': time.time()}
         self.jobs = [*running, job]
-        self.report(message)
+        self.report(message, toast=False)  # the page's progress card shows it
         self._describe_asset()  # the next addition gets a fresh name
         return job
+
+    def _job_cards(self):
+        """Running additions for the page's progress card: what each is doing and for how long; an import that
+        runs a converter can be cancelled."""
+        return [{'key': job['key'], 'name': job['name'], 'message': job['message'], 'seconds': round(time.time() - job.get('started', time.time())),
+                 'fraction': job['done'] / job['total'] if job.get('total') else None, 'cancel': job.get('process') is not None}
+                for job in getattr(self, 'jobs', []) if job['running']]
+
+    def _ui_cancel_job(self, request):
+        """End a running import's converter (its whole process group: the Isaac importer it started too)."""
+        import signal
+        job = next((job for job in self.jobs if job['running'] and job['key'] == request.get('key')), None)
+        if job is None or job.get('process') is None:
+            raise ValueError('没有可以取消的导入')
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(job['process'].pid, signal.SIGTERM)
+        job['message'] = f'正在取消 {job["name"]}…'
 
     def _shown_job(self):
         """The job the shelf shows: the newest running one (with how many others run), else the newest."""
@@ -4182,13 +5866,8 @@ class Editor:
         return job
 
     def _prepare_simready(self, job, entry, position):
-        shown = [0.0]
-
         def progress(done, total):
             job.update(done=done, total=total, message=f'下载 {job["key"]}：{done / 1e6:.1f}/{total / 1e6:.1f} MB')
-            if time.time() - shown[0] > 1 or done == total:
-                shown[0] = time.time()
-                self.report(job['message'])
 
         try:
             record = simready.prepare(entry['publisher'], entry['name'], progress)
@@ -4200,9 +5879,11 @@ class Editor:
                 if factory is None:
                     raise ValueError(f'已准备 {record["formats"]["usd"]}，但当前后端的资产目录没有 usd_object')
                 self._save_first()
-                self._add_entity({'name': job['name'], 'factory': 'usd_object', 'kind': 'entity',
+                from shared.asset_import import driven
+                robot = driven(ROOT / record['formats']['usd'])  # a SimReady robot (M20) drives its joints
+                self._add_entity({'name': job['name'], 'factory': 'usd_object', 'kind': 'robot' if robot else 'entity',
                                   'parameters': {'usd_path': record['formats']['usd']},
-                                  'pose': {'position': position, 'orientation': [1, 0, 0, 0]}}, factory)
+                                  'pose': {'position': position, 'orientation': [1, 0, 0, 0]}}, factory, rest=True)
                 self._refresh_assets()  # the wrapper also joins the asset shelf
                 job.update(scene=self._simready_usage().get(job['key'], []), running=False,
                            message=f'已添加 {job["name"]}（{job["key"]}）；在编辑器中保存后写入 scene.yaml')
@@ -4220,7 +5901,7 @@ class Editor:
     def _prepare_environment(self, job):
         def progress(message):
             job['message'] = message
-            self.report(message)
+            self.report(message, toast=False)
 
         try:
             record = environments.prepare(job['key'], progress)
@@ -4439,6 +6120,116 @@ class Editor:
         self.report(f'已登记资产 {same["label"]}{joints}；添加到场景后加载。示意图在后台生成')
         self.start_thumbnails(keys={thumbnail_key(factory, parameters)})
 
+    # ------------------------------------------------- import from the app (files, a folder or a zip)
+    def import_file(self, batch, relative, stream, size):
+        """One uploaded file of import ``batch``, staged until import_finish names the asset."""
+        from shared.asset_import import store
+        if not re.fullmatch(r'[a-z0-9]{8,40}', str(batch)):
+            raise ValueError('导入批次无效')
+        store(ROOT / '.cache' / 'imports' / batch, relative, stream, size)
+        return {'ok': True}
+
+    def import_needs(self, request):
+        """Which files of a folder chosen in the page the import uses (shared.asset_import.needed_files): the page has
+        sent the text files of the batch and lists every path; the others stand in as empty files while the
+        description is read, then go, and the page sends just the needed ones."""
+        from shared.asset_import import ImportFailed, needed_files, safe_parts
+        batch = str(request.get('batch', ''))
+        staged = ROOT / '.cache' / 'imports' / batch / 'source'
+        if not re.fullmatch(r'[a-z0-9]{8,40}', batch) or not staged.is_dir():
+            raise ValueError('没有收到要导入的文件')
+        stand_ins = []
+        try:
+            for relative in request.get('files') or []:
+                parts = safe_parts(relative)
+                path = staged.joinpath(*parts) if parts else None
+                if path is not None and not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.touch()
+                    stand_ins.append(path)
+            needed = needed_files(staged, str(request.get('main', '')), str(request.get('xacro') or ''))
+        except ImportFailed as error:
+            self.report(f'⚠️ {error}', error=True, detail=error.detail)
+            raise ValueError(str(error)) from error
+        finally:
+            for path in stand_ins:
+                path.unlink(missing_ok=True)
+        return {'needed': needed}
+
+    def import_finish(self, request):
+        """Turn the staged files into an asset of this project (projects/<project>/assets/<name>/, ASSET or
+        IMPORT.json), list it on the project's shelf and add it to the scene, in the background: converting a URDF
+        starts the Isaac importer."""
+        from shared.asset_import import KINDS, identifier, new_directory
+        batch, kind = str(request.get('batch', '')), request.get('kind') or 'object'
+        staged = ROOT / '.cache' / 'imports' / batch / 'source'
+        if not re.fullmatch(r'[a-z0-9]{8,40}', batch) or not staged.is_dir():
+            raise ValueError('没有收到要导入的文件')
+        if kind not in KINDS:
+            raise ValueError(f'未知的类型 {kind}')
+        label = str(request.get('name') or '').strip() or next(staged.iterdir()).stem
+        if self.draft:
+            raise ValueError('新项目还没保存：先保存，导入的文件放进 projects/<项目>/assets/')
+        with self.lock:
+            taken = {item['name'] for item in self.snapshot['entities']} | {job['name'] for job in self.jobs if job['running']}
+            name, index = identifier(label), 2
+            while name in taken:
+                name, index = f'{identifier(label)}_{index}', index + 1
+            job = self._start_job('import:' + batch, name, f'导入 {label}…')
+            if kind != 'scene':  # where the view looks, on the ground: it appears there, marked until it does
+                clients = list(self.server.get_clients().values())
+                job['position'] = [round(float(v), 3) for v in clients[0].camera.look_at[:2]] + [0.0] if clients else [0.0, 0.0, 0.0]
+        directory = new_directory(name, self._project_library().parent)  # the project's own assets/
+        shutil.rmtree(directory / 'source')
+        shutil.move(str(staged), str(directory / 'source'))
+        shutil.rmtree(staged.parent, ignore_errors=True)
+        threading.Thread(target=self._import_job, args=(job, directory, kind, label, bool(request.get('fixed')), request.get('main'),
+                                                        str(request.get('xacro') or '')), daemon=True).start()
+        return {'name': name}
+
+    def _project_library(self):
+        """This project's shelf library: projects/<name>/assets/library.json, beside its imports."""
+        return Path(self.target).parent / 'assets' / 'library.json'
+
+    def _import_job(self, job, directory, kind, label, fixed, main=None, xacro=''):
+        from shared.asset_import import import_asset, library_entry, register
+
+        def progress(message):
+            job['message'] = message
+            self.report(message, toast=False)
+        try:
+            record = import_asset(directory, kind, job['name'], progress, main=main, xacro=xacro,
+                                  started=lambda process: job.update(process=process))
+            entry = library_entry(directory, record, label, fixed)
+            parameters, note = entry['parameters'], entry['note']
+            with self.lock:
+                register(entry, self._project_library())
+                self._refresh_assets()
+                factory = next((item for item in self.snapshot['catalog']['assets'] if item['id'] == 'usd_object'), None)
+                if factory is None:
+                    raise ValueError('当前后端的资产目录没有 usd_object')
+                self._save_first()
+                position = list(job.get('position') or [0.0, 0.0, 0.0])
+                if kind != 'scene' and record.get('bounds'):  # standing on the ground (its lowest point at z = 0)
+                    position[2] = round(-record['bounds'][0][2], 4)
+                entity = {'name': job['name'], 'factory': 'usd_object', 'kind': 'robot' if kind == 'robot' else 'entity',
+                          'parameters': parameters, 'pose': {'position': position, 'orientation': [1, 0, 0, 0]}}
+                if kind == 'scene':
+                    entity['scope'] = 'global'
+                self._add_entity(entity, factory, rest=kind != 'scene')
+                self.outliner_revision += 1
+                job.update(running=False, message=f'已导入 {label}（资产架里也能再次添加）：{note}')
+                self.report(job['message'])
+        except Exception as error:  # noqa: BLE001 - shown in the page
+            traceback.print_exc()
+            job.update(running=False, error=True, message=f'{label} 未导入：{error}')
+            # The copy of the upload goes (the files are still where they came from); what the tool said stays
+            # in the message list.
+            if not (directory / 'ASSET.json').exists() and not (directory / 'IMPORT.json').exists():
+                shutil.rmtree(directory, ignore_errors=True)
+            self.report(f'⚠️ {job["message"]}', error=True,
+                        detail=getattr(error, 'detail', '') or ''.join(traceback.format_exception(error))[-6000:])
+
     @action
     def _refresh_native(self):
         self._save_first()  # exports the working copy; scene.yaml waits for save
@@ -4455,7 +6246,7 @@ class Editor:
             raise ValueError('请先保存当前编辑，再新建环境')
         from shared.assembly.starter import create_draft
         self._edit(create_draft(name, self.new_template.value))
-        self.draft, self.selected = name, None
+        self.draft, self.selected, self.start_screen = name, None, False
         self.load()
         self.report(f'未保存环境（模板 {self.new_template.value}）；保存后生成 projects/{name}')
 
@@ -4469,7 +6260,7 @@ class Editor:
         old = self.target
         try:
             self._edit(path)
-            self.draft, self.selected = None, None
+            self.draft, self.selected, self.start_screen = None, None, False
             self.load()
         except Exception:
             self._edit(old)
@@ -4487,6 +6278,7 @@ class Editor:
             return False
         self.preview_restore, self.preview_key = [(node, node.local.copy(), node.parent) for node in nodes], key
         self.gizmo.visible = False
+        self._sync_body_drags()
         return True
 
     def _end_preview(self):
@@ -4690,59 +6482,68 @@ class Editor:
                 return
             state['start'] = node.world()
             target, body = resolve_body()
-            parent = self.body_node(target, body)
-            target_item = self.items[target]
-            physical = mode() == 'physical'
-            if physical and target_item['category'] == 'robot' and not body and not abstract:
-                raise ValueError('请先刷新原生预览，解析机器人连杆')
-            if parent is node or node in parent.ancestors():
-                raise ValueError('不能安装到自身或其子节点')
-            matrix = offset_matrix(parent)
-            payload = self.collect()
-            changes = {}
-            payload['layout_parents'] = {path: None}
-            payload['entities'].append({'path': path, 'changes': changes})
-            if not physical:
-                # Switching from a physical relation drops it in the same edit.
-                if item.get('mount'):
-                    changes['mount'] = None
-                if info['fixed']:
-                    if not info['fixed']['project']:
-                        raise ValueError('共享组合内部连接请在模板中编辑')
-                    payload['connections'] = {info['fixed']['name']: None}
-                payload['layout_parents'][path] = {'entity': target, 'body': body}
-                world = parent.world() @ matrix
-                logical = self.info.get(item['parent'])
-                if logical:
-                    world = np.linalg.inv(logical['node'].world()) @ world
-                changes['pose'] = F.matrix_pose(world)
-            elif sensor or abstract:
-                changes.update(mount={'entity': target} if abstract else {'entity': target, 'body': body},
-                               pose=F.matrix_pose(matrix))
-                if abstract:
-                    changes['reset'] = None  # A followed entity is positioned by its parent.
-            else:
-                if any('root_state' not in capabilities.get(p, []) for p in (path, target)):
-                    raise ValueError('物理固定需要两个物理资产；静态桌子请选择“共同摆放”')
-                child_body = self.initial_display(path).get('root_body', '')
-                if item['category'] == 'robot' and not child_body:
-                    raise ValueError('请先刷新原生预览，解析机器人根连杆')
-                if info['fixed'] and not info['fixed']['project']:
-                    raise ValueError('共享组合内部连接请在模板中编辑')
-                if item.get('reset'):
-                    changes['reset'] = None  # The parent's reset carries the attached child.
-                asset = next((entry for entry in self.snapshot['catalog']['assets'] if entry['id'] == item.get('factory')), {})
-                if 'fix_root_link' in asset.get('parameters', {}):
-                    changes['parameters'] = {'fix_root_link': False}
-                name = info['fixed']['name'] if info['fixed'] else item['native_key'] + '_attachment'
-                payload['connections'] = {name: {'parent': {'entity': target, 'body': body},
-                                                 'child': {'entity': path, 'body': child_body},
-                                                 'parent_pose': F.matrix_pose(matrix)}}
             self.open_section = title  # Keep the section open on the applied relation.
-            self._apply(payload)
-            self.report(f'已设置父物体 {target_item["label"]}；拖动坐标轴可调整相对位置'
-                        + ('（已移除子实体自身的随机复位）' if changes.get('reset', 0) is None and not abstract else ''))
+            self.attach_to(path, target, body, mode() == 'physical', offset_matrix(self.body_node(target, body)))
         apply.on_click(execute)
+
+    def attach_to(self, path, target, body, physical, matrix=None):
+        """Give ``path`` the parent ``target``: a physical relation (sensors mount on ``body``, abstract entities
+        follow the root, two physical assets are fixed together) or a layout one. ``matrix`` is the child's pose
+        in the parent body's frame; by default it keeps its current place."""
+        item, info, node = self.items[path], self.info[path], self.info[path]['node']
+        abstract, sensor = item['category'] == 'abstract', item['category'] == 'sensor'
+        capabilities = {entry['path']: entry.get('capabilities', []) for entry in self.snapshot['catalog']['entities']}
+        parent = self.body_node(target, body)
+        target_item = self.items[target]
+        if matrix is None:
+            matrix = np.linalg.inv(parent.world()) @ node.world()
+        if physical and target_item['category'] == 'robot' and not body and not abstract:
+            raise ValueError('请先刷新原生预览，解析机器人连杆')
+        if parent is node or node in parent.ancestors():
+            raise ValueError('不能安装到自身或其子节点')
+        payload = self.collect()
+        changes = {}
+        payload['layout_parents'] = {path: None}
+        payload['entities'].append({'path': path, 'changes': changes})
+        if not physical:
+            # Switching from a physical relation drops it in the same edit.
+            if item.get('mount'):
+                changes['mount'] = None
+            if info['fixed']:
+                if not info['fixed']['project']:
+                    raise ValueError('共享组合内部连接请在模板中编辑')
+                payload['connections'] = {info['fixed']['name']: None}
+            payload['layout_parents'][path] = {'entity': target, 'body': body}
+            world = parent.world() @ matrix
+            logical = self.info.get(item['parent'])
+            if logical:
+                world = np.linalg.inv(logical['node'].world()) @ world
+            changes['pose'] = F.matrix_pose(world)
+        elif sensor or abstract:
+            changes.update(mount={'entity': target} if abstract else {'entity': target, 'body': body},
+                           pose=F.matrix_pose(matrix))
+            if abstract:
+                changes['reset'] = None  # A followed entity is positioned by its parent.
+        else:
+            if any('root_state' not in capabilities.get(p, []) for p in (path, target)):
+                raise ValueError('物理固定需要两个物理资产；静态桌子请选择“共同摆放”')
+            child_body = self.initial_display(path).get('root_body', '')
+            if item['category'] == 'robot' and not child_body:
+                raise ValueError('请先刷新原生预览，解析机器人根连杆')
+            if info['fixed'] and not info['fixed']['project']:
+                raise ValueError('共享组合内部连接请在模板中编辑')
+            if item.get('reset'):
+                changes['reset'] = None  # The parent's reset carries the attached child.
+            asset = next((entry for entry in self.snapshot['catalog']['assets'] if entry['id'] == item.get('factory')), {})
+            if 'fix_root_link' in asset.get('parameters', {}):
+                changes['parameters'] = {'fix_root_link': False}
+            name = info['fixed']['name'] if info['fixed'] else item['native_key'] + '_attachment'
+            payload['connections'] = {name: {'parent': {'entity': target, 'body': body},
+                                             'child': {'entity': path, 'body': child_body},
+                                             'parent_pose': F.matrix_pose(matrix)}}
+        self._apply(payload)
+        self.report(f'已设置父物体 {target_item["label"]}；拖动坐标轴可调整相对位置'
+                    + ('（已移除子实体自身的随机复位）' if changes.get('reset', 0) is None and not abstract else ''))
 
     def _initial_section(self, path):
         gui, item, info = self.server.gui, self.items[path], self.info[path]
@@ -5045,6 +6846,65 @@ class Editor:
             self.arm_placement(f'{path} 的下一个路径点', add)  # keep adding until Esc
         self.arm_placement(f'{path} 的路径点', add)
 
+    def _draw_sensor(self):
+        """What the selected sensor measures, in the view: a contact sensor's bodies (an arrow for the force
+        it reads on each), a height scanner's rays down to the surface, a frame transformer's target."""
+        for handle in self.sensor_marker:
+            handle.remove()
+        self.sensor_marker = []
+        if not self.selected or self.selected[0] != 'entity' or self.selected[1] not in self.items:
+            return
+        path = self.selected[1]
+        item = self.items[path]
+        if item['category'] != 'sensor':
+            return
+        scene, color, mount = self.server.scene, (240, 110, 30), item.get('mount') or {}
+        target = _resolve(path, mount['entity']) if mount.get('entity') else None
+        values = self.parameter_values(item)
+        if item.get('factory') == 'contact_sensor' and target in self.info:
+            bodies = self.info[target]['bodies']
+            names = [name for name in bodies if _body_pattern_matches(mount.get('body') or '', name)] or \
+                ([mount['body']] if mount.get('body') in bodies else [])
+            points = np.array([_xyz(bodies[name].world()) for name in names] or
+                              [_xyz(self.info[target]['node'].world())], dtype=float)
+            # The force a contact sensor reads, drawn as the ground pushing back on each body.
+            up = np.array([0.0, 0.0, .16])
+            segments = [[p - up * .2, p + up] for p in points]
+            segments += [[p + up, p + up * .7 + offset] for p in points for offset in ((.03, 0, 0), (-.03, 0, 0))]
+            self.sensor_marker.append(scene.add_line_segments('/sensor_view/forces', np.array(segments, float), color,
+                                                              thickness=4., thickness_units='screen'))
+            self.sensor_marker.append(scene.add_point_cloud('/sensor_view/bodies', points.astype(np.float32), colors=color,
+                                                            point_size=.035, point_shape='circle'))
+        elif item.get('factory') == 'height_scanner':
+            pattern = values.get('pattern') or {}
+            resolution, size = float(pattern.get('resolution') or .1), pattern.get('size') or (1.0, 1.0)
+            xs = np.arange(-size[0] / 2, size[0] / 2 + 1e-9, resolution)
+            ys = np.arange(-size[1] / 2, size[1] / 2 + 1e-9, resolution)
+            grid = np.array([(x, y, 0.0) for x in xs for y in ys], float)
+            world = self.info[path]['node'].world()
+            alignment = values.get('ray_alignment') or 'base'
+            rotation = world[:3, :3] if alignment == 'base' else \
+                F.euler_matrix([0, 0, F.matrix_euler(world)[2]])[:3, :3] if alignment == 'yaw' else np.eye(3)
+            origins = grid @ rotation.T + world[:3, 3]
+            down = rotation @ np.array([0.0, 0.0, -1.0])
+            shown = origins[::max(1, len(origins) // 240)]  # every ray in a small pattern, a sample of a large one
+            hits = [self.surface_point(origin, down) for origin in shown]
+            hits = np.array([hit if hit is not None else origin + down * 2 for origin, hit in zip(shown, hits)], float)
+            self.sensor_marker.append(scene.add_line_segments('/sensor_view/rays', np.stack([shown, hits], 1), (46, 160, 220),
+                                                              thickness=1., thickness_units='screen'))
+            self.sensor_marker.append(scene.add_point_cloud('/sensor_view/hits', hits.astype(np.float32), colors=(46, 160, 220),
+                                                            point_size=.02, point_shape='circle'))
+        elif item.get('factory') == 'frame_transformer' and target in self.info:
+            bodies = self.info[target]['bodies']
+            start = _xyz(self.info[path]['node'].world())
+            end = bodies.get(values.get('target_body') or '')
+            if end is not None:
+                end = np.asarray(_xyz(end.world())) + end.world()[:3, :3] @ np.asarray(values.get('target_position') or (0, 0, 0), float)
+                self.sensor_marker.append(scene.add_line_segments('/sensor_view/frame', np.array([[start, end]], float), color,
+                                                                  thickness=3., thickness_units='screen'))
+                self.sensor_marker.append(scene.add_frame('/sensor_view/target', axes_length=.08, axes_radius=.004,
+                                                          position=tuple(end), wxyz=_wxyz(bodies[values['target_body']].world())))
+
     def _draw_motion_path(self):
         """The selected entity's path (points and segments) in the view."""
         if self.path_marker is not None:
@@ -5191,119 +7051,16 @@ class Editor:
             for key in saved:
                 self.observation_enabled[(role, key)] = True
         self.train_role = control.get('train')
-        self._rebuild_observations()
 
     @action
     def _set_train(self, role):
         if role == self.train_role:
             return
         self.checkpoint()
+        if role not in self.observation_order:
+            raise ValueError('选择 planner 或 executor')
         self.train_role = role
-        self._show_train()
         self.report(f'训练模块改为 {role}；保存后生效')
-
-    def _show_train(self):
-        """Mark the trained module on the switch and on its tab icon."""
-        roles = list(self.observation_order)
-        row = TRAIN_ROW.format(id=self.train_switch._impl.uuid)
-        rules = [TRAIN_SWITCH_CSS.format(row=row)]
-        for index, role in enumerate(roles, 1):
-            trained = role == self.train_role
-            self.observation_tabs[role].icon = 'flame' if trained else 'lock'
-            caption = ' · '.join(filter(None, (ROLE_PURPOSE.get(role), '训练中' if trained else '固定')))
-            rules.append(TRAIN_BUTTON_CSS.format(row=row, n=index, caption=json.dumps(caption, ensure_ascii=False)))
-            if trained:
-                rules.append(TRAIN_ON_CSS.format(row=row, n=index))
-        self.train_style.content = '<style>' + ''.join(rules) + '</style>'
-
-    def _rebuild_observations(self):
-        for handle in self.observation_items:
-            handle.remove()
-        self._forget_widgets('observation')
-        self.observation_items, self.observation_tabs, self.observation_boxes = [], {}, {}
-        self.period_fields, self.dimension_fields = {}, {}
-        gui, roles = self.server.gui, list(self.observation_order)
-        components = (self.snapshot.get('control') or {}).get('components', {})
-        boxes = []
-        with self.observation_folder:
-            if not roles:
-                self.observation_items.append(gui.add_html(
-                    '<div class="rl-status error" style="margin:0 8px 6px">此场景没有 control.components，'
-                    '不是当前模板格式；编辑器只编辑新模板项目的组件观察。</div>'))
-                return
-            self.train_switch = gui.add_button_group('训练', roles, hint=(
-                '橙色为被训练的模块：PPO 更新其参数。其余模块固定，只运行 policy.py 中的模型。'))
-            self.train_switch.on_click(lambda event: self._set_train(event.target.value))
-            self.train_style = gui.add_html('')
-            tabs = gui.add_tab_group()
-            self.observation_items += [self.train_switch, self.train_style, tabs]
-            for index, role in enumerate(roles):
-                with tabs.add_tab(f'{role} 的输入') as tab:
-                    self.observation_tabs[role] = tab
-                    self._period_field(role, components[role])
-                    # A module reads earlier modules' interfaces, not its own or later ones.
-                    boxes += self._observation_boxes(role, components, hidden=roles[index:])
-            self._show_train()
-            self._show_links()
-            # Attribute path on the first line in monospace, the description below it.
-            if boxes:
-                selectors = [f'p:has(> label[for="{box._impl.uuid}"])' for box in boxes]
-                self.observation_items.append(gui.add_html('<style>' + OBSERVATION_CSS.format(
-                    labels=','.join(selectors), first=','.join(item + '::first-line' for item in selectors))
-                    + OBSERVATION_GROUP_CSS.format(checked=','.join(f'input[id="{box._impl.uuid}"]:checked' for box in boxes))
-                    + '</style>'))
-
-    def _period_field(self, role, saved):
-        period = self.pending['components'].get(role, {}).get('period', saved.get('period', ''))
-        field = self.server.gui.add_text('决策周期 (s)', str(period),
-                                         hint='须为物理步 simulation.dt 的整数倍；executor 周期须整除 planner 周期')
-        field.on_update(lambda _: (self.checkpoint(('component', role, 'period')),
-                                   self.pending['components'].setdefault(role, {}).__setitem__('period', field.value)))
-        self.period_fields[role] = field
-        dimension = self.pending['components'].get(role, {}).get('dimension', saved.get('dimension', 'auto'))
-        size = self.server.gui.add_text('输出维度', str(dimension), hint=(
-            '模型 forward 返回的末维；planner 须为正整数，executor 可写 auto（等于控制目标关节总数）'))
-        size.on_update(lambda _: (self.checkpoint(('component', role, 'dimension')),
-                                  self.pending['components'].setdefault(role, {}).__setitem__('dimension', size.value)))
-        self.dimension_fields[role] = size
-
-    def _observation_boxes(self, profile, components, hidden=()):
-        """One folder per obs object (obs.robot), a checkbox per attribute of the given module.
-
-        Rows follow the catalogue order on every page; interfaces of `hidden` modules are
-        left out unless already selected."""
-        gui, groups, boxes = self.server.gui, {}, []
-        order = self.observation_order[profile]
-        for key in [key for key in self.observation_meta if key in order] + [key for key in order if key not in self.observation_meta]:
-            if key.partition('.')[0] in hidden and not self.observation_enabled.get((profile, key)):
-                continue
-            meta = self.observation_meta.get(key, {})
-            source = meta.get('source_groups', {}).get('default', {})
-            group, name = observation_group(key, source, components)
-            groups.setdefault(group, []).append((key, name, meta, source))
-        for label, rows in groups.items():
-            with gui.add_folder(label, expand_by_default=any(self.observation_enabled.get((profile, key)) for key, *_ in rows)):
-                native = rows[0][0].partition('.')[0]
-                if any(item.get('native_key') == native for item in self.items.values()):
-                    gui.add_button('在场景中定位', icon='focus-2').on_click(
-                        lambda _, native=native: self._select_native(native, focus=True))
-                for key, name, meta, source in rows:
-                    enabled = bool(self.observation_enabled.get((profile, key)))
-                    available = source.get('available', meta.get('available', enabled)) and meta.get('observation_selectable', True)
-                    hint = f'obs.{key}：' + meta.get('description', '')
-                    if source.get('missing'):
-                        hint += '　缺少：' + ', '.join(source['missing'])
-                    # Rows show the attribute inside the folder's object in English, then the
-                    # description, shape and unit.
-                    box = gui.add_checkbox(f'{name}\n{observation_caption(meta)}'.strip(), enabled,
-                                           disabled=not available and not enabled, hint=hint)
-                    boxes.append(box)
-                    self.observation_boxes[(profile, key)] = box
-                    self.entity_widgets.setdefault(key.partition('.')[0], []).append(box._impl.uuid)
-                    box.on_update(lambda _, key=key, box=box: (
-                        self.checkpoint(), self.observation_enabled.__setitem__((profile, key), box.value),
-                        self._select_native(key.partition('.')[0])))
-        return boxes
 
     # ----------------------------------------------------------------- control
     def bindings(self):
@@ -5311,90 +7068,6 @@ class Editor:
         snapshot = self.snapshot
         saved = (snapshot.get('control') or {}).get('output', {})
         return overlay_outputs(saved, self.pending['actions'])
-
-    def measured_joints(self):
-        result = {item['native_key']: list(self.initial_display(item['path']).get('joint_positions', {}))
-                  for item in self.snapshot['entities'] if item.get('native_key')}
-        result.update({name: item['joint_names'] for name, item in
-                       (self.snapshot.get('interface') or {}).get('articulations', {}).items()})
-        return result
-
-    def _refresh_control(self):
-        for handle in self.control_items:
-            handle.remove()
-        self.control_items = []
-        self._forget_widgets('control')
-        gui, measured = self.server.gui, self.measured_joints()
-        self.syncing += 1
-        try:
-            robots = {item['native_key'] for item in self.snapshot['entities'] if item['category'] == 'robot'}
-            keys = sorted(key for key, joints in measured.items() if joints or key in robots)
-            self.target_asset.options = keys or [NONE]
-            if self.target_asset.value not in self.target_asset.options:
-                self.target_asset.value = self.target_asset.options[0]
-        finally:
-            self.syncing -= 1
-        self._suggest_target_name()
-        with self.control_folder:
-            if not self.snapshot.get('control'):
-                self.control_items.append(gui.add_html(
-                    '<div class="rl-status error" style="margin:0 8px 6px">此场景没有 control 段，不是当前模板格式。</div>'))
-                return
-            bindings = self.bindings()
-            if not bindings:
-                self.control_items.append(gui.add_markdown('尚无控制目标；在下方新增。'))
-            css = []
-            for name, binding in bindings.items():
-                joints = list(binding['joint_names'])
-                # The ✕ sits on the folder's header line, so a target is removed without expanding it.
-                remove = gui.add_button('', icon='x', color='red', hint=f'删除控制目标 {name}')
-                remove.on_click(lambda _, name=name: self._remove_target(name))
-                css.append(CONTROL_REMOVE_CSS.format(id=remove._impl.uuid))
-                mark = ' *' if name in self.pending['actions'] else ''
-                folder = gui.add_folder(f'{name} · {CONTROL_TYPES.get(binding["type"], binding["type"]).split(" ")[0]}'
-                                        f' · {binding["asset_name"]} · {len(joints)} 维{mark}', expand_by_default=False)
-                self.control_items += [remove, folder]
-                with folder:
-                    gui.add_button(f'在场景中定位 {binding["asset_name"]}', icon='focus-2').on_click(
-                        lambda _, asset=binding['asset_name']: self._select_native(asset, focus=True))
-                    kind = gui.add_dropdown('类型', list(CONTROL_TYPES.values()), initial_value=CONTROL_TYPES[binding['type']])
-                    kind.on_update(lambda _, name=name, kind=kind: None if self.syncing else self._set_target_type(name, kind.value))
-                    self.entity_widgets.setdefault(binding['asset_name'], []).append(kind._impl.uuid)
-                    self.control_widgets.append(kind._impl.uuid)
-                    available = measured.get(binding['asset_name'], [])
-                    if not available:
-                        gui.add_markdown('尚无实测关节列表（等待原生网格导出）')
-                    for joint in [*available, *(j for j in joints if j not in available)]:
-                        index = joints.index(joint) if joint in joints else None
-                        box = gui.add_checkbox(joint, index is not None,
-                                               hint=f'动作第 {index} 维' if index is not None else '未控制')
-                        box.on_update(lambda _, name=name, joint=joint, box=box, asset=binding['asset_name']:
-                                      None if self.syncing else (self._toggle_joint(name, joint, box.value),
-                                                                 self._select_native(asset, joint=joint)))
-            if css:
-                self.control_items.append(gui.add_html('<style>' + ''.join(css) + '</style>'))
-        self._show_links()
-
-    # ---------------------------------------- selection shown in the 观察 / 控制 tabs
-    def _forget_widgets(self, kind):
-        """Drop the widget ids of one tab before it is rebuilt (observation boxes or control targets)."""
-        dropped = set(getattr(self, 'control_widgets', [])) if kind == 'control' else \
-            {box._impl.uuid for box in getattr(self, 'observation_boxes', {}).values()}
-        self.entity_widgets = {key: [uuid for uuid in uuids if uuid not in dropped]
-                               for key, uuids in getattr(self, 'entity_widgets', {}).items()}
-        if kind == 'control':
-            self.control_widgets = []
-
-    def _show_links(self):
-        """Highlight the selected entity's observation folders and control targets."""
-        if not hasattr(self, 'link_style'):
-            return
-        owner, ids = self.selected, []
-        if owner and owner[0] == 'entity' and owner[1] in self.items:
-            ids = self.entity_widgets.get(self.items[owner[1]].get('native_key') or '', [])
-        css = LINK_CSS.format(ids=','.join(f'[id="{uuid}"]' for uuid in ids)) if ids else ''
-        if self.link_style.content != css:
-            self.link_style.content = f'<style>{css}</style>' if css else ''
 
     def _select_native(self, key, joint=None, focus=False):
         """Select the entity an observation or control row belongs to (its native key), if it is one, and
@@ -5420,96 +7093,9 @@ class Editor:
             if mesh.handle is not None and mesh.shape and mesh.shape.get('color') is not None \
                     and getattr(mesh, 'link_lit', False) != lit:
                 mesh.handle.color = (90, 160, 255) if lit else (COLORS['selected'] if self.selected == ('entity', path)
-                                                                 else mesh.shape['color'])
+                                                                 else self._rest_color(('entity', path), mesh))
                 mesh.link_lit = lit
 
-    def _suggest_target_name(self):
-        from shared.assembly.control import free_target_name
-        self.syncing += 1
-        try:
-            asset = self.target_asset.value
-            self.target_name.value = free_target_name(self.bindings(), asset if asset != NONE else 'arm')
-        finally:
-            self.syncing -= 1
-
-    def _stage_targets(self, changes, message):
-        """Validate the effective bindings with these changes, then stage them for saving."""
-        from shared.assembly.control import (overlay_outputs, require_listed_joints, validate_outputs,
-                                             validate_target_conflicts)
-        if not self.snapshot.get('control'):
-            raise ValueError('此场景没有 control 段，不是当前模板格式')
-        proposed = overlay_outputs(self.bindings(), changes)
-        require_listed_joints({name: binding for name, binding in changes.items() if binding})
-        validate_outputs(proposed)
-        validate_target_conflicts(proposed, self.measured_joints())
-        self.checkpoint()
-        self.pending['actions'].update(changes)
-        self._refresh_control()
-        self.report(message)
-
-    @action
-    def _toggle_joint(self, name, joint, enabled):
-        try:
-            binding = self.bindings()[name]
-            joints = list(binding['joint_names'])
-            if enabled and joint not in joints:
-                measured = self.measured_joints().get(binding['asset_name'], [])
-                # A list kept in articulation order stays in that order; a custom order gets the joint appended.
-                if joints == [item for item in measured if item in joints] and joint in measured:
-                    joints = [item for item in measured if item in joints or item == joint]
-                else:
-                    joints.append(joint)
-            elif not enabled:
-                joints = [item for item in joints if item != joint]
-            if not joints:
-                raise ValueError(f'{name} 至少要控制一个关节；不需要该目标时点 ✕ 删除')
-            self._stage_targets({name: {**binding, 'joint_names': joints}},
-                                f'控制目标 {name}：{len(joints)} 维；保存后写入 scene.yaml')
-        except Exception:
-            self._refresh_control()  # Restore the checkbox to the effective binding.
-            raise
-
-    @action
-    def _set_target_type(self, name, label):
-        binding = self.bindings()[name]
-        kind = next(key for key, value in CONTROL_TYPES.items() if value == label)
-        try:
-            self._stage_targets({name: {**binding, 'type': kind}}, f'控制目标 {name} 改为{label}；保存后写入 scene.yaml')
-        except Exception:
-            self._refresh_control()
-            raise
-
-    @action
-    def _add_target(self):
-        asset, name = self.target_asset.value, self.target_name.value.strip()
-        if asset == NONE:
-            raise ValueError('场景中没有可控制的机器人')
-        if name in self.bindings():
-            raise ValueError(f'控制目标 {name} 已存在')
-        from shared.assembly.control import default_target_joints
-        controlled = {joint for binding in self.bindings().values() if binding['asset_name'] == asset
-                      for joint in binding['joint_names']}
-        path = next((item['path'] for item in self.snapshot['entities'] if item.get('native_key') == asset), None)
-        kinematics = (self.info.get(path) or {}).get('kinematics') or {}
-        joints = default_target_joints(self.measured_joints().get(asset, []), controlled, kinematics.get('joints', ()))
-        if not joints:
-            raise ValueError(f'{asset} 没有尚未控制的关节' if controlled else
-                             f'{asset} 的关节名尚未读出（等待原生网格导出）')
-        kind = next(key for key, value in CONTROL_TYPES.items() if value == self.target_type.value)
-        rest = len(self.measured_joints().get(asset, [])) - len(controlled) - len(joints)
-        self._stage_targets({name: {'type': kind, 'asset_name': asset, 'joint_names': joints}},
-                            f'控制目标 {name} 已添加（{len(joints)} 维）'
-                            + (f'，另有 {rest} 个类型不同的关节未选，可勾选或另建目标' if rest > 0 else '')
-                            + '；同步 policy.py 的 decode_action，保存后写入 scene.yaml')
-
-    @action
-    def _remove_target(self, name):
-        if name not in self.bindings():
-            raise ValueError(f'控制目标 {name} 不存在')
-        self.checkpoint()
-        self.pending['actions'][name] = None
-        self._refresh_control()
-        self.report(f'控制目标 {name} 将在保存后删除；记得同步 policy.py 的 decode_action')
 
 
 def main(argv=None):
@@ -5517,18 +7103,33 @@ def main(argv=None):
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument('--project')
     target.add_argument('--scene', type=Path)
+    target.add_argument('--start', action='store_true', help='No project yet: a blank draft, and the page offers new or open')
     parser.add_argument('--host', default='127.0.0.1', help='Use 0.0.0.0 only on a trusted network')
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--no-native-preview', action='store_true', help='Do not start the Isaac geometry export')
     parser.add_argument('--library-port', type=int, help='SimReady asset library page (default: editor port + 1, '
                                                          'or the next free one)')
     args = parser.parse_args(argv)
-    scene = args.scene or ROOT / 'projects' / args.project / 'scene.yaml'
+    draft = None
+    if args.start:
+        from shared.assembly.starter import create_draft
+        draft = next(name for name in ('untitled', *(f'untitled_{n}' for n in range(2, 100)))
+                     if not (ROOT / 'projects' / name).exists())
+        scene = create_draft(draft, 'blank')
+    else:
+        scene = args.scene or ROOT / 'projects' / args.project / 'scene.yaml'
     if not Path(scene).is_file():
         parser.error(f'No scene.yaml: {scene}')
     editor = Editor(scene, host=args.host, port=args.port, native_preview=not args.no_native_preview,
                     library_port=args.library_port)
-    print(f'RLinf scene editor: http://{"localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host}:{editor.server.get_port()}')
+    if draft:
+        editor.draft, editor.start_screen = draft, True
+    shown = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    page = getattr(editor, 'editor_url', None) or f'http://{shown}:{editor.server.get_port()}'
+    behind = f' (viser above: its websocket, port {editor.server.get_port()})' if getattr(editor, 'editor_url', None) else ''
+    print(f'RLinf scene editor: {page}{behind}', flush=True)
+    if page.endswith(f':{editor.server.get_port()}') and editor.patched:
+        print('  (the patched page did not start; this is viser\'s own page)', flush=True)
     try:
         while True:
             time.sleep(3600)

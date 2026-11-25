@@ -7,8 +7,9 @@ from .frames import wxyz
 # refer to the root body's centre of mass, as in the other backends.
 FIELDS = {'linear_velocity': 'root_com_lin_vel_w', 'angular_velocity': 'root_com_ang_vel_w',
           'joint_position': 'joint_pos', 'joint_velocity': 'joint_vel',
-          'default_joint_position': 'default_joint_pos', 'default_joint_velocity': 'default_joint_vel'}
-SUPPORTED = {*FIELDS, 'position', 'orientation', 'joint_effort', 'ray_hit_positions', 'frame_positions',
+          'default_joint_position': 'default_joint_pos', 'default_joint_velocity': 'default_joint_vel',
+          'joint_limits': 'joint_pos_limits'}
+SUPPORTED = {*FIELDS, 'position', 'orientation', 'joint_effort', 'bounds', 'ray_hit_positions', 'frame_positions',
              'contact_force', 'contact_force_samples', 'rgb', 'distance_to_image_plane', 'distance_to_camera',
              'normals'}
 
@@ -70,6 +71,10 @@ def bind_reader(env, settings, path):
         if parsed is None:
             raise ValueError(f'Unknown scene information: {source}')
         key, field = parsed
+        if field == 'bounds' or (field in ('position', 'orientation') and _static(env, key)):
+            position, orientation, bounds = _geometry(env, key)
+            value = {'position': position, 'orientation': orientation, 'bounds': bounds}[field]
+            return lambda: value
         asset = env.scene[key]
         # Data properties may return new array views after a reset; read `.torch` on every call.
         # Sensors refresh outdated buffers when `.data` is read, so read it on every call too.
@@ -97,3 +102,60 @@ def bind_reader(env, settings, path):
     from .robot import robots
     return bind_common(env, settings, path, bind_physical=physical, bind_sampled_target=sampled,
                        robots=robots(env, settings))
+
+
+def _static(env, key):
+    from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+    config = getattr(env.scene.cfg, key, None)
+    return isinstance(config, AssetBaseCfg) and not isinstance(config, (ArticulationCfg, RigidObjectCfg))
+
+
+def _geometry(env, key):
+    """``(position, orientation, bounds)`` of entity ``key`` as spawned, batched over environments.
+
+    The frame is the one the root readings use: the root body of a rigid object or articulation
+    (the body no joint of the asset hangs from), the entity prim of a static one. ``bounds`` are the
+    corners of the drawn geometry in that frame, at the default joint positions; the pose of a static
+    entity is constant. Read once from the stage, from one environment's copy when each has one.
+    """
+    cache = env.__dict__.setdefault('_assembly_geometry', {})
+    if key in cache:
+        return cache[key]
+    import re
+    import torch
+    from isaaclab.sim.utils.queries import find_first_matching_prim
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+    stage = env.sim.stage
+    template = getattr(env.scene.cfg, key).prim_path
+    prim = stage.GetPrimAtPath(template) if Sdf.Path.IsValidPathString(template) else Usd.Prim()
+    clone = None if prim.IsValid() else find_first_matching_prim(template, stage)
+    if clone is not None:
+        prim = clone  # one environment's copy; the others are clones at their origins
+    if not prim.IsValid():
+        raise ValueError(f'{key}: no prim at {template}')
+    number = re.search(r'/env_(\d+)/', str(prim.GetPath()) + '/') if clone is not None else None
+    root = prim
+    if not _static(env, key):
+        prims = list(Usd.PrimRange(prim, Usd.TraverseInstanceProxies()))
+        bodies = [p for p in prims if p.HasAPI(UsdPhysics.RigidBodyAPI)]
+        children = {target for p in prims if p.IsA(UsdPhysics.Joint) and UsdPhysics.Joint(p).GetBody0Rel().GetTargets()
+                    for target in UsdPhysics.Joint(p).GetBody1Rel().GetTargets()}
+        root = next((body for body in bodies if body.GetPath() not in children), prim)
+    time = Usd.TimeCode.Default()
+    transform = Gf.Transform(UsdGeom.Xformable(root).ComputeLocalToWorldTransform(time))
+    frame = Gf.Matrix4d().SetRotate(transform.GetRotation()) * Gf.Matrix4d().SetTranslate(transform.GetTranslation())
+    box = UsdGeom.BBoxCache(time, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]).ComputeWorldBound(prim)
+    box.Transform(frame.GetInverse())
+    extent = box.ComputeAlignedRange()
+    if extent.IsEmpty():
+        raise ValueError(f'{key}: no drawn geometry to bound')
+    device = env.device
+    origins = env.scene.env_origins
+    position = torch.tensor(list(transform.GetTranslation()), device=device, dtype=torch.float32)
+    position = position - (origins[int(number.group(1))] if number else origins)
+    quaternion = transform.GetRotation().GetQuat()
+    orientation = torch.tensor([quaternion.GetReal(), *quaternion.GetImaginary()], device=device, dtype=torch.float32)
+    bounds = torch.tensor([list(extent.GetMin()), list(extent.GetMax())], device=device, dtype=torch.float32)
+    cache[key] = (position.expand(env.num_envs, 3), orientation.expand(env.num_envs, 4),
+                  bounds.expand(env.num_envs, 2, 3))
+    return cache[key]

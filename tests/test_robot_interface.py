@@ -164,9 +164,9 @@ def test_generated_robot_nodes_inherit_the_interface(tmp_path):
     target, _ = create_project('robot_example', destination=tmp_path)
     tree = {}
     exec(compile((target / 'observation.py').read_text(), 'observation.py', 'exec'), tree)
-    assert issubclass(tree['ExecutorObs_robot'], RobotView)
+    assert issubclass(tree['PolicyObs_robot'], RobotView)
     assert issubclass(tree['SceneInfo_robot'], RobotView)
-    assert not issubclass(tree['SceneInfo_executor_input_robot'], RobotView)
+    assert not issubclass(tree['SceneInfo_policy_input_robot'], RobotView)
 
 
 def test_named_frame_is_an_observation_read_through_the_robot_interface():

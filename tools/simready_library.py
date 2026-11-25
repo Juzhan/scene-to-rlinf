@@ -5,7 +5,8 @@ viser serves only its own client, so the browser runs a small HTTP server in the
 back into the editor, which downloads/wraps through shared.simready and adds the entity with the
 same apply_edits as every other edit. The editor binds it to its own host, on the next free port.
 
-  GET  /                          the page
+  GET  /library                   the page
+  GET  / (/editor/)               the editor: viser's page patched (tools/viser_client), with the app
   GET  /api/catalog               every asset {key, publisher, name, category, local, bytes} + sources
   GET  /api/asset?key=pub/name    details: files present/missing, wrapper, scene entities, suggested name
   GET  /api/status                the current add job (download progress, result)
@@ -23,6 +24,16 @@ and the scene tab's outliner (tools/scene_outliner.html):
 
   GET  /api/outliner/state?revision=n   tree rows with their switches (only the revision when unchanged)
   POST /api/outliner/select | focus | toggle   (see Editor.outliner_post)
+
+and the editor app that replaces viser's panels (tools/editor_ui/):
+
+  GET  /ui/<file>                  app.js, app.css, shelf.html (the asset shelf with this port)
+  GET  /api/ui/state | inspector   top bar; the selection's properties (Editor.ui_get)
+  POST /api/ui/<action>            save, undo, pose, physics, initial, ... (Editor.ui_post)
+  GET  /api/ui/camera.jpg          the selected camera's view, rendered once edits settle
+  POST /api/import/file?batch=&path=   one file of an import (raw body; a folder is uploaded file by file)
+  POST /api/import/needs {batch, main, xacro, files}   which files of a chosen folder the import uses
+  POST /api/import/finish {batch, kind, name, fixed}   convert and add it (shared.asset_import)
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -34,6 +45,34 @@ import urllib.parse
 from shared import simready
 
 PAGE = Path(__file__).with_name('simready_library.html')
+APP = Path(__file__).with_name('editor_ui')
+APP_FILES = {'app.js': 'text/javascript; charset=utf-8', 'app.css': 'text/css; charset=utf-8'}
+# viser's client with the editor's patches (tools/viser_client/rlinf.patch, built by tools/build_viser_client.py):
+# the editor's page at / (and /editor/), connected to viser's websocket on its own port.
+VIEWER = Path(__file__).with_name('viser_client') / 'viewer.html'
+
+
+def viewer_problem():
+    """Why the patched page cannot be served (None when it can): it speaks the protocol of the viser it was
+    built from."""
+    import viser
+    record = VIEWER.with_name('BUILD.json')
+    if not VIEWER.is_file() or not record.is_file():
+        return 'tools/viser_client/viewer.html 未构建：python tools/build_viser_client.py'
+    built = json.loads(record.read_text()).get('viser')
+    if built != viser.__version__:
+        return f'改进版视图按 viser {built} 构建，当前是 {viser.__version__}：python tools/build_viser_client.py'
+    return None
+
+
+def viewer_page(viser_port):
+    """The patched viser page, told where viser's websocket is (the same host, viser's port)."""
+    script = ("<script>window.__RLINF_WS__ = (location.protocol === 'https:' ? 'wss://' : 'ws://') + "
+              f"location.hostname + ':{int(viser_port)}';</script>"
+              # The editor app with the page (served here too), so viser's own panels never show while it loads;
+              # the loader viser's GUI injects later finds it already there.
+              "<link rel='stylesheet' href='/ui/app.css'><script id='rl-app-js' src='/ui/app.js' data-api='/' defer></script>")
+    return VIEWER.read_text().replace('<head>', '<head>' + script, 1).encode()
 SIZES = (320, 768)
 _fetching = threading.BoundedSemaphore(6)  # previews not yet cached hit Hugging Face at most 6 at a time
 
@@ -98,8 +137,12 @@ class _Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         query = dict(urllib.parse.parse_qsl(url.query))
         try:
-            if url.path in ('/', '/index.html'):
+            if url.path in ('/library', '/library/'):
                 return self._send(200, PAGE.read_bytes(), 'text/html; charset=utf-8')
+            if url.path in ('/', '/index.html', '/editor', '/editor/'):
+                if viewer_problem():
+                    return self._send(404, {'error': viewer_problem()})
+                return self._send(200, viewer_page(self.editor.origin_port), 'text/html; charset=utf-8', cache='no-cache')
             if url.path == '/api/catalog':
                 return self._send(200, self.editor.catalog())
             if url.path == '/api/asset':
@@ -112,6 +155,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.editor.shelf_get(url.path[11:], query))
             if url.path.startswith('/api/outliner/'):
                 return self._send(200, self.editor.outliner_get(url.path[14:], query))
+            if url.path == '/api/ui/camera.jpg':
+                frame = self.editor.ui_camera()
+                return self._send(200, frame, 'image/jpeg') if frame else self._send(204, b'', 'image/jpeg')
+            if url.path.startswith('/api/ui/'):
+                return self._send(200, self.editor.ui_get(url.path[8:], query))
+            if url.path.startswith('/ui/'):
+                name = url.path[4:]
+                if name in APP_FILES:
+                    return self._send(200, (APP / name).read_bytes(), APP_FILES[name], cache='no-cache')
+                if name == 'shelf.html':
+                    page = Path(__file__).with_name('asset_shelf.html').read_text()
+                    page = page.replace('__LIBRARY_PORT__', str(self.server.server_address[1]))
+                    return self._send(200, page.encode(), 'text/html; charset=utf-8', cache='no-cache')
             if url.path.startswith('/thumb/') and url.path.endswith('.png'):
                 return self._send(200, self.editor.shelf_picture(urllib.parse.unquote(url.path[7:-4])), 'image/png',
                                   cache='no-cache')
@@ -142,7 +198,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - http.server API
         url = urllib.parse.urlsplit(self.path)
         try:
+            if url.path == '/api/import/file':  # raw bytes of one file, streamed to disk
+                query = dict(urllib.parse.parse_qsl(url.query))
+                return self._send(200, self.editor.import_file(query.get('batch', ''), query.get('path', ''), self.rfile,
+                                                               int(self.headers.get('Content-Length') or 0)))
             request = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+            if url.path == '/api/import/finish':
+                return self._send(200, self.editor.import_finish(request))
+            if url.path == '/api/import/needs':
+                return self._send(200, self.editor.import_needs(request))
             if url.path == '/api/add':
                 return self._send(200, self.editor.add(request.get('key', ''), str(request.get('name', '')).strip(),
                                                        request.get('position') or [0, 0, 0]))
@@ -150,6 +214,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.editor.shelf_post(url.path[11:], request))
             if url.path.startswith('/api/outliner/'):
                 return self._send(200, self.editor.outliner_post(url.path[14:], request))
+            if url.path.startswith('/api/ui/'):
+                return self._send(200, self.editor.ui_post(url.path[8:], request))
         except (KeyError, ValueError) as error:
             return self._send(400, {'error': str(error)})
         except Exception as error:  # noqa: BLE001 - reported to the page

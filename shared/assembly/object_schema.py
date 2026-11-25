@@ -2,6 +2,7 @@
 import keyword
 from pathlib import Path
 from .objects import selected_fields
+from .layers import type_name
 
 HEADER = '# Generated from scene.yaml; edit the scene and run check to refresh.\n'
 
@@ -12,7 +13,8 @@ def observation_fields(scene, *, catalog_directory=None, settings=None, factorie
     from .catalog import describe_scene
     from .layout import load_scene_config
     scene = Path(scene).resolve()
-    settings = load_scene_config(scene) if settings is None else settings
+    from .layers import normalize
+    settings = load_scene_config(scene) if settings is None else normalize(settings, catalog_directory or scene.parent)
     # A project entry knows its own package; the path alone cannot identify a
     # project added to ``projects.__path__``, so its factories are passed in.
     catalog = describe_scene(settings, directory=catalog_directory or scene.parent,
@@ -30,7 +32,7 @@ def observation_fields(scene, *, catalog_directory=None, settings=None, factorie
     # component.input is a structured view, not a fictitious tensor.
     for role, selection in selected_fields(settings).items():
         fields.pop(role + '.input', None)
-        if role != 'policy':
+        if 'control' in settings:  # a policy's layers (an older scene without one has a single 'policy' group)
             history = history_lengths(settings).get(role, {})
             for path in selection:
                 if path in fields:
@@ -45,11 +47,13 @@ def history_lengths(settings):
     return {role: dict(cfg.get('history') or {}) for role, cfg in components.items() if isinstance(cfg, dict)}
 
 
-def _contracts(settings):
+def _contracts(settings, world):
     """Return types of the project functions scene.yaml calls; unknown sizes stay None."""
     lines = ['\n\n']
     control = settings.get('control')
-    if control:
+    if control and control.get('layers') is True:
+        lines.append(_layer_contracts(control))
+    elif control:
         from .control import declared_dimension, joint_count
         for role in control['components']:
             shape = ['B', declared_dimension(control, role)]
@@ -62,14 +66,26 @@ def _contracts(settings):
             if role == 'executor':
                 note += '；解码前动作，initial 返回同形状'
             lines.append(f'{name}Output = Tensor  # {shape}, {note}\n')
-        outputs = control.get('output') or {}
-        # Always present, so policy.py still imports and check reports the empty control.output itself.
-        lines.append('\n\nclass ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致\n')
+    if control:
+        from .control import effective_outputs, joint_count
+        outputs = effective_outputs(control, world)
+        automatic = 'output' not in control
+        # Always present, so policy.py still imports and check reports the missing targets itself.
+        if control.get('layers') is True:
+            lines.append(f"\n\nclass Targets(TypedDict):  # decode_action(action, obs: {type_name(control['driver'])}Obs) 返回；"
+                         '实际单位，每台受控机器人一项\n')
+        else:
+            lines.append('\n\nclass ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，'
+                         + ('每台受控机器人一项\n' if automatic else '键与 control.output 一致\n'))
         if not outputs:
-            lines.append('    pass  # control.output 为空：没有控制目标，无法训练\n')
+            lines.append('    pass  # 没有受控机器人：无法训练\n')
         for key, output in outputs.items():
             if not key.isidentifier() or keyword.iskeyword(key):
                 raise ValueError(f'Cannot expose control output {key!r} as a Python key; rename it in the scene')
+            if automatic:
+                lines.append(f"    {key}: Tensor  # ['B', 关节数], {output['type']}, {key} 的全部关节，"
+                             f"顺序同 {key}.joint_position\n")
+                continue
             joints = list(output.get('joint_names', []))
             lines.append(f"    {key}: Tensor  # {['B', joint_count(output)]}, {output.get('type')}, "
                          f"{output.get('asset_name')}: {', '.join(joints)}\n")
@@ -88,6 +104,27 @@ def _contracts(settings):
     return ''.join(lines)
 
 
+def _layer_contracts(control):
+    """Return types of a ``policy:`` (layers): the trained layer's actions, fixed layers' results."""
+    lines = []
+    structure = control.get('structure') or {}
+    for role in control['components']:
+        name = type_name(role)
+        if role == control['train']:
+            note = (f"被训练层 {role} 的 forward 返回：动作 ['B', 动作个数]；个数就是模型最后一层的大小，"
+                    "构造参数写 actions 时得到受控关节总数（默认 decode 的情形）")
+            lines.append(f"Action = Tensor  # {note}\n")
+            if role == control['driver']:
+                lines.append("# initial_action(obs) 返回同形状的 Action（复位后第一步之前的动作，缺省为 0）\n")
+            continue
+        found = structure.get(role) or {}
+        if found.get('parts'):
+            lines.append(f"# {role} 的 forward 返回字典（{'、'.join(found['parts'])}），下一层读 obs.{role}.<名字>\n")
+        else:
+            lines.append(f"{name}Output = Tensor  # ['B', ...]，固定层 {role} 的 forward 返回；形状在第一步测得\n")
+    return ''.join(lines)
+
+
 def generate(scene, *, catalog_directory=None, settings=None, factories=None, terms=None,
              extra_fields=None, write=True):
     scene = Path(scene).resolve()
@@ -100,12 +137,13 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
         missing = set(paths) - fields.keys()
         if missing:
             raise ValueError(f'{role}: unavailable observation fields {sorted(missing)}')
-        groups[role.capitalize() + 'Obs' if role != 'policy' else 'Obs'] = paths
-        windows[role.capitalize() + 'Obs'] = history_lengths(settings).get(role, {})
+        root = type_name(role) + 'Obs' if 'control' in settings else 'Obs'
+        groups[root] = paths
+        windows[root] = history_lengths(settings).get(role, {})
     from .layout import world_spec_from_config
     from .robot import RobotView, robot_frames
-    robots = robot_frames(world_spec_from_config(settings, directory=catalog_directory or scene.parent,
-                                                 factories=factories))
+    world = world_spec_from_config(settings, directory=catalog_directory or scene.parent, factories=factories)
+    robots = robot_frames(world)
     methods = {name for name in vars(RobotView) if not name.startswith('_')}
     lines = [HEADER, 'from typing import TypedDict\n\nfrom torch import Tensor\nfrom shared.assembly.objects import ObjectView\n'
              'from shared.assembly.robot import RobotView\n\n']
@@ -155,9 +193,9 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
             lines.append('\n\n')
         emit(tree, root)
     if 'control' in settings:
-        lines.append(f"Obs = {settings['control']['train'].capitalize()}Obs\n")
+        lines.append(f"Obs = {type_name(settings['control']['train'])}Obs\n")
     lines.append('SCENE_FIELDS = ' + repr(tuple(groups['SceneInfo'])) + '\n')
-    lines.append(_contracts(settings))
+    lines.append(_contracts(settings, world))
     text = ''.join(lines)
     target = scene.parent / 'observation.py'
     if target.exists() and not target.read_text().startswith(HEADER):

@@ -42,7 +42,7 @@
 
 ## 观察历史窗口
 
-可选配置 `control.components.<角色>.history: {观察路径: T}`（整数 ≥2，键须是该组件已选观察）。
+可选配置 `policy.layers.<层>.history: {输入: T}`（整数 ≥2，键须是该层的输入；旧写法 `control.components.<角色>.history`）。
 未配置时行为与之前完全相同。
 
 - **位置**：窗口保存在共享 `ComponentInput`（`shared/assembly/history.py` 的 `HistoryWindow`），
@@ -57,8 +57,7 @@
 - **复位**：按环境清零并重新计数，不跨环境、不跨回合。被训练角色的窗口在一个决策步内只推进一次，
   重复计算观察不会多推。显式的部分复位只推进被复位的环境。终态快照会显示终止帧，但之后会恢复，
   不推进在线窗口。
-- **频率**：每个组件按自己的周期推进窗口。planner 窗口里的帧间隔是 planner 周期，executor 窗口里的
-  帧间隔是 executor 周期。决策之间的读取（如 `decode`）返回已存的窗口。
+- **频率**：每层按自己的周期推进窗口，窗口里的帧间隔就是该层的周期。决策之间的读取（如 `decode`）返回已存的窗口。
 - **离线数据**：`history_windows(frames, T, episode=, step=)` 复用同一个类。帧必须按该组件的决策
   频率记录，函数不做重采样。回合变化或步号不连续时重新开窗，绝不跨缺失步拼接。
 - **接口标识**：`history` 在场景 `control` 内，`project_signature` 会把它算进 `interface_sha256`。

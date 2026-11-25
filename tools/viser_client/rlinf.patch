@@ -1,0 +1,1433 @@
+diff -ruN a/src/App.tsx b/src/App.tsx
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -83,6 +83,9 @@
+ 
+ /** Gets default WebSocket server URL based on current window location. */
+ const getDefaultServerFromUrl = (): string => {
++  // RLinf: the editor serves this page beside viser and names viser's websocket.
++  const rlinf = (window as any).__RLINF_WS__;
++  if (typeof rlinf === "string") return rlinf;
+   let server = window.location.href;
+   server = server.replace("http://", "ws://");
+   server = server.replace("https://", "wss://");
+@@ -800,7 +803,7 @@
+       style={{ position: "relative", zIndex: 0, width: "100%", height: "100%" }}
+     >
+       <Canvas
+-        gl={{ preserveDrawingBuffer: true, reversedDepthBuffer: true }}
++        gl={{ preserveDrawingBuffer: true, reversedDepthBuffer: true, stencil: true }}
+         // `touchAction: none` opts the canvas out of native touch actions.
+         // Without it the browser can reinterpret a curved/multi-touch drag
+         // (e.g. dragging the orbit gizmo's rotation ring, especially on
+diff -ruN a/src/MessageHandler.tsx b/src/MessageHandler.tsx
+--- a/src/MessageHandler.tsx
++++ b/src/MessageHandler.tsx
+@@ -338,6 +338,8 @@
+       // at this (and only this) provably-complete point.
+       case "ReplayDoneMessage": {
+         viewer.guiActions.replayDone();
++        // RLinf: the editor page checks that the 3D view received the scene (a reconnect seen to replay nothing).
++        (window as any).__rlinfReplayDone = true;
+         return;
+       }
+       // Configure the theme.
+diff -ruN a/src/SceneTree.tsx b/src/SceneTree.tsx
+--- a/src/SceneTree.tsx
++++ b/src/SceneTree.tsx
+@@ -1,4 +1,6 @@
+-import { PivotControls } from "@react-three/drei";
++// RLinf: drei's PivotControls with Blender-like scale handles and axes when rotating (./rlinfPivot).
++import { PivotControls } from "./rlinfPivot/index.js";
++import { NodeNameContext } from "./rlinfSelection";
+ import { Grid } from "./Grid";
+ import { useContextBridge } from "its-fine";
+ import { useFrame, useThree } from "@react-three/fiber";
+@@ -452,6 +454,14 @@
+       // This variable persists in the closure created by makeObject,
+       // so we don't need useRef here.
+       let isDragging = false;
++      // RLinf: with arrows, planes and rings all off the gizmo scales: drei's handles at the axis ends,
++      // dragged in place. The factors go to the editor page (window.__rlinfScale), not to the pose.
++      const scaling =
++        message.props.disable_axes &&
++        message.props.disable_sliders &&
++        message.props.disable_rotations;
++      const rlinfScale = (factors: number[] | null, phase: string) =>
++        (window as any).__rlinfScale?.(factors, phase);
+       return {
+         makeObject: (ref, children) => (
+           <group onClick={(e) => e.stopPropagation()}>
+@@ -464,13 +474,18 @@
+               disableAxes={message.props.disable_axes}
+               disableSliders={message.props.disable_sliders}
+               disableRotations={message.props.disable_rotations}
+-              disableScaling={true}
++              disableScaling={!scaling}
++              autoTransform={!scaling}
+               translationLimits={message.props.translation_limits}
+               rotationLimits={message.props.rotation_limits}
+               depthTest={message.props.depth_test}
+               opacity={message.props.opacity}
+               onDragStart={() => {
+                 isDragging = true;
++                if (scaling) {
++                  rlinfScale(null, "start");
++                  return;
++                }
+                 viewer.mutable.current.sendMessage({
+                   type: "TransformControlsDragStartMessage",
+                   name: message.name,
+@@ -478,6 +493,10 @@
+                 });
+               }}
+               onDrag={(l) => {
++                if (scaling) {
++                  rlinfScale(new THREE.Vector3().setFromMatrixScale(l).toArray(), "update");
++                  return;
++                }
+                 const wxyz = new THREE.Quaternion();
+                 wxyz.setFromRotationMatrix(l);
+                 const position = new THREE.Vector3().setFromMatrixPosition(l);
+@@ -519,7 +538,10 @@
+                 });
+               }}
+               onDragEnd={() => {
+-                if (isDragging) {
++                if (isDragging && scaling) {
++                  isDragging = false;
++                  rlinfScale(null, "end");
++                } else if (isDragging) {
+                   isDragging = false;
+                   flushDragMessage();
+                   viewer.mutable.current.sendMessage({
+@@ -1280,7 +1302,7 @@
+           }
+         >
+           <HoverableContext.Provider value={{ state: hoveredRef, clickable }}>
+-            {objNode}
++            <NodeNameContext.Provider value={props.name}>{objNode}</NodeNameContext.Provider>
+           </HoverableContext.Provider>
+         </group>
+       </>
+diff -ruN a/src/mesh/BasicMesh.tsx b/src/mesh/BasicMesh.tsx
+--- a/src/mesh/BasicMesh.tsx
++++ b/src/mesh/BasicMesh.tsx
+@@ -3,6 +3,7 @@
+ import { ViserStandardMeshMaterial, ShadowMesh } from "./MeshUtils";
+ import { MeshMessage } from "../WebsocketMessages";
+ import { OutlinesIfHovered } from "../OutlinesIfHovered";
++import { SelectionOutline } from "../rlinfSelection";
+ import { normalizeScale } from "../utils/normalizeScale";
+ import { syncBufferGeometry } from "../utils/bufferGeometrySync";
+ 
+@@ -65,6 +66,7 @@
+         receiveShadow={message.props.receive_shadow === true}
+       >
+         <ViserStandardMeshMaterial {...message.props} />
++        <SelectionOutline />
+         <OutlinesIfHovered
+           enableCreaseAngle={
+             geometry.attributes.position.count < 1024 &&
+diff -ruN a/src/mesh/BoxMesh.tsx b/src/mesh/BoxMesh.tsx
+--- a/src/mesh/BoxMesh.tsx
++++ b/src/mesh/BoxMesh.tsx
+@@ -3,6 +3,7 @@
+ import { ViserStandardMeshMaterial, ShadowMesh } from "./MeshUtils";
+ import { BoxMessage } from "../WebsocketMessages";
+ import { OutlinesIfHovered } from "../OutlinesIfHovered";
++import { SelectionOutline } from "../rlinfSelection";
+ import { normalizeScale } from "../utils/normalizeScale";
+ 
+ let boxGeometry: THREE.BoxGeometry | null = null;
+@@ -45,6 +46,7 @@
+         receiveShadow={message.props.receive_shadow === true}
+       >
+         <ViserStandardMeshMaterial {...message.props} />
++        <SelectionOutline />
+         <OutlinesIfHovered enableCreaseAngle />
+       </mesh>
+       <ShadowMesh
+diff -ruN a/src/mesh/CylinderMesh.tsx b/src/mesh/CylinderMesh.tsx
+--- a/src/mesh/CylinderMesh.tsx
++++ b/src/mesh/CylinderMesh.tsx
+@@ -3,6 +3,7 @@
+ import { ViserStandardMeshMaterial, ShadowMesh } from "./MeshUtils";
+ import { CylinderMessage } from "../WebsocketMessages";
+ import { OutlinesIfHovered } from "../OutlinesIfHovered";
++import { SelectionOutline } from "../rlinfSelection";
+ import { normalizeScale } from "../utils/normalizeScale";
+ 
+ // Cache cylinder geometries based on # of radial segments.
+@@ -58,6 +59,7 @@
+         receiveShadow={message.props.receive_shadow === true}
+       >
+         <ViserStandardMeshMaterial {...message.props} />
++        <SelectionOutline />
+         <OutlinesIfHovered enableCreaseAngle />
+       </mesh>
+       <ShadowMesh
+diff -ruN a/src/mesh/IcosphereMesh.tsx b/src/mesh/IcosphereMesh.tsx
+--- a/src/mesh/IcosphereMesh.tsx
++++ b/src/mesh/IcosphereMesh.tsx
+@@ -3,6 +3,7 @@
+ import { ViserStandardMeshMaterial, ShadowMesh } from "./MeshUtils";
+ import { IcosphereMessage } from "../WebsocketMessages";
+ import { OutlinesIfHovered } from "../OutlinesIfHovered";
++import { SelectionOutline } from "../rlinfSelection";
+ import { normalizeScale } from "../utils/normalizeScale";
+ 
+ // Cache icosphere geometries based on # of subdivisions. In theory this cache
+@@ -54,6 +55,7 @@
+         receiveShadow={message.props.receive_shadow === true}
+       >
+         <ViserStandardMeshMaterial {...message.props} />
++        <SelectionOutline />
+         <OutlinesIfHovered />
+       </mesh>
+       <ShadowMesh opacity={shadowOpacity} geometry={geometry} scale={scale} />
+diff -ruN a/src/mesh/SingleGlbAsset.tsx b/src/mesh/SingleGlbAsset.tsx
+--- a/src/mesh/SingleGlbAsset.tsx
++++ b/src/mesh/SingleGlbAsset.tsx
+@@ -7,6 +7,7 @@
+ import { ViewerContext } from "../ViewerContext";
+ import { OutlinesMaterial } from "../OutlinesMaterial";
+ import { normalizeScale } from "../utils/normalizeScale";
++import { SelectionOutlineGroup } from "../rlinfSelection";
+ 
+ /**
+  * Component for rendering a single GLB model
+@@ -129,6 +130,7 @@
+           ))}
+         </group>
+       ) : null}
++      <SelectionOutlineGroup meshes={meshes} matrices={meshMatrices} scale={normalizeScale(message.props.scale)} />
+       {children}
+     </group>
+   );
+diff -ruN a/src/rlinfPivot/AxisArrow.js b/src/rlinfPivot/AxisArrow.js
+--- a/src/rlinfPivot/AxisArrow.js
++++ b/src/rlinfPivot/AxisArrow.js
+@@ -0,0 +1,193 @@
++import * as React from 'react';
++import * as THREE from 'three';
++import { useThree } from '@react-three/fiber';
++import { Line } from '@react-three/drei';
++import { Html } from '@react-three/drei';
++import { context } from './context.js';
++
++const vec1 = /* @__PURE__ */new THREE.Vector3();
++const vec2 = /* @__PURE__ */new THREE.Vector3();
++const calculateOffset = (clickPoint, normal, rayStart, rayDir) => {
++  const e1 = normal.dot(normal);
++  const e2 = normal.dot(clickPoint) - normal.dot(rayStart);
++  const e3 = normal.dot(rayDir);
++  if (e3 === 0) {
++    return -e2 / e1;
++  }
++  vec1.copy(rayDir).multiplyScalar(e1 / e3).sub(normal);
++  vec2.copy(rayDir).multiplyScalar(e2 / e3).add(rayStart).sub(clickPoint);
++  const offset = -vec1.dot(vec2) / vec1.dot(vec1);
++  return offset;
++};
++const upV = /* @__PURE__ */new THREE.Vector3(0, 1, 0);
++const offsetMatrix = /* @__PURE__ */new THREE.Matrix4();
++const AxisArrow = ({
++  direction,
++  axis
++}) => {
++  const {
++    translation,
++    translationLimits,
++    annotations,
++    annotationsClass,
++    depthTest,
++    scale,
++    lineWidth,
++    fixed,
++    axisColors,
++    hoveredColor,
++    opacity,
++    renderOrder,
++    onDragStart,
++    onDrag,
++    onDragEnd,
++    userData
++  } = React.useContext(context);
++  const camControls = useThree(state => state.controls);
++  const divRef = React.useRef(null);
++  const objRef = React.useRef(null);
++  const clickInfo = React.useRef(null);
++  const offset0 = React.useRef(0);
++  const [isHovered, setIsHovered] = React.useState(false);
++  const onPointerDown = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.innerText = `${translation.current[axis].toFixed(2)}`;
++      divRef.current.style.display = 'block';
++    }
++    e.stopPropagation();
++    const rotation = new THREE.Matrix4().extractRotation(objRef.current.matrixWorld);
++    const clickPoint = e.point.clone();
++    const origin = new THREE.Vector3().setFromMatrixPosition(objRef.current.matrixWorld);
++    const dir = direction.clone().applyMatrix4(rotation).normalize();
++    clickInfo.current = {
++      clickPoint,
++      dir
++    };
++    offset0.current = translation.current[axis];
++    onDragStart({
++      component: 'Arrow',
++      axis,
++      origin,
++      directions: [dir]
++    });
++    camControls && (camControls.enabled = false);
++    // @ts-ignore - setPointerCapture is not in the type definition
++    e.target.setPointerCapture(e.pointerId);
++  }, [annotations, direction, camControls, onDragStart, translation, axis]);
++  const onPointerMove = React.useCallback(e => {
++    e.stopPropagation();
++    if (!isHovered) setIsHovered(true);
++    if (clickInfo.current) {
++      const {
++        clickPoint,
++        dir
++      } = clickInfo.current;
++      const [min, max] = (translationLimits == null ? void 0 : translationLimits[axis]) || [undefined, undefined];
++      let offset = calculateOffset(clickPoint, dir, e.ray.origin, e.ray.direction);
++      if (min !== undefined) {
++        offset = Math.max(offset, min - offset0.current);
++      }
++      if (max !== undefined) {
++        offset = Math.min(offset, max - offset0.current);
++      }
++      translation.current[axis] = offset0.current + offset;
++      if (annotations) {
++        divRef.current.innerText = `${translation.current[axis].toFixed(2)}`;
++      }
++      offsetMatrix.makeTranslation(dir.x * offset, dir.y * offset, dir.z * offset);
++      onDrag(offsetMatrix);
++    }
++  }, [annotations, onDrag, isHovered, translation, translationLimits, axis]);
++  const onPointerUp = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.style.display = 'none';
++    }
++    e.stopPropagation();
++    clickInfo.current = null;
++    onDragEnd();
++    camControls && (camControls.enabled = true);
++    // @ts-ignore - releasePointerCapture & PointerEvent#pointerId is not in the type definition
++    e.target.releasePointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragEnd]);
++  const onPointerOut = React.useCallback(e => {
++    e.stopPropagation();
++    setIsHovered(false);
++  }, []);
++  const {
++    cylinderLength,
++    coneWidth,
++    coneLength,
++    matrixL
++  } = React.useMemo(() => {
++    const coneWidth = fixed ? lineWidth / scale * 1.6 : scale / 20;
++    const coneLength = fixed ? 0.2 : scale / 5;
++    const cylinderLength = fixed ? 1 - coneLength : scale - coneLength;
++    const quaternion = new THREE.Quaternion().setFromUnitVectors(upV, direction.clone().normalize());
++    const matrixL = new THREE.Matrix4().makeRotationFromQuaternion(quaternion);
++    return {
++      cylinderLength,
++      coneWidth,
++      coneLength,
++      matrixL
++    };
++  }, [direction, scale, lineWidth, fixed]);
++  const color_ = isHovered ? hoveredColor : axisColors[axis];
++  return /*#__PURE__*/React.createElement("group", {
++    ref: objRef
++  }, /*#__PURE__*/React.createElement("group", {
++    matrix: matrixL,
++    matrixAutoUpdate: false,
++    onPointerDown: onPointerDown,
++    onPointerMove: onPointerMove,
++    onPointerUp: onPointerUp,
++    onPointerOut: onPointerOut
++  }, annotations && /*#__PURE__*/React.createElement(Html, {
++    position: [0, -coneLength, 0]
++  }, /*#__PURE__*/React.createElement("div", {
++    style: {
++      display: 'none',
++      background: '#151520',
++      color: 'white',
++      padding: '6px 8px',
++      borderRadius: 7,
++      whiteSpace: 'nowrap'
++    },
++    className: annotationsClass,
++    ref: divRef
++  })), /*#__PURE__*/React.createElement("mesh", {
++    visible: false,
++    position: [0, (cylinderLength + coneLength) / 2.0, 0],
++    userData: userData
++  }, /*#__PURE__*/React.createElement("cylinderGeometry", {
++    args: [coneWidth * 1.4, coneWidth * 1.4, cylinderLength + coneLength, 8, 1]
++  })), /*#__PURE__*/React.createElement(Line, {
++    transparent: true,
++    raycast: () => null,
++    depthTest: depthTest,
++    points: [0, 0, 0, 0, cylinderLength, 0],
++    lineWidth: lineWidth,
++    side: THREE.DoubleSide,
++    color: color_,
++    opacity: opacity,
++    polygonOffset: true,
++    renderOrder: renderOrder,
++    polygonOffsetFactor: -10,
++    fog: false
++  }), /*#__PURE__*/React.createElement("mesh", {
++    raycast: () => null,
++    position: [0, cylinderLength + coneLength / 2.0, 0],
++    renderOrder: renderOrder
++  }, /*#__PURE__*/React.createElement("coneGeometry", {
++    args: [coneWidth, coneLength, 24, 1]
++  }), /*#__PURE__*/React.createElement("meshBasicMaterial", {
++    transparent: true,
++    depthTest: depthTest,
++    color: color_,
++    opacity: opacity,
++    polygonOffset: true,
++    polygonOffsetFactor: -10,
++    fog: false
++  }))));
++};
++
++export { AxisArrow, calculateOffset };
+diff -ruN a/src/rlinfPivot/AxisRotator.js b/src/rlinfPivot/AxisRotator.js
+--- a/src/rlinfPivot/AxisRotator.js
++++ b/src/rlinfPivot/AxisRotator.js
+@@ -0,0 +1,220 @@
++import * as React from 'react';
++import * as THREE from 'three';
++import { useThree } from '@react-three/fiber';
++import { Line } from '@react-three/drei';
++import { Html } from '@react-three/drei';
++import { context } from './context.js';
++
++const clickDir = /* @__PURE__ */new THREE.Vector3();
++const intersectionDir = /* @__PURE__ */new THREE.Vector3();
++const toDegrees = radians => radians * 180 / Math.PI;
++const toRadians = degrees => degrees * Math.PI / 180;
++const calculateAngle = (clickPoint, intersectionPoint, origin, e1, e2) => {
++  clickDir.copy(clickPoint).sub(origin);
++  intersectionDir.copy(intersectionPoint).sub(origin);
++  const dote1e1 = e1.dot(e1);
++  const dote2e2 = e2.dot(e2);
++  const uClick = clickDir.dot(e1) / dote1e1;
++  const vClick = clickDir.dot(e2) / dote2e2;
++  const uIntersection = intersectionDir.dot(e1) / dote1e1;
++  const vIntersection = intersectionDir.dot(e2) / dote2e2;
++  const angleClick = Math.atan2(vClick, uClick);
++  const angleIntersection = Math.atan2(vIntersection, uIntersection);
++  return angleIntersection - angleClick;
++};
++const fmod = (num, denom) => {
++  let k = Math.floor(num / denom);
++  k = k < 0 ? k + 1 : k;
++  return num - k * denom;
++};
++const minimizeAngle = angle => {
++  let result = fmod(angle, 2 * Math.PI);
++  if (Math.abs(result) < 1e-6) {
++    return 0.0;
++  }
++  if (result < 0.0) {
++    result += 2 * Math.PI;
++  }
++  return result;
++};
++const rotMatrix = /* @__PURE__ */new THREE.Matrix4();
++const posNew = /* @__PURE__ */new THREE.Vector3();
++const ray = /* @__PURE__ */new THREE.Ray();
++const intersection = /* @__PURE__ */new THREE.Vector3();
++const AxisRotator = ({
++  dir1,
++  dir2,
++  axis
++}) => {
++  const {
++    rotationLimits,
++    annotations,
++    annotationsClass,
++    depthTest,
++    scale,
++    lineWidth,
++    fixed,
++    axisColors,
++    hoveredColor,
++    renderOrder,
++    opacity,
++    onDragStart,
++    onDrag,
++    onDragEnd,
++    userData
++  } = React.useContext(context);
++  const camControls = useThree(state => state.controls);
++  const divRef = React.useRef(null);
++  const objRef = React.useRef(null);
++  const angle0 = React.useRef(0);
++  const angle = React.useRef(0);
++  const clickInfo = React.useRef(null);
++  const [isHovered, setIsHovered] = React.useState(false);
++  const onPointerDown = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.innerText = `${toDegrees(angle.current).toFixed(0)}º`;
++      divRef.current.style.display = 'block';
++    }
++    e.stopPropagation();
++    const clickPoint = e.point.clone();
++    const origin = new THREE.Vector3().setFromMatrixPosition(objRef.current.matrixWorld);
++    const e1 = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 0).normalize();
++    const e2 = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 1).normalize();
++    const normal = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 2).normalize();
++    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, origin);
++    clickInfo.current = {
++      clickPoint,
++      origin,
++      e1,
++      e2,
++      normal,
++      plane
++    };
++    onDragStart({
++      component: 'Rotator',
++      axis,
++      origin,
++      directions: [e1, e2, normal]
++    });
++    camControls && (camControls.enabled = false);
++    // @ts-ignore
++    e.target.setPointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragStart, axis]);
++  const onPointerMove = React.useCallback(e => {
++    e.stopPropagation();
++    if (!isHovered) setIsHovered(true);
++    if (clickInfo.current) {
++      const {
++        clickPoint,
++        origin,
++        e1,
++        e2,
++        normal,
++        plane
++      } = clickInfo.current;
++      const [min, max] = (rotationLimits == null ? void 0 : rotationLimits[axis]) || [undefined, undefined];
++      ray.copy(e.ray);
++      ray.intersectPlane(plane, intersection);
++      ray.direction.negate();
++      ray.intersectPlane(plane, intersection);
++      let deltaAngle = calculateAngle(clickPoint, intersection, origin, e1, e2);
++      let degrees = toDegrees(deltaAngle);
++
++      // @ts-ignore
++      if (e.shiftKey) {
++        degrees = Math.round(degrees / 10) * 10;
++        deltaAngle = toRadians(degrees);
++      }
++      if (min !== undefined && max !== undefined && max - min < 2 * Math.PI) {
++        deltaAngle = minimizeAngle(deltaAngle);
++        deltaAngle = deltaAngle > Math.PI ? deltaAngle - 2 * Math.PI : deltaAngle;
++        deltaAngle = THREE.MathUtils.clamp(deltaAngle, min - angle0.current, max - angle0.current);
++        angle.current = angle0.current + deltaAngle;
++      } else {
++        angle.current = minimizeAngle(angle0.current + deltaAngle);
++        angle.current = angle.current > Math.PI ? angle.current - 2 * Math.PI : angle.current;
++      }
++      if (annotations) {
++        degrees = toDegrees(angle.current);
++        divRef.current.innerText = `${degrees.toFixed(0)}º`;
++      }
++      rotMatrix.makeRotationAxis(normal, deltaAngle);
++      posNew.copy(origin).applyMatrix4(rotMatrix).sub(origin).negate();
++      rotMatrix.setPosition(posNew);
++      onDrag(rotMatrix);
++    }
++  }, [annotations, onDrag, isHovered, rotationLimits, axis]);
++  const onPointerUp = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.style.display = 'none';
++    }
++    e.stopPropagation();
++    angle0.current = angle.current;
++    clickInfo.current = null;
++    onDragEnd();
++    camControls && (camControls.enabled = true);
++    // @ts-ignore
++    e.target.releasePointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragEnd]);
++  const onPointerOut = React.useCallback(e => {
++    e.stopPropagation();
++    setIsHovered(false);
++  }, []);
++  const matrixL = React.useMemo(() => {
++    const dir1N = dir1.clone().normalize();
++    const dir2N = dir2.clone().normalize();
++    return new THREE.Matrix4().makeBasis(dir1N, dir2N, dir1N.clone().cross(dir2N));
++  }, [dir1, dir2]);
++  const r = fixed ? 0.65 : scale * 0.65;
++  const arc = React.useMemo(() => {
++    const segments = 32;
++    const points = [];
++    for (let j = 0; j <= segments; j++) {
++      const angle = j * (Math.PI / 2) / segments;
++      points.push(new THREE.Vector3(Math.cos(angle) * r, Math.sin(angle) * r, 0));
++    }
++    return points;
++  }, [r]);
++  return /*#__PURE__*/React.createElement("group", {
++    ref: objRef,
++    onPointerDown: onPointerDown,
++    onPointerMove: onPointerMove,
++    onPointerUp: onPointerUp,
++    onPointerOut: onPointerOut,
++    matrix: matrixL,
++    matrixAutoUpdate: false
++  }, annotations && /*#__PURE__*/React.createElement(Html, {
++    position: [r, r, 0]
++  }, /*#__PURE__*/React.createElement("div", {
++    style: {
++      display: 'none',
++      background: '#151520',
++      color: 'white',
++      padding: '6px 8px',
++      borderRadius: 7,
++      whiteSpace: 'nowrap'
++    },
++    className: annotationsClass,
++    ref: divRef
++  })), /*#__PURE__*/React.createElement(Line, {
++    points: arc,
++    lineWidth: lineWidth * 4,
++    visible: false,
++    userData: userData
++  }), /*#__PURE__*/React.createElement(Line, {
++    transparent: true,
++    raycast: () => null,
++    depthTest: depthTest,
++    points: arc,
++    lineWidth: lineWidth,
++    side: THREE.DoubleSide,
++    color: isHovered ? hoveredColor : axisColors[axis],
++    opacity: opacity,
++    polygonOffset: true,
++    polygonOffsetFactor: -10,
++    renderOrder: renderOrder,
++    fog: false
++  }));
++};
++
++export { AxisRotator };
+diff -ruN a/src/rlinfPivot/PlaneSlider.js b/src/rlinfPivot/PlaneSlider.js
+--- a/src/rlinfPivot/PlaneSlider.js
++++ b/src/rlinfPivot/PlaneSlider.js
+@@ -0,0 +1,202 @@
++import * as React from 'react';
++import * as THREE from 'three';
++import { useThree } from '@react-three/fiber';
++import { Line } from '@react-three/drei';
++import { Html } from '@react-three/drei';
++import { context } from './context.js';
++
++const decomposeIntoBasis = (e1, e2, offset) => {
++  const i1 = Math.abs(e1.x) >= Math.abs(e1.y) && Math.abs(e1.x) >= Math.abs(e1.z) ? 0 : Math.abs(e1.y) >= Math.abs(e1.x) && Math.abs(e1.y) >= Math.abs(e1.z) ? 1 : 2;
++  const e2DegrowthOrder = [0, 1, 2].sort((a, b) => Math.abs(e2.getComponent(b)) - Math.abs(e2.getComponent(a)));
++  const i2 = i1 === e2DegrowthOrder[0] ? e2DegrowthOrder[1] : e2DegrowthOrder[0];
++  const a1 = e1.getComponent(i1);
++  const a2 = e1.getComponent(i2);
++  const b1 = e2.getComponent(i1);
++  const b2 = e2.getComponent(i2);
++  const c1 = offset.getComponent(i1);
++  const c2 = offset.getComponent(i2);
++  const y = (c2 - c1 * (a2 / a1)) / (b2 - b1 * (a2 / a1));
++  const x = (c1 - y * b1) / a1;
++  return [x, y];
++};
++const ray = /* @__PURE__ */new THREE.Ray();
++const intersection = /* @__PURE__ */new THREE.Vector3();
++const offsetMatrix = /* @__PURE__ */new THREE.Matrix4();
++const PlaneSlider = ({
++  dir1,
++  dir2,
++  axis
++}) => {
++  const {
++    translation,
++    translationLimits,
++    annotations,
++    annotationsClass,
++    depthTest,
++    scale,
++    lineWidth,
++    fixed,
++    axisColors,
++    hoveredColor,
++    opacity,
++    renderOrder,
++    onDragStart,
++    onDrag,
++    onDragEnd,
++    userData
++  } = React.useContext(context);
++  const camControls = useThree(state => state.controls);
++  const divRef = React.useRef(null);
++  const objRef = React.useRef(null);
++  const clickInfo = React.useRef(null);
++  const offsetX0 = React.useRef(0);
++  const offsetY0 = React.useRef(0);
++  const [isHovered, setIsHovered] = React.useState(false);
++  const onPointerDown = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.innerText = `${translation.current[(axis + 1) % 3].toFixed(2)}, ${translation.current[(axis + 2) % 3].toFixed(2)}`;
++      divRef.current.style.display = 'block';
++    }
++    e.stopPropagation();
++    const clickPoint = e.point.clone();
++    const origin = new THREE.Vector3().setFromMatrixPosition(objRef.current.matrixWorld);
++    const e1 = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 0).normalize();
++    const e2 = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 1).normalize();
++    const normal = new THREE.Vector3().setFromMatrixColumn(objRef.current.matrixWorld, 2).normalize();
++    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, origin);
++    clickInfo.current = {
++      clickPoint,
++      e1,
++      e2,
++      plane
++    };
++    offsetX0.current = translation.current[(axis + 1) % 3];
++    offsetY0.current = translation.current[(axis + 2) % 3];
++    onDragStart({
++      component: 'Slider',
++      axis,
++      origin,
++      directions: [e1, e2, normal]
++    });
++    camControls && (camControls.enabled = false);
++    // @ts-ignore
++    e.target.setPointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragStart, axis]);
++  const onPointerMove = React.useCallback(e => {
++    e.stopPropagation();
++    if (!isHovered) setIsHovered(true);
++    if (clickInfo.current) {
++      const {
++        clickPoint,
++        e1,
++        e2,
++        plane
++      } = clickInfo.current;
++      const [minX, maxX] = (translationLimits == null ? void 0 : translationLimits[(axis + 1) % 3]) || [undefined, undefined];
++      const [minY, maxY] = (translationLimits == null ? void 0 : translationLimits[(axis + 2) % 3]) || [undefined, undefined];
++      ray.copy(e.ray);
++      ray.intersectPlane(plane, intersection);
++      ray.direction.negate();
++      ray.intersectPlane(plane, intersection);
++      intersection.sub(clickPoint);
++      let [offsetX, offsetY] = decomposeIntoBasis(e1, e2, intersection);
++      /* let offsetY = (intersection.y - (intersection.x * e1.y) / e1.x) / (e2.y - (e2.x * e1.y) / e1.x)
++      let offsetX = (intersection.x - offsetY * e2.x) / e1.x */
++      if (minX !== undefined) {
++        offsetX = Math.max(offsetX, minX - offsetX0.current);
++      }
++      if (maxX !== undefined) {
++        offsetX = Math.min(offsetX, maxX - offsetX0.current);
++      }
++      if (minY !== undefined) {
++        offsetY = Math.max(offsetY, minY - offsetY0.current);
++      }
++      if (maxY !== undefined) {
++        offsetY = Math.min(offsetY, maxY - offsetY0.current);
++      }
++      translation.current[(axis + 1) % 3] = offsetX0.current + offsetX;
++      translation.current[(axis + 2) % 3] = offsetY0.current + offsetY;
++      if (annotations) {
++        divRef.current.innerText = `${translation.current[(axis + 1) % 3].toFixed(2)}, ${translation.current[(axis + 2) % 3].toFixed(2)}`;
++      }
++      offsetMatrix.makeTranslation(offsetX * e1.x + offsetY * e2.x, offsetX * e1.y + offsetY * e2.y, offsetX * e1.z + offsetY * e2.z);
++      onDrag(offsetMatrix);
++    }
++  }, [annotations, onDrag, isHovered, translation, translationLimits, axis]);
++  const onPointerUp = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.style.display = 'none';
++    }
++    e.stopPropagation();
++    clickInfo.current = null;
++    onDragEnd();
++    camControls && (camControls.enabled = true);
++    // @ts-ignore
++    e.target.releasePointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragEnd]);
++  const onPointerOut = React.useCallback(e => {
++    e.stopPropagation();
++    setIsHovered(false);
++  }, []);
++  const matrixL = React.useMemo(() => {
++    const dir1N = dir1.clone().normalize();
++    const dir2N = dir2.clone().normalize();
++    return new THREE.Matrix4().makeBasis(dir1N, dir2N, dir1N.clone().cross(dir2N));
++  }, [dir1, dir2]);
++  const pos1 = fixed ? 1 / 7 : scale / 7;
++  const length = fixed ? 0.225 : scale * 0.225;
++  const color = isHovered ? hoveredColor : axisColors[axis];
++  const points = React.useMemo(() => [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, length, 0), new THREE.Vector3(length, length, 0), new THREE.Vector3(length, 0, 0), new THREE.Vector3(0, 0, 0)], [length]);
++  return /*#__PURE__*/React.createElement("group", {
++    ref: objRef,
++    matrix: matrixL,
++    matrixAutoUpdate: false
++  }, annotations && /*#__PURE__*/React.createElement(Html, {
++    position: [0, 0, 0]
++  }, /*#__PURE__*/React.createElement("div", {
++    style: {
++      display: 'none',
++      background: '#151520',
++      color: 'white',
++      padding: '6px 8px',
++      borderRadius: 7,
++      whiteSpace: 'nowrap'
++    },
++    className: annotationsClass,
++    ref: divRef
++  })), /*#__PURE__*/React.createElement("group", {
++    position: [pos1 * 1.7, pos1 * 1.7, 0]
++  }, /*#__PURE__*/React.createElement("mesh", {
++    visible: true,
++    onPointerDown: onPointerDown,
++    onPointerMove: onPointerMove,
++    onPointerUp: onPointerUp,
++    onPointerOut: onPointerOut,
++    scale: length,
++    userData: userData,
++    renderOrder: renderOrder
++  }, /*#__PURE__*/React.createElement("planeGeometry", null), /*#__PURE__*/React.createElement("meshBasicMaterial", {
++    transparent: true,
++    depthTest: depthTest,
++    color: color,
++    polygonOffset: true,
++    polygonOffsetFactor: -10,
++    side: THREE.DoubleSide,
++    fog: false
++  })), /*#__PURE__*/React.createElement(Line, {
++    position: [-length / 2, -length / 2, 0],
++    transparent: true,
++    depthTest: depthTest,
++    points: points,
++    lineWidth: lineWidth,
++    color: color,
++    opacity: opacity,
++    polygonOffset: true,
++    polygonOffsetFactor: -10,
++    userData: userData,
++    fog: false,
++    renderOrder: renderOrder
++  })));
++};
++
++export { PlaneSlider };
+diff -ruN a/src/rlinfPivot/ScalingSphere.js b/src/rlinfPivot/ScalingSphere.js
+--- a/src/rlinfPivot/ScalingSphere.js
++++ b/src/rlinfPivot/ScalingSphere.js
+@@ -0,0 +1,207 @@
++// RLinf: drei's PivotControls (MIT, @react-three/drei 10.7.8, web/pivotControls), vendored to draw the scale
++// handles as Blender does: a cube at the end of a line along each axis, and the axes beside the rotation arcs.
++import * as React from 'react';
++import * as THREE from 'three';
++import { useThree } from '@react-three/fiber';
++import { Html, Line } from '@react-three/drei';
++import { context } from './context.js';
++import { calculateScaleFactor } from '@react-three/drei';
++
++const vec1 = /* @__PURE__ */new THREE.Vector3();
++const vec2 = /* @__PURE__ */new THREE.Vector3();
++const calculateOffset = (clickPoint, normal, rayStart, rayDir) => {
++  const e1 = normal.dot(normal);
++  const e2 = normal.dot(clickPoint) - normal.dot(rayStart);
++  const e3 = normal.dot(rayDir);
++  if (e3 === 0) {
++    return -e2 / e1;
++  }
++  vec1.copy(rayDir).multiplyScalar(e1 / e3).sub(normal);
++  vec2.copy(rayDir).multiplyScalar(e2 / e3).add(rayStart).sub(clickPoint);
++  const offset = -vec1.dot(vec2) / vec1.dot(vec1);
++  return offset;
++};
++const upV = /* @__PURE__ */new THREE.Vector3(0, 1, 0);
++const scaleV = /* @__PURE__ */new THREE.Vector3();
++const scaleMatrix = /* @__PURE__ */new THREE.Matrix4();
++const ScalingSphere = ({
++  direction,
++  axis
++}) => {
++  const {
++    scaleLimits,
++    annotations,
++    annotationsClass,
++    depthTest,
++    scale,
++    lineWidth,
++    fixed,
++    axisColors,
++    hoveredColor,
++    opacity,
++    renderOrder,
++    onDragStart,
++    onDrag,
++    onDragEnd,
++    userData
++  } = React.useContext(context);
++  const size = useThree(state => state.size);
++  const camControls = useThree(state => state.controls);
++  const divRef = React.useRef(null);
++  const objRef = React.useRef(null);
++  const meshRef = React.useRef(null);
++  const scale0 = React.useRef(1);
++  const scaleCur = React.useRef(1);
++  const clickInfo = React.useRef(null);
++  const [isHovered, setIsHovered] = React.useState(false);
++  const position = fixed ? 1.2 : 1.2 * scale;
++  const onPointerDown = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.innerText = `${scaleCur.current.toFixed(2)}`;
++      divRef.current.style.display = 'block';
++    }
++    e.stopPropagation();
++    const rotation = new THREE.Matrix4().extractRotation(objRef.current.matrixWorld);
++    const clickPoint = e.point.clone();
++    const origin = new THREE.Vector3().setFromMatrixPosition(objRef.current.matrixWorld);
++    const dir = direction.clone().applyMatrix4(rotation).normalize();
++    const mPLG = objRef.current.matrixWorld.clone();
++    const mPLGInv = mPLG.clone().invert();
++    const offsetMultiplier = fixed ? 1 / calculateScaleFactor(objRef.current.getWorldPosition(vec1), scale, e.camera, size) : 1;
++    clickInfo.current = {
++      clickPoint,
++      dir,
++      mPLG,
++      mPLGInv,
++      offsetMultiplier
++    };
++    onDragStart({
++      component: 'Sphere',
++      axis,
++      origin,
++      directions: [dir]
++    });
++    camControls && (camControls.enabled = false);
++    // @ts-ignore - setPointerCapture is not in the type definition
++    e.target.setPointerCapture(e.pointerId);
++  }, [annotations, camControls, direction, onDragStart, axis, fixed, scale, size]);
++  const onPointerMove = React.useCallback(e => {
++    e.stopPropagation();
++    if (!isHovered) setIsHovered(true);
++    if (clickInfo.current) {
++      const {
++        clickPoint,
++        dir,
++        mPLG,
++        mPLGInv,
++        offsetMultiplier
++      } = clickInfo.current;
++      const [min, max] = (scaleLimits == null ? void 0 : scaleLimits[axis]) || [1e-5, undefined]; // always limit the minimal value, since setting it very low might break the transform
++
++      const offsetW = calculateOffset(clickPoint, dir, e.ray.origin, e.ray.direction);
++      const offsetL = offsetW * offsetMultiplier;
++      const offsetH = fixed ? offsetL : offsetL / scale;
++      let upscale = Math.pow(2, offsetH * 0.2);
++
++      // @ts-ignore
++      if (e.shiftKey) {
++        upscale = Math.round(upscale * 10) / 10;
++      }
++      upscale = Math.max(upscale, min / scale0.current);
++      if (max !== undefined) {
++        upscale = Math.min(upscale, max / scale0.current);
++      }
++      scaleCur.current = scale0.current * upscale;
++      meshRef.current.position.set(0, position + offsetL, 0);
++      if (annotations) {
++        divRef.current.innerText = `${scaleCur.current.toFixed(2)}`;
++      }
++      scaleV.set(1, 1, 1);
++      scaleV.setComponent(axis, upscale);
++      scaleMatrix.makeScale(scaleV.x, scaleV.y, scaleV.z).premultiply(mPLG).multiply(mPLGInv);
++      onDrag(scaleMatrix);
++    }
++  }, [annotations, position, onDrag, isHovered, scaleLimits, axis]);
++  const onPointerUp = React.useCallback(e => {
++    if (annotations) {
++      divRef.current.style.display = 'none';
++    }
++    e.stopPropagation();
++    scale0.current = scaleCur.current;
++    clickInfo.current = null;
++    meshRef.current.position.set(0, position, 0);
++    onDragEnd();
++    camControls && (camControls.enabled = true);
++    // @ts-ignore - releasePointerCapture & PointerEvent#pointerId is not in the type definition
++    e.target.releasePointerCapture(e.pointerId);
++  }, [annotations, camControls, onDragEnd, position]);
++  const onPointerOut = React.useCallback(e => {
++    e.stopPropagation();
++    setIsHovered(false);
++  }, []);
++  const {
++    radius,
++    matrixL
++  } = React.useMemo(() => {
++    const radius = fixed ? lineWidth / scale * 1.8 : scale / 22.5;
++    const quaternion = new THREE.Quaternion().setFromUnitVectors(upV, direction.clone().normalize());
++    const matrixL = new THREE.Matrix4().makeRotationFromQuaternion(quaternion);
++    return {
++      radius,
++      matrixL
++    };
++  }, [direction, scale, lineWidth, fixed]);
++  const color = isHovered ? hoveredColor : axisColors[axis];
++  return /*#__PURE__*/React.createElement("group", {
++    ref: objRef
++  }, /*#__PURE__*/React.createElement("group", {
++    matrix: matrixL,
++    matrixAutoUpdate: false,
++    onPointerDown: onPointerDown,
++    onPointerMove: onPointerMove,
++    onPointerUp: onPointerUp,
++    onPointerOut: onPointerOut
++  }, annotations && /*#__PURE__*/React.createElement(Html, {
++    position: [0, position / 2, 0]
++  }, /*#__PURE__*/React.createElement("div", {
++    style: {
++      display: 'none',
++      background: '#151520',
++      color: 'white',
++      padding: '6px 8px',
++      borderRadius: 7,
++      whiteSpace: 'nowrap'
++    },
++    className: annotationsClass,
++    ref: divRef
++  })), /*#__PURE__*/React.createElement("mesh", {
++    ref: meshRef,
++    position: [0, position, 0],
++    renderOrder: renderOrder,
++    userData: userData
++  }, /*#__PURE__*/React.createElement("boxGeometry", {
++    args: [radius * 1.6, radius * 1.6, radius * 1.6]
++  }), /*#__PURE__*/React.createElement("meshBasicMaterial", {
++    transparent: true,
++    depthTest: depthTest,
++    color: color,
++    opacity: opacity,
++    polygonOffset: true,
++    polygonOffsetFactor: -10
++  })), /*#__PURE__*/React.createElement(Line, {
++    // RLinf: the axis to its handle, as Blender draws it (not picked: the handle is).
++    transparent: true,
++    raycast: () => null,
++    depthTest: depthTest,
++    points: [0, 0, 0, 0, position, 0],
++    lineWidth: lineWidth,
++    color: color,
++    opacity: opacity,
++    polygonOffset: true,
++    polygonOffsetFactor: -10,
++    renderOrder: renderOrder,
++    fog: false
++  })));
++};
++
++export { ScalingSphere, calculateOffset };
+diff -ruN a/src/rlinfPivot/context.js b/src/rlinfPivot/context.js
+--- a/src/rlinfPivot/context.js
++++ b/src/rlinfPivot/context.js
+@@ -0,0 +1,5 @@
++import * as React from 'react';
++
++const context = /* @__PURE__ */React.createContext(null);
++
++export { context };
+diff -ruN a/src/rlinfPivot/index.d.ts b/src/rlinfPivot/index.d.ts
+--- a/src/rlinfPivot/index.d.ts
++++ b/src/rlinfPivot/index.d.ts
+@@ -0,0 +1,2 @@
++// The vendored PivotControls (index.js) takes drei's props.
++export { PivotControls } from "@react-three/drei";
+diff -ruN a/src/rlinfPivot/index.js b/src/rlinfPivot/index.js
+--- a/src/rlinfPivot/index.js
++++ b/src/rlinfPivot/index.js
+@@ -0,0 +1,246 @@
++// RLinf: drei's PivotControls (MIT, @react-three/drei 10.7.8, web/pivotControls), vendored to draw the scale
++// handles as Blender does (ScalingSphere.js) and the axes beside the rotation arcs (AxisLine).
++const _extends = (...objects) => Object.assign({}, ...objects);
++import { useThree, useFrame } from '@react-three/fiber';
++import * as React from 'react';
++import * as THREE from 'three';
++import { AxisArrow } from './AxisArrow.js';
++import { AxisRotator } from './AxisRotator.js';
++import { PlaneSlider } from './PlaneSlider.js';
++import { ScalingSphere } from './ScalingSphere.js';
++import { context } from './context.js';
++import { calculateScaleFactor, Line } from '@react-three/drei';
++
++const mL0 = /* @__PURE__ */new THREE.Matrix4();
++const mW0 = /* @__PURE__ */new THREE.Matrix4();
++const mP = /* @__PURE__ */new THREE.Matrix4();
++const mPInv = /* @__PURE__ */new THREE.Matrix4();
++const mW = /* @__PURE__ */new THREE.Matrix4();
++const mL = /* @__PURE__ */new THREE.Matrix4();
++const mL0Inv = /* @__PURE__ */new THREE.Matrix4();
++const mdL = /* @__PURE__ */new THREE.Matrix4();
++const mG = /* @__PURE__ */new THREE.Matrix4();
++const bb = /* @__PURE__ */new THREE.Box3();
++const bbObj = /* @__PURE__ */new THREE.Box3();
++const vCenter = /* @__PURE__ */new THREE.Vector3();
++const vSize = /* @__PURE__ */new THREE.Vector3();
++const vAnchorOffset = /* @__PURE__ */new THREE.Vector3();
++const vPosition = /* @__PURE__ */new THREE.Vector3();
++const vScale = /* @__PURE__ */new THREE.Vector3();
++const xDir = /* @__PURE__ */new THREE.Vector3(1, 0, 0);
++const yDir = /* @__PURE__ */new THREE.Vector3(0, 1, 0);
++const zDir = /* @__PURE__ */new THREE.Vector3(0, 0, 1);
++// RLinf: the three axes drawn plainly beside the rotation arcs, so the frame being turned stays legible.
++const AxisLine = ({
++  direction,
++  axis
++}) => {
++  const {
++    depthTest,
++    scale,
++    lineWidth,
++    fixed,
++    axisColors,
++    opacity,
++    renderOrder
++  } = React.useContext(context);
++  const length = fixed ? 0.65 : scale * 0.65;
++  return /*#__PURE__*/React.createElement(Line, {
++    transparent: true,
++    raycast: () => null,
++    depthTest: depthTest,
++    points: [0, 0, 0, direction.x * length, direction.y * length, direction.z * length],
++    lineWidth: lineWidth,
++    color: axisColors[axis],
++    opacity: opacity,
++    renderOrder: renderOrder,
++    fog: false
++  });
++};
++const PivotControls = /* @__PURE__ */React.forwardRef(({
++  enabled = true,
++  matrix,
++  onDragStart,
++  onDrag,
++  onDragEnd,
++  autoTransform = true,
++  anchor,
++  disableAxes = false,
++  disableSliders = false,
++  disableRotations = false,
++  disableScaling = false,
++  activeAxes = [true, true, true],
++  offset = [0, 0, 0],
++  rotation = [0, 0, 0],
++  scale = 1,
++  lineWidth = 4,
++  fixed = false,
++  translationLimits,
++  rotationLimits,
++  scaleLimits,
++  depthTest = true,
++  renderOrder = 500,
++  axisColors = ['#ff2060', '#20df80', '#2080ff'],
++  hoveredColor = '#ffff40',
++  annotations = false,
++  annotationsClass,
++  opacity = 1,
++  visible = true,
++  userData,
++  children,
++  ...props
++}, fRef) => {
++  const invalidate = useThree(state => state.invalidate);
++  const parentRef = React.useRef(null);
++  const ref = React.useRef(null);
++  const gizmoRef = React.useRef(null);
++  const childrenRef = React.useRef(null);
++  const translation = React.useRef([0, 0, 0]);
++  const cameraScale = React.useRef(new THREE.Vector3(1, 1, 1));
++  const gizmoScale = React.useRef(new THREE.Vector3(1, 1, 1));
++  React.useLayoutEffect(() => {
++    if (!anchor) return;
++    childrenRef.current.updateWorldMatrix(true, true);
++    mPInv.copy(childrenRef.current.matrixWorld).invert();
++    bb.makeEmpty();
++    childrenRef.current.traverse(obj => {
++      if (!obj.geometry) return;
++      if (!obj.geometry.boundingBox) obj.geometry.computeBoundingBox();
++      mL.copy(obj.matrixWorld).premultiply(mPInv);
++      bbObj.copy(obj.geometry.boundingBox);
++      bbObj.applyMatrix4(mL);
++      bb.union(bbObj);
++    });
++    vCenter.copy(bb.max).add(bb.min).multiplyScalar(0.5);
++    vSize.copy(bb.max).sub(bb.min).multiplyScalar(0.5);
++    vAnchorOffset.copy(vSize).multiply(new THREE.Vector3(...anchor)).add(vCenter);
++    vPosition.set(...offset).add(vAnchorOffset);
++    gizmoRef.current.position.copy(vPosition);
++    invalidate();
++  });
++  const config = React.useMemo(() => ({
++    onDragStart: props => {
++      mL0.copy(ref.current.matrix);
++      mW0.copy(ref.current.matrixWorld);
++      onDragStart && onDragStart(props);
++      invalidate();
++    },
++    onDrag: mdW => {
++      mP.copy(parentRef.current.matrixWorld);
++      mPInv.copy(mP).invert();
++      // After applying the delta
++      mW.copy(mW0).premultiply(mdW);
++      mL.copy(mW).premultiply(mPInv);
++      mL0Inv.copy(mL0).invert();
++      mdL.copy(mL).multiply(mL0Inv);
++      if (autoTransform) {
++        ref.current.matrix.copy(mL);
++      }
++      onDrag && onDrag(mL, mdL, mW, mdW);
++      invalidate();
++    },
++    onDragEnd: () => {
++      if (onDragEnd) onDragEnd();
++      invalidate();
++    },
++    translation,
++    translationLimits,
++    rotationLimits,
++    axisColors,
++    hoveredColor,
++    opacity,
++    scale,
++    lineWidth,
++    fixed,
++    depthTest,
++    renderOrder,
++    userData,
++    annotations,
++    annotationsClass
++  }), [onDragStart, onDrag, onDragEnd, translation, translationLimits, rotationLimits, scaleLimits, depthTest, scale, lineWidth, fixed, ...axisColors, hoveredColor, opacity, userData, autoTransform, annotations, annotationsClass]);
++  const vec = new THREE.Vector3();
++  useFrame(state => {
++    if (fixed) {
++      const sf = calculateScaleFactor(gizmoRef.current.getWorldPosition(vec), scale, state.camera, state.size);
++      cameraScale.current.setScalar(sf);
++    }
++    if (matrix && matrix instanceof THREE.Matrix4) {
++      ref.current.matrix = matrix;
++    }
++    // Update gizmo scale in accordance with matrix changes
++    // Without this, there might be noticable turbulences if scaling happens fast enough
++    ref.current.updateWorldMatrix(true, true);
++    mG.makeRotationFromEuler(gizmoRef.current.rotation).setPosition(gizmoRef.current.position).premultiply(ref.current.matrixWorld);
++    gizmoScale.current.setFromMatrixScale(mG);
++    vScale.copy(cameraScale.current).divide(gizmoScale.current);
++    if (Math.abs(gizmoRef.current.scale.x - vScale.x) > 1e-4 || Math.abs(gizmoRef.current.scale.y - vScale.y) > 1e-4 || Math.abs(gizmoRef.current.scale.z - vScale.z) > 1e-4) {
++      gizmoRef.current.scale.copy(vScale);
++      state.invalidate();
++    }
++  });
++  React.useImperativeHandle(fRef, () => ref.current, []);
++  return /*#__PURE__*/React.createElement(context.Provider, {
++    value: config
++  }, /*#__PURE__*/React.createElement("group", {
++    ref: parentRef
++  }, /*#__PURE__*/React.createElement("group", _extends({
++    ref: ref,
++    matrix: matrix,
++    matrixAutoUpdate: false
++  }, props), /*#__PURE__*/React.createElement("group", {
++    visible: visible,
++    ref: gizmoRef,
++    position: offset,
++    rotation: rotation
++  }, enabled && /*#__PURE__*/React.createElement(React.Fragment, null, !disableAxes && activeAxes[0] && /*#__PURE__*/React.createElement(AxisArrow, {
++    axis: 0,
++    direction: xDir
++  }), !disableAxes && activeAxes[1] && /*#__PURE__*/React.createElement(AxisArrow, {
++    axis: 1,
++    direction: yDir
++  }), !disableAxes && activeAxes[2] && /*#__PURE__*/React.createElement(AxisArrow, {
++    axis: 2,
++    direction: zDir
++  }), !disableSliders && activeAxes[0] && activeAxes[1] && /*#__PURE__*/React.createElement(PlaneSlider, {
++    axis: 2,
++    dir1: xDir,
++    dir2: yDir
++  }), !disableSliders && activeAxes[0] && activeAxes[2] && /*#__PURE__*/React.createElement(PlaneSlider, {
++    axis: 1,
++    dir1: zDir,
++    dir2: xDir
++  }), !disableSliders && activeAxes[2] && activeAxes[1] && /*#__PURE__*/React.createElement(PlaneSlider, {
++    axis: 0,
++    dir1: yDir,
++    dir2: zDir
++  }), disableAxes && !disableRotations && [xDir, yDir, zDir].map((direction, axis) => activeAxes[axis] && /*#__PURE__*/React.createElement(AxisLine, {
++    key: axis,
++    axis: axis,
++    direction: direction
++  })), !disableRotations && activeAxes[0] && activeAxes[1] && /*#__PURE__*/React.createElement(AxisRotator, {
++    axis: 2,
++    dir1: xDir,
++    dir2: yDir
++  }), !disableRotations && activeAxes[0] && activeAxes[2] && /*#__PURE__*/React.createElement(AxisRotator, {
++    axis: 1,
++    dir1: zDir,
++    dir2: xDir
++  }), !disableRotations && activeAxes[2] && activeAxes[1] && /*#__PURE__*/React.createElement(AxisRotator, {
++    axis: 0,
++    dir1: yDir,
++    dir2: zDir
++  }), !disableScaling && activeAxes[0] && /*#__PURE__*/React.createElement(ScalingSphere, {
++    axis: 0,
++    direction: xDir
++  }), !disableScaling && activeAxes[1] && /*#__PURE__*/React.createElement(ScalingSphere, {
++    axis: 1,
++    direction: yDir
++  }), !disableScaling && activeAxes[2] && /*#__PURE__*/React.createElement(ScalingSphere, {
++    axis: 2,
++    direction: zDir
++  }))), /*#__PURE__*/React.createElement("group", {
++    ref: childrenRef
++  }, children))));
++});
++
++export { PivotControls };
+diff -ruN a/src/rlinfSelection.tsx b/src/rlinfSelection.tsx
+--- a/src/rlinfSelection.tsx
++++ b/src/rlinfSelection.tsx
+@@ -0,0 +1,119 @@
++/** RLinf editor additions: an outline around the selected scene nodes that stays visible behind other
++ * objects. The editor page names the nodes with `window.__rlinfOutline(names)` (a node and everything
++ * under it); each mesh draws its footprint into the stencil buffer, then a screen-space shell around it
++ * where the footprint is not, both without depth testing. */
++import React from "react";
++import * as THREE from "three";
++import { useThree } from "@react-three/fiber";
++import { OutlinesMaterial } from "./OutlinesMaterial";
++
++let outlined: string[] = [];
++const listeners = new Set<() => void>();
++
++function isOutlined(name: string): boolean {
++  return outlined.some((p) => name === p || name.startsWith(p + "/"));
++}
++
++function subscribe(listener: () => void) {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++}
++
++(window as any).__rlinfOutline = (names: string[]) => {
++  if (names.length === outlined.length && names.every((n, i) => n === outlined[i])) return;
++  outlined = names.slice();
++  listeners.forEach((listener) => listener());
++};
++
++/** Name of the scene node a mesh belongs to (provided by SceneTree). */
++export const NodeNameContext = React.createContext<string>("");
++
++function useOutlined(): boolean {
++  const name = React.useContext(NodeNameContext);
++  return React.useSyncExternalStore(subscribe, () => name !== "" && isOutlined(name));
++}
++
++const MASK_ORDER = 10000;
++const OUTLINE_COLOR = 0xff9a1f;
++const OUTLINE_PIXELS = 3;
++
++const maskMaterial = new THREE.MeshBasicMaterial({
++  colorWrite: false,
++  depthWrite: false,
++  depthTest: false,
++  transparent: true,
++  side: THREE.DoubleSide,
++  stencilWrite: true,
++  stencilRef: 1,
++  stencilFunc: THREE.AlwaysStencilFunc,
++  stencilZPass: THREE.ReplaceStencilOp,
++  stencilZFail: THREE.ReplaceStencilOp,
++  stencilFail: THREE.ReplaceStencilOp,
++});
++
++function useShellMaterial() {
++  const gl = useThree((state) => state.gl);
++  const material = React.useMemo(() => {
++    const m = new OutlinesMaterial({ side: THREE.BackSide }) as any;
++    m.thickness = OUTLINE_PIXELS * gl.getPixelRatio();
++    m.color = new THREE.Color(OUTLINE_COLOR);
++    m.opacity = 1;
++    m.size = gl.getDrawingBufferSize(new THREE.Vector2());
++    m.screenspace = true;
++    m.transparent = true;
++    m.toneMapped = false;
++    m.depthTest = false;
++    m.depthWrite = false;
++    m.stencilWrite = true;
++    m.stencilRef = 1;
++    m.stencilFunc = THREE.NotEqualStencilFunc;
++    m.stencilFail = THREE.KeepStencilOp;
++    m.stencilZFail = THREE.KeepStencilOp;
++    m.stencilZPass = THREE.KeepStencilOp;
++    return m as THREE.Material;
++  }, [gl]);
++  React.useEffect(() => () => material.dispose(), [material]);
++  return material;
++}
++
++function Shells(props: { geometry: THREE.BufferGeometry; matrix?: THREE.Matrix4 }) {
++  const shell = useShellMaterial();
++  const placed = props.matrix ? { matrix: props.matrix, matrixAutoUpdate: false } : {};
++  return (
++    <>
++      <mesh geometry={props.geometry} material={maskMaterial} renderOrder={MASK_ORDER} {...placed} />
++      <mesh geometry={props.geometry} material={shell} renderOrder={MASK_ORDER + 1} {...placed} />
++    </>
++  );
++}
++
++/** Child of a mesh: outlines the parent's geometry while its node is selected. */
++export function SelectionOutline() {
++  const on = useOutlined();
++  const ref = React.useRef<THREE.Group>(null);
++  const [geometry, setGeometry] = React.useState<THREE.BufferGeometry | null>(null);
++  React.useLayoutEffect(() => {
++    const parent = ref.current?.parent as THREE.Mesh | undefined;
++    if (parent?.geometry && parent.geometry !== geometry) setGeometry(parent.geometry);
++  });
++  return <group ref={ref}>{on && geometry ? <Shells geometry={geometry} /> : null}</group>;
++}
++
++/** The meshes of a GLB (with their matrices inside it): outlined while its node is selected. */
++export function SelectionOutlineGroup(props: {
++  meshes: THREE.Mesh[];
++  matrices: THREE.Matrix4[];
++  scale: any;
++}) {
++  const on = useOutlined();
++  if (!on) return null;
++  return (
++    <group scale={props.scale}>
++      {props.meshes.map((mesh, i) => (
++        <Shells key={i} geometry={mesh.geometry} matrix={props.matrices[i]} />
++      ))}
++    </group>
++  );
++}

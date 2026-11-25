@@ -1,37 +1,29 @@
-"""Chase policy: a fixed planner passes the ball, the executor is the released Go2-SuperMimic actor.
+"""Chase policy: the released Go2-SuperMimic actor as the one policy layer (scene.yaml policy).
 
-The executor reproduces the actor of Zhengtianjin/go2-supermimic (MIT, commit 054a13c) and loads its
+``Policy`` reproduces the actor of Zhengtianjin/go2-supermimic (MIT, commit 054a13c) and loads its
 flat-ground weights ``weights/flat.pt`` (see weights/WEIGHTS.json). The weights fix everything below:
 feature order, the 5-frame history, the per-leg joint order, stance and action scale. Changing any of
 them needs a new training run, not an edit here. The scene drives the robot with the matching
 ``go2(actuators: supermimic)`` motors; with other motors these weights do not walk.
 
-Where to write your own model: ``build_executor`` returns any module whose forward(obs) returns
-(action mean [B, 12], value [B, 1]); ``decode_action`` turns the action into the joint targets named in
-scene.yaml ``control.output``. ``obs`` only holds the observations selected in scene.yaml
-(observation.py lists them with shapes and units).
+``forward(obs)`` returns the 12 actions; ``value(obs)`` is the value network PPO fine-tunes with (the released
+checkpoint has none; it is named ``value_head`` so RLinf gives it ``optim.value_lr``). ``decode_action`` turns the
+actions into joint targets for every joint of the robot, in the order of its joint_position. ``obs`` only holds the
+inputs scene.yaml lists (observation.py lists them with shapes and units).
 """
 from pathlib import Path
 
 import torch
 from torch import Tensor, nn
 from shared.policy_math import inverse_rotate, yaw
-from .observation import ExecutorObs, ExecutorOutput, ExecutorTargets, PlannerObs, PlannerOutput
+from .observation import Action, PolicyObs, Targets
 
-# The actor orders legs FL, FR, RL, RR with hip, thigh, calf per leg; the robot reports joints as
-# hips, thighs, calves (ASSET.json joint_order). control.output lists the legs in actor order.
+# The actor orders legs FL, FR, RL, RR with hip, thigh, calf per leg; the robot reports and takes joints
+# as hips, thighs, calves (ASSET.json joint_order).
 ASSET_TO_ACTOR = [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11]
+ACTOR_TO_ASSET = [ASSET_TO_ACTOR.index(joint) for joint in range(12)]
 STANCE = (.1, .9, -1.8, -.1, .9, -1.8, .1, .9, -1.8, -.1, .9, -1.8)  # rad, actor order
 SCALE = (.3349, .3349, .2853) * 4  # rad per action unit, actor order
-
-
-class Planner(nn.Module):
-    def forward(self, obs: PlannerObs) -> PlannerOutput:
-        return obs.ball.position
-
-
-def build_planner():
-    return Planner()
 
 
 class RunningNorm(nn.Module):
@@ -61,8 +53,8 @@ def yaw_frame(vector, heading):
                         -s * vector[..., 0] + c * vector[..., 1], vector[..., 2]), -1)
 
 
-def features(obs: ExecutorObs) -> Tensor:
-    """350 inputs: six terms, each the 5 frames oldest -> newest (scene.yaml executor.history)."""
+def features(obs: PolicyObs) -> Tensor:
+    """350 inputs: six terms, each the 5 frames oldest -> newest (scene.yaml policy history)."""
     robot = obs.robot
     orientation = robot.orientation  # [B, 5, 4]
     stance = orientation.new_tensor(STANCE)
@@ -76,7 +68,7 @@ def features(obs: ExecutorObs) -> Tensor:
     slot = torch.cat((offset, velocity, torch.zeros_like(offset), one, zero, zero, zero, one), -1)
     terms = (inverse_rotate(robot.angular_velocity, orientation), gravity,
              robot.joint_position[..., ASSET_TO_ACTOR] - stance, robot.joint_velocity[..., ASSET_TO_ACTOR],
-             obs.executor.output, torch.cat((slot, torch.zeros_like(slot)), -1))
+             obs.policy.output, torch.cat((slot, torch.zeros_like(slot)), -1))
     return torch.cat([term.flatten(1) for term in terms], -1)
 
 
@@ -89,38 +81,30 @@ class Actor(nn.Module):
         self.net = mlp(inputs, hidden, actions)
 
 
-class Executor(nn.Module):
-    def __init__(self, value_hidden):
+class Policy(nn.Module):
+    def __init__(self, actor_file: str | None = 'weights/flat.pt', value_hidden=(512, 256, 128)):
+        """``actor_file``: a go2-supermimic actor file (absolute or relative to this project); null starts from
+        random initialisation. Checkpoints passed to evaluate/view load on top of it."""
         super().__init__()
         self.actor = Actor()
-        # PPO fine-tuning only: the released checkpoint has no critic or exploration noise.
-        self.actor_logstd = nn.Parameter(torch.full((12,), -2.))
         self.value_head = mlp(350, value_hidden, 1)
+        if actor_file:
+            path = Path(__file__).parent / actor_file
+            if not path.is_file():
+                raise FileNotFoundError(f'{path} is missing; restore weights/flat.pt from git')
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            if checkpoint.get('obs_dim') != 350:
+                raise ValueError(f'{path}: expected a 350-input go2-supermimic actor, got {checkpoint.get("obs_dim")}')
+            self.actor.load_state_dict(checkpoint['actor'])
 
-    def forward(self, obs: ExecutorObs) -> tuple[ExecutorOutput, Tensor]:
-        x = self.actor.norm(features(obs))
-        return self.actor.net(x), self.value_head(x)
+    def forward(self, obs: PolicyObs) -> Action:
+        return self.actor.net(self.actor.norm(features(obs)))
 
-
-def build_executor(config, torch_dtype, weights: str | None = 'weights/flat.pt'):
-    """``weights``: a go2-supermimic actor file (absolute or relative to this project); null starts
-    from random initialisation. Checkpoints passed to evaluate/view load on top of it."""
-    model = Executor(tuple(config.hidden_dims))
-    if weights:
-        path = Path(__file__).parent / weights
-        if not path.is_file():
-            raise FileNotFoundError(f'{path} is missing; restore weights/flat.pt from git')
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        if checkpoint.get('obs_dim') != 350:
-            raise ValueError(f'{path}: expected a 350-input go2-supermimic actor, got {checkpoint.get("obs_dim")}')
-        model.actor.load_state_dict(checkpoint['actor'])
-    return model.to(dtype=torch_dtype)
+    def value(self, obs: PolicyObs) -> Tensor:
+        return self.value_head(self.actor.norm(features(obs)))
 
 
-def decode_action(action: ExecutorOutput, obs: ExecutorObs) -> ExecutorTargets:
-    """Joint-position targets around the stance, in the control.output (actor) order."""
-    return {'legs': action.new_tensor(STANCE) + action.new_tensor(SCALE) * action}
+def decode_action(action: Action, obs: PolicyObs) -> Targets:
+    """Joint-position targets around the stance, computed in actor order and given in the robot's."""
+    return {'robot': (action.new_tensor(STANCE) + action.new_tensor(SCALE) * action)[:, ACTOR_TO_ASSET]}
 
-
-def initial_action(obs: ExecutorObs) -> ExecutorOutput:
-    return obs.robot.joint_position.new_zeros(obs.robot.joint_position.shape[0], 12)

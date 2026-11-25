@@ -6,14 +6,14 @@ Piper X 在地面抓起方块，抬离地面 4 cm 并稳住 0.5 s 即成功。�
 
 | 文件 | 内容 | 谁来改 |
 | --- | --- | --- |
-| `scene.yaml` | 实体、抽象体、各组件的观察选择、控制终点 | `run.sh edit` 或直接编辑 |
-| `policy.py` | `build_planner`、`build_executor`（模型）、`decode_action`（动作→关节目标）、`initial_action` | 换模型、改动作缩放时改这里 |
+| `scene.yaml` | 实体、抽象体、各组件的观察选择；piper 的全部关节自动受控 | `run.sh edit` 或直接编辑 |
+| `policy.py` | `Policy`（网络与价值网络）、`decode_action`（动作→关节目标） | 换模型、改动作缩放时改这里 |
 | `task.py` | `Task.evaluate(obs)`：奖励、成功、失败与指标 | 改任务时改这里 |
 | `observation.py` | 由 scene.yaml 生成的观察类型（形状、单位），`check` 时刷新 | 不要手改 |
 | `train.yaml` | RLinf PPO 配方；`env.train.init_params.backend/physics` 选后端与物理引擎 | 训练时改 |
 | `weights/` | `pick.pt`（随项目进 git，见“权重”）、`WEIGHTS.json` | 只读 |
 
-改了 `scene.yaml` 的实体、观察或控制终点后先 `check` 刷新 `observation.py`，再按其中的类型改
+改了 `scene.yaml` 的实体或观察后先 `check` 刷新 `observation.py`，再按其中的类型改
 `policy.py`/`task.py`。网络、缩放写在 `policy.py`；奖励、阈值写在 `task.py`。
 
 ## 场景与模型
@@ -21,11 +21,13 @@ Piper X 在地面抓起方块，抬离地面 4 cm 并稳住 0.5 s 即成功。�
 - 场景：Piper X 固定在原点；`cube`（4.8 cm 方块）每次复位随机放在抽象矩形 `cube_area` 内
   （中心 (0.32, 0)，16×16 cm）；`tcp_frame` 测 `gripper_base` 前 0.13 m 的指尖中心；`wrist_camera`
   在场景中但未被选为观察，训练时不渲染。
-- planner：每 0.2 s 透传 `cube.position`（模板要求保留，不训练）。
-- executor（训练，0.02 s）：输入全部关节位置/速度/力、`cube.position`、`tcp_frame` 指尖位置，
-  `policy.py` 另算“方块 − 指尖”×10；MLP 输出 7 维动作和价值，`actor_logstd=-0.5`。
-- 动作：每回合从 `READY`（指尖朝下、张开、区域中心上方 0.15 m）开始。6 个臂关节目标 =
-  实测关节位置 + 0.05 rad × 动作；第 7 维为夹爪开度，截到 [-1, 0] 后镜像成两指目标 `READY + 0.05 m × 动作`。
+- 策略（一层 `policy`，训练，0.02 s）：输入全部关节位置/速度/力、`cube.position`、`tcp_frame` 指尖位置，
+  `policy.py` 另算“方块 − 指尖”×10；共享的特征 MLP 后接动作头（7 个动作）和 `value_head`（价值），
+  动作噪声初值 exp(−0.5)。2026-11-25 从 planner/executor 写法迁移：输入、动作含义和权重不变（原 planner 只透传
+  方块位置、executor 不读它，已去掉）。
+- 动作：6 个臂关节目标 = 实测关节位置 + 0.05 rad × 动作（增量）；第 7 维为夹爪开度，截到 [-1, 0] 后镜像成两指目标
+  `OPEN + 0.05 m × 动作`（`OPEN` 为全开）。动作为 0 时手臂停在原处、夹爪张开。关节特征相对一个固定的参考姿态 `REFERENCE`
+  （指尖朝下、区域中心上方 0.15 m，也是 scene.yaml 里每回合的起始姿态），它是策略的常数，由权重决定，不读仿真的默认关节位置。
 - 奖励（`task.py`，计入回报时乘 0.02 s）：接近 `1 − tanh(d/0.1)`；近处合爪奖励；夹住后按抬升量
   和静止度加分；成功（夹住、抬升 ≥4 cm、速度 <0.1 m/s 持续 0.5 s）一次性 +50；方块离区 0.6 m
   或掉出地面失败 −5；动作变化惩罚。没有接触传感器，夹住由指尖距离与开度判断。
@@ -37,8 +39,9 @@ Piper X 在地面抓起方块，抬离地面 4 cm 并稳住 0.5 s 即成功。�
 
 `weights/pick.pt` 随项目一起进 git（`.gitignore` 对 `projects/*/weights/*.pt` 例外放行），哈希与来源见 `weights/WEIGHTS.json`：
 本工作区 2026-10-22 在 **mjlab** 后端训练 1500 轮的 `global_step_1500`
-（运行 `outputs/piper_pick/runs/20261022_124529_30e82905256d`）。scene.yaml `executor.parameters.weights`
-让 `build_executor` 默认加载它；写 `null` 则随机初始化（从头训练时改成 `null`，否则 train 是在它之上继续训练）。
+（运行 `outputs/piper_pick/runs/20261022_124529_30e82905256d`）。scene.yaml `policy.layers.policy.parameters.weights`
+让框架加载它（文件里的 `model.actor_logstd` 读作动作噪声 `log_std`）；删掉这一行则随机初始化（从头训练时删掉，否则 train 是在它之上继续训练）。
+迁移后评估（Newton，16 环境）与迁移前一致：成功 1.00、平均回合 53.1 步（迁移前 53.4 / 52.5 步）。
 文件缺失时直接报错。evaluate/view 若另给 checkpoint，在此之上加载。
 
 ## 运行

@@ -11,6 +11,7 @@ class SceneInfo_cube_lower_target(ObjectView):
 
 class SceneInfo_cube_lower(ObjectView):
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, cube_lower/root, 包围盒（本体坐标的最小角, 最大角）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
@@ -23,6 +24,7 @@ class SceneInfo_cube_upper_target(ObjectView):
 
 class SceneInfo_cube_upper(ObjectView):
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, cube_upper/root, 包围盒（本体坐标的最小角, 最大角）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
     orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
@@ -100,9 +102,11 @@ class SceneInfo_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：tcp
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, robot/root, 包围盒（本体坐标的最小角, 最大角）
     default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_effort: Tensor  # ['B', None], float, 关节实际力 / 力矩
+    joint_limits: Tensor  # ['B', None, 2], float, 关节范围（下限, 上限）
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -118,6 +122,12 @@ class SceneInfo_simulation(ObjectView):
     time: Tensor  # ['B', 1], s
 
 
+class SceneInfo_table(ObjectView):
+    bounds: Tensor  # ['B', 2, 3], float, m, table/root, 包围盒（本体坐标的最小角, 最大角）
+    orientation: Tensor  # ['B', 4], float, 1, environment, wxyz, 根部朝向
+    position: Tensor  # ['B', 3], float, m, environment, 根部位置
+
+
 class SceneInfo(ObjectView):
     cube_lower: SceneInfo_cube_lower
     cube_upper: SceneInfo_cube_upper
@@ -126,6 +136,7 @@ class SceneInfo(ObjectView):
     planner: SceneInfo_planner
     robot: SceneInfo_robot
     simulation: SceneInfo_simulation
+    table: SceneInfo_table
 
 
 class PlannerObs_cube_upper_target(ObjectView):
@@ -173,7 +184,7 @@ class ExecutorObs(ObjectView):
 
 
 Obs = ExecutorObs
-SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'robot.wrist_camera.rgb', 'cube_lower.position', 'cube_lower.orientation', 'cube_lower.linear_velocity', 'cube_lower.angular_velocity', 'cube_upper.position', 'cube_upper.orientation', 'cube_upper.linear_velocity', 'cube_upper.angular_velocity', 'ee_frame.frame_positions', 'robot.tcp.position', 'robot.tcp.orientation', 'simulation.gravity', 'cube_lower.target.position', 'cube_upper.target.position', 'planner.output', 'planner.previous_output', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.cube_upper.target.position', 'executor.input.robot.joint_position', 'executor.input.robot.joint_velocity', 'executor.input.cube_upper.position', 'executor.input.cube_lower.position', 'executor.input.planner.output', 'executor.input.ee_frame.frame_positions', 'executor.input.robot.default_joint_position')
+SCENE_FIELDS = ('table.position', 'table.orientation', 'table.bounds', 'robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'robot.joint_limits', 'robot.bounds', 'robot.wrist_camera.rgb', 'cube_lower.position', 'cube_lower.orientation', 'cube_lower.linear_velocity', 'cube_lower.angular_velocity', 'cube_lower.bounds', 'cube_upper.position', 'cube_upper.orientation', 'cube_upper.linear_velocity', 'cube_upper.angular_velocity', 'cube_upper.bounds', 'ee_frame.frame_positions', 'robot.tcp.position', 'robot.tcp.orientation', 'simulation.gravity', 'cube_lower.target.position', 'cube_upper.target.position', 'planner.output', 'planner.previous_output', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.cube_upper.target.position', 'executor.input.robot.joint_position', 'executor.input.robot.joint_velocity', 'executor.input.cube_upper.position', 'executor.input.cube_lower.position', 'executor.input.planner.output', 'executor.input.ee_frame.frame_positions', 'executor.input.robot.default_joint_position')
 
 
 PlannerOutput = Tensor  # ['B', 3], 固定组件 forward 返回

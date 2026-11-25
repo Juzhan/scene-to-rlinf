@@ -135,6 +135,8 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0,
             raise NotImplementedError(f"Entity {path}: kinematic entities are only bound on isaaclab3")
         if not node.visible:
             raise NotImplementedError(f"{path}: visible: false (hidden from rendering) is only bound on isaaclab3")
+        if node.gravity_compensation:
+            raise NotImplementedError(f"{path}: gravity_compensation is only bound on isaaclab3")
         if node.reset:
             from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 

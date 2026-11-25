@@ -612,3 +612,78 @@ def test_simready_layer_puts_the_root_body_on_the_asset_origin(tmp_path):
     world = Gf.Matrix4d().SetTranslate(Gf.Vec3d(axle.GetLocalPos0Attr().Get())) * \
         cache.GetLocalToWorldTransform(out.GetPrimAtPath('/ladder/frame'))
     assert list(world.ExtractTranslation()) == pytest.approx([.3, .5, .05], abs=1e-6)
+
+
+def test_mjcf_geom_defaults_are_written_out_for_the_isaac_importer(tmp_path):
+    import mujoco
+    import numpy as np
+    import xml.etree.ElementTree as ElementTree
+    from shared.asset_formats import mjcf_geom_defaults
+    (tmp_path / 'arm.xml').write_text('''<mujoco><default><default class="arm"><joint axis="0 1 0"/>
+      <default class="collision"><geom type="capsule" group="3"/><default class="tip"><geom type="cylinder"/></default></default>
+      </default></default><worldbody><body name="base" childclass="arm">
+        <geom class="collision" size="0.05 0.1"/><body name="link" pos="0 0 0.2"><joint name="hinge"/>
+          <geom class="tip" size="0.03 0.05"/><geom type="box" size="0.01 0.01 0.01"/></body></body></worldbody></mujoco>''')
+    assert mjcf_geom_defaults(tmp_path / 'arm.xml', tmp_path / 'out.xml') == 2
+    types = [geom.get('type') for geom in ElementTree.parse(tmp_path / 'out.xml').getroot().find('worldbody').iter('geom')]
+    assert types == ['capsule', 'cylinder', 'box']
+    a, b = (mujoco.MjModel.from_xml_path(str(tmp_path / name)) for name in ('arm.xml', 'out.xml'))
+    assert all(np.array_equal(getattr(a, field), getattr(b, field)) for field in ('geom_type', 'geom_size', 'geom_group'))
+    (tmp_path / 'plain.xml').write_text('<mujoco><worldbody><geom type="plane" size="1 1 1"/></worldbody></mujoco>')
+    assert mjcf_geom_defaults(tmp_path / 'plain.xml', tmp_path / 'none.xml') == 0 and not (tmp_path / 'none.xml').exists()
+
+
+def test_an_mjcf_made_to_be_included_gets_its_geoms_masses_on_its_own(tmp_path):
+    import mujoco
+    from shared.asset_formats import mjcf_standalone_inertia
+    # robosuite / LIBERO objects: inertiagrouprange 4 4 with every geom in group 0, masses set by the includer
+    door = '''<mujoco><compiler inertiagrouprange="4 4"/><worldbody><body name="box"><geom type="box" size=".1 .1 .1" mass=".5"/>
+      <body name="door" pos=".1 0 0"><joint name="hinge" axis="0 0 1"/><geom type="box" size=".01 .1 .1" mass=".2"/></body>
+      </body></worldbody></mujoco>'''
+    (tmp_path / 'source').mkdir()
+    (tmp_path / 'source' / 'oven.xml').write_text(door)
+    assert mjcf_standalone_inertia(tmp_path / 'source' / 'oven.xml', tmp_path / 'mjcf' / 'oven.xml')
+    model = mujoco.MjModel.from_xml_path(str(tmp_path / 'mjcf' / 'oven.xml'))
+    assert abs(model.body('door').mass[0] - .2) < 1e-9
+    (tmp_path / 'plain.xml').write_text(door.replace(' inertiagrouprange="4 4"', ''))
+    assert not mjcf_standalone_inertia(tmp_path / 'plain.xml', tmp_path / 'none.xml') and not (tmp_path / 'none.xml').exists()
+
+
+def test_joints_that_cannot_be_at_zero_start_at_their_nearest_limit(tmp_path):
+    Usd = pytest.importorskip('pxr.Usd')
+    from pxr import UsdGeom, UsdPhysics
+    from shared.asset_formats import usd_zero_outside_limits
+    stage = Usd.Stage.CreateNew(str(tmp_path / 'leg.usda'))
+    stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, '/leg').GetPrim())
+    for name, (low, high) in {'knee': (30., 160.), 'hip': (-30., 30.), 'calf': (-160., -30.)}.items():
+        joint = UsdPhysics.RevoluteJoint.Define(stage, f'/leg/{name}')
+        joint.CreateLowerLimitAttr(low)
+        joint.CreateUpperLimitAttr(high)
+    stage.GetRootLayer().Save()
+    nearest = usd_zero_outside_limits(tmp_path / 'leg.usda')  # DeepRobotics Lite3's knees: 0.52 to 2.79 rad
+    assert nearest.keys() == {'knee', 'calf'}
+    assert nearest['knee'] == pytest.approx(0.5236, abs=1e-4) and nearest['calf'] == pytest.approx(-0.5236, abs=1e-4)
+
+
+def test_a_coupled_joint_follows_its_leader_through_the_physx_mimic_schema(tmp_path):
+    Usd = pytest.importorskip('pxr.Usd')
+    from pxr import UsdGeom, UsdPhysics
+    from shared.asset_formats import joint_coupling_layer
+    stage = Usd.Stage.CreateNew(str(tmp_path / 'bin.usda'))
+    stage.SetDefaultPrim(UsdGeom.Xform.Define(stage, '/bin').GetPrim())
+    for name, axis in (('pedal', 'Y'), ('lid', 'Y'), ('drawer', 'X')):
+        joint = (UsdPhysics.PrismaticJoint if name == 'drawer' else UsdPhysics.RevoluteJoint).Define(stage, f'/bin/{name}')
+        joint.CreateAxisAttr(axis)
+    stage.GetRootLayer().Save()
+    layer = joint_coupling_layer(tmp_path / 'bin.usda', {'lid': {'leader': 'pedal', 'ratio': -6.4, 'offset': .1}})
+    coupled = Usd.Stage.Open(str(layer))
+    lid = coupled.GetPrimAtPath('/bin/lid')
+    assert 'PhysxMimicJointAPI:rotY' in lid.GetMetadata('apiSchemas').GetAddedOrExplicitItems()  # unregistered here
+    # PhysX (and Newton's import of it): lid + gearing * pedal + offset = 0
+    assert lid.GetAttribute('physxMimicJoint:rotY:gearing').Get() == pytest.approx(6.4)
+    assert lid.GetAttribute('physxMimicJoint:rotY:offset').Get() == pytest.approx(-.1)
+    assert lid.GetRelationship('physxMimicJoint:rotY:referenceJoint').GetTargets() == ['/bin/pedal']
+    for couplings, match in (({'lid': {'leader': 'lid'}}, 'itself'), ({'lid': {'leader': 'pedal'}, 'pedal': {'leader': 'drawer'}}, 'follows another'),
+                             ({'lid': {'leader': 'door'}}, 'unknown joint')):
+        with pytest.raises(ValueError, match=match):
+            joint_coupling_layer(tmp_path / 'bin.usda', couplings)

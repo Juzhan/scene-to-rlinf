@@ -43,7 +43,7 @@ def _expand_entity(data, directory, stack=()):
     data = _fields(data, ("name", "kind", "factory", "assembly", "pose", "parameters", "tags",
                           "initial_state", "children", "mount", "connections", "frames", "reset", "camera_only",
                           "overrides", "connection_overrides", "scope", "meshes", "prim_name", "shape", "size",
-                          "kinematic", "motion", "visible"), "entity")
+                          "kinematic", "motion", "visible", "gravity_compensation"), "entity")
     if "assembly" in data:
         _fields(data, ("name", "assembly", "pose", "parameters", "camera_only", "overrides",
                        "connection_overrides", "scope", "prim_name"), "assembly instance")
@@ -88,7 +88,7 @@ def _instance_overrides(root, changes, *, connections=False):
     index(root, "")
     allowed = ("parent_pose", "child_pose", "parent", "child") if connections else (
         "pose", "parameters", "tags", "initial_state", "mount", "scope", "meshes", "prim_name", "reset", "kinematic",
-        "motion", "visible")
+        "motion", "visible", "gravity_compensation")
     for path, values in changes.items():
         if not isinstance(path, str) or not (path == "." and not connections or
                 re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(/[A-Za-z_][A-Za-z_0-9]*)*", path)):
@@ -170,7 +170,8 @@ def _entity(data, cameras, factories):
                        frames=tuple(frames), reset=_root_reset(data["reset"]) if "reset" in data else None,
                        scope=data.get("scope"), prim_name=data.get("prim_name"), meshes=tuple(data.get("meshes", ())),
                        pose_authored="pose" in data, kinematic=data.get("kinematic", False),
-                       motion=data.get("motion"), visible=data.get("visible", True))
+                       motion=data.get("motion"), visible=data.get("visible", True),
+                       gravity_compensation=data.get("gravity_compensation", False))
 
 
 def _read_config(path, fields, label):
@@ -190,11 +191,13 @@ def load_assembly(path, cameras=False, *, overrides=None, factories=None, _stack
 
 def load_scene_config(path):
     data = _read_config(Path(path).resolve(), ("name", "entities", "connections", "observations",
-                        "application", "simulation", "world", "actions", "task", "targets", "regions", "authoring", "control", "variables", "visualization"), "scene")
+                        "application", "simulation", "world", "actions", "task", "targets", "regions", "authoring", "control",
+                        "policy", "variables", "visualization"), "scene")
     if "regions" in data:
         raise ValueError(f"{path}: the regions section was replaced by abstract entities; "
                          "declare each region in entities with kind: abstract")
-    return data
+    from .layers import normalize
+    return normalize(data, Path(path).resolve().parent)
 
 
 def load_world_spec(path, cameras=False, *, factories=None, backend=DEFAULT_BACKEND):

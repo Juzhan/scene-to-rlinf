@@ -12,7 +12,8 @@ from shared.integrations.rlinf.object_policy import ObjectPolicy
 
 
 def samples(project, role=None):
-    settings=yaml.safe_load((Path('projects')/project/'scene.yaml').read_text())
+    from shared.assembly.layout import load_scene_config
+    settings=load_scene_config(Path('projects')/project/'scene.yaml')  # a policy: read as the control mapping
     fields=selected_fields(settings)
     role=role or settings.get('control',{}).get('train','policy')
     data={}
@@ -31,12 +32,12 @@ def samples(project, role=None):
     return data
 
 
-@pytest.mark.parametrize('project,actions',[('planner_executor',12),('assembly_go2_navigation',3),('assembly_lift',8),('assembly_go2',12)])
+@pytest.mark.parametrize('project,actions',[('assembly_go2_navigation',3),('assembly_lift',8),('assembly_go2',12)])
 def test_object_models_keep_rollout_and_update_consistent(project,actions):
     module=importlib.import_module('projects.'+project+'.policy')
     schema=importlib.import_module('projects.'+project+'.observation')
     config=OmegaConf.create({'hidden_dims':[16], 'action_dim':actions})
-    model=(module.Executor if project=='planner_executor' else module.Policy)(config)
+    model=module.Policy(config)
     data=samples(project)
     model(schema.Obs(data))
     adapter=ObjectPolicy(model,schema.Obs,True)
@@ -64,7 +65,7 @@ def test_frozen_executor_accepts_object_and_validates_checkpoint_features():
     with pytest.raises(ValueError,match='187'):model(ExecutorObs(data))
 
 
-@pytest.mark.parametrize('project', ['assembly_go2', 'planner_executor'])
+@pytest.mark.parametrize('project', ['assembly_go2'])
 def test_executor_distribution_uses_actual_joint_units(project):
     module = importlib.import_module('projects.' + project + '.policy')
     schema = importlib.import_module('projects.' + project + '.observation')
@@ -94,3 +95,20 @@ def test_frozen_executor_outputs_physical_angles_with_original_actor_history():
     torch.testing.assert_close(captured[0][:, 36:48], torch.zeros(4, 12))
     raw = torch.nn.Sequential.forward(model, captured[0])
     torch.testing.assert_close(output, data['robot.default_joint_position'] + .25 * raw)
+
+
+@pytest.mark.parametrize('project,model',[('planner_executor','Executor'),('go2_goal','Policy')])
+def test_policy_layers_keep_rollout_and_update_consistent(project,model):
+    """A layer returning only its actions: the adapter adds the noise and the value network, rollout and update agree."""
+    module=importlib.import_module('projects.'+project+'.policy')
+    schema=importlib.import_module('projects.'+project+'.observation')
+    network=getattr(module,model)(OmegaConf.create({'hidden_dims':[16]}),12)
+    adapter=ObjectPolicy(network,schema.Obs,True,action_dim=12,hidden=(16,))
+    data=samples(project)
+    adapter._evaluate(data)  # sizes the lazy layers
+    _,rollout=adapter.predict_action_batch(data)
+    update=adapter(forward_inputs=rollout['forward_inputs'])
+    torch.testing.assert_close(update['logprobs'],rollout['prev_logprobs'][:,0])
+    torch.testing.assert_close(update['values'],rollout['prev_values'])
+    (-update['logprobs'].mean()+update['values'].square().mean()).backward()
+    assert network.net[0].weight.grad.abs().sum()>0 and adapter.log_std.grad is not None

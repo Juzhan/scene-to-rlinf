@@ -35,7 +35,7 @@ def test_native_preview_default_pose_and_geometry_invalidation(tmp_path):
 def test_mount_keeps_mesh_cache_but_joint_pose_invalidates(tmp_path):
     scene = tmp_path / 'scene.yaml'
     scene.write_text('schema_version: 1\nname: world\nentities:\n  - {name: arm, factory: piper_x}\n')
-    before = geometry_keys(scene)
+    before, content = geometry_keys(scene), geometry_keys(scene, content=True)
     doc = SceneDocument(scene)
     doc.set_entity('world/arm', {'parameters': {'fix_root_link': False}})
     doc.save()
@@ -43,6 +43,8 @@ def test_mount_keeps_mesh_cache_but_joint_pose_invalidates(tmp_path):
     doc.set_entity('world/arm', {'initial_state': {'joint_positions': {'joint1': .5}}})
     doc.save()
     assert geometry_keys(scene) != before
+    # The last mesh stays on show while the new pose exports: editors pose the bodies themselves.
+    assert geometry_keys(scene, content=True) == content
 
 
 def test_editor_opens_before_native_export(tmp_path, monkeypatch):

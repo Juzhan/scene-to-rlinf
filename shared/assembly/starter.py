@@ -13,7 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PROJECTS = ROOT / 'projects'
 
 
-def create_draft(name, template='planner_executor'):
+DEFAULT_TEMPLATE = 'go2_goal'  # a new project starts from this one unless another is chosen
+
+
+def create_draft(name, template=DEFAULT_TEMPLATE):
     """Copy ``template`` as project ``name`` into a temporary directory; returns its scene.yaml."""
     from tools.create import create_project
     if (PROJECTS / name).exists():

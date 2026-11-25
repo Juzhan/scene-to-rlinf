@@ -63,6 +63,10 @@ Signals.describe() 展示 information、entity、source，并附上候选操作�
 ------------
 
 * Isaac entity 信息目录：位置、朝向、速度、关节集合、扫描高度、接触力和图像。
+* 实体包围盒 ``bounds``：number (2, 3)，m，本体坐标（position/orientation 所指的坐标系），最小角与最大角，
+  按默认关节位置的可绘制几何计算，回合内不变；有形状的物体与机器人都有。静态物体（无刚体）另有固定的
+  position / orientation。带关节实体另有 ``joint_limits``：number (J, 2)，下限与上限，列序同 joint_position。
+  目前由 isaaclab3 读取（从舞台读一次）；``shared/predicates.py`` 用它们判断 inside / on_top / is_open 等关系。
 * Isaac 显式 targets：固定三维期望位置、线速度、角速度，继承对应属性的类型与环境坐标。
   原生命令描述只用于旧实验兼容，新模板不从原生任务注入目标。
 * 抽象体（``kind: abstract``）：position（m，环境坐标）、orientation（wxyz，环境坐标）、矩形/长方体的 size
@@ -132,6 +136,7 @@ assembly_go2 同样比较 robot.linear_velocity 与 robot.target.linear_velocity
 旧表达式中的 ``region: {signal: regions.<name>}`` 已随 ``regions:`` 段移除。新项目在 task.py 中读取
 抽象体（如 ``obs.spawn_area.position/orientation/size``）自行判断：先把点转到区域局部坐标，矩形比较
 XY，长方体比较三维。这只判断实体根位置，不代表整个物体几何都在区域里，也不判断支撑或接触。
+``shared/predicates.py`` 的 inside / inside_gap 按这种方式比较，实体用它的 bounds 盒。
 
 设备类别（须由项目注册该 Signal）：
 

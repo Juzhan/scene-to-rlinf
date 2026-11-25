@@ -62,12 +62,46 @@ header { flex: none; padding: 2px 4px 6px; }
 .sw.remove:hover { color: #c92a2a !important; }
 .sw.restore { color: #2f9e44; }
 #empty { display: none; padding: 14px 8px; color: var(--muted); }
+/* Lenses: the same tree seen as the scene, as a component's inputs, as what the task or the policy uses. */
+:root { --planner: #2e6edc; --executor: #7c5ce6; --control: #2a9d64; }
+#lenses { display: flex; margin: 0 0 6px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #f6f7f9; }
+#lenses button { flex: 1; border: 0; border-right: 1px solid var(--line); background: none; padding: 4px 0 3px; font: inherit;
+                 color: #495057; cursor: pointer; display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+#lenses button:last-child { border-right: 0; }
+#lenses button small { font-size: 10px; color: #8a929c; white-space: nowrap; }
+#lenses button.on { background: #fff; color: var(--accent); font-weight: 600; box-shadow: inset 0 -2px 0 var(--accent); }
+#roles { display: none; gap: 4px; margin: 0 0 6px; }
+#roles.on { display: flex; }
+#roles button { flex: 1; border: 1px solid var(--line); border-radius: 7px; background: #fff; padding: 3px 0; font: inherit;
+                cursor: pointer; color: #495057; }
+#roles button.on { color: #fff; border-color: transparent; font-weight: 600; }
+.badge { flex: none; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 4px; font-size: 10px; line-height: 16px;
+         text-align: center; color: #fff; font-weight: 700; }
+.badge.p { background: var(--planner); } .badge.e { background: var(--executor); } .badge.c { background: var(--control); }
+.badge.off { background: #ced4da; }
+.row.sub { height: 24px; font-size: 12px; }
+.row.sub .label { color: #343a40; }
+.row.sub .unit { flex: none; font: 10.5px ui-monospace, monospace; color: #8a929c; }
+.row.sub.na .label { color: #adb5bd; }
+.jt { flex: none; width: 16px; text-align: center; font-size: 11px; color: #868e96; }
+.idx { flex: none; font: 10.5px ui-monospace, monospace; color: #8a929c; min-width: 22px; text-align: right; }
+.toggle { flex: none; width: 28px; height: 16px; border-radius: 8px; background: #dee2e6; position: relative; margin-right: 4px; }
+.toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff;
+                 box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .12s; }
+.toggle.on::after { left: 14px; }
+.mode { flex: none; font-size: 10.5px; padding: 0 6px; border-radius: 8px; color: #fff; background: var(--control); }
+.mode.none { background: #ced4da; }
+.group { padding: 6px 4px 2px; font-size: 11px; color: #8a929c; }
 #message { display: none; margin: 0 4px 4px; padding: 4px 8px; border-radius: 6px; font-size: 11.5px; color: #c92a2a; background: #fff5f5; }
 #offline { display: none; padding: 14px 8px; color: #c92a2a; }
 </style>
 </head>
 <body>
-<header><input id="filter" type="search" placeholder="筛选名称（/）" autocomplete="off"></header>
+<header>
+  <div id="lenses"></div>
+  <div id="roles"></div>
+  <input id="filter" type="search" placeholder="筛选名称（/）" autocomplete="off">
+</header>
 <div id="message"></div>
 <div id="list"></div>
 <div id="empty">场景为空：在“添加”中加入地面、机器人和物体。</div>
@@ -111,6 +145,12 @@ const PHYSICS = {
 };
 
 let revision = null, rows = [], failures = 0;
+// The lens (Editor.lens_state): scene, observe (a component's inputs), task or policy; signals of the observe lens.
+let lens = {lens: 'scene', role: null, roles: [], counts: {}, train: null};
+let signals = null;
+const ROLE_NAMES = {planner: 'Planner', executor: 'Executor'};
+const JOINT_GLYPH = {revolute: '⟳', continuous: '⟳', prismatic: '⇕'};
+const MODE_NAMES = {joint_position: '位置', joint_velocity: '速度', joint_effort: '力矩', none: '不控制'};
 const filterKey = 'rlinf-outliner.filter', openKey = 'rlinf-outliner.open';
 const store = (() => { try { return embedded ? parent.sessionStorage : sessionStorage; } catch { return null; } })();
 $('filter').value = (store && store.getItem(filterKey)) || '';
@@ -140,6 +180,49 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 }
 
+function lensBadges(r) {
+  const uses = r.uses || {}, out = [];
+  if (lens.lens === 'observe') {
+    const n = uses[lens.role] || 0;
+    return n ? `<span class="badge ${lens.role[0]}" title="${ROLE_NAMES[lens.role]} 读它的 ${n} 个量">${n}</span>` : '';
+  }
+  if (uses.planner) out.push(`<span class="badge p" title="Planner 读它的 ${uses.planner} 个量">P</span>`);
+  if (uses.executor) out.push(`<span class="badge e" title="Executor 读它的 ${uses.executor} 个量">E</span>`);
+  if (r.mode && r.mode !== 'none') out.push(`<span class="badge c" title="Executor 控制它的全部关节（${MODE_NAMES[r.mode]}）">C</span>`);
+  return out.join('');
+}
+
+// Rows below an entity in the current lens: its movable joints (scene, task, policy) or its quantities (observe).
+function subKey(r) { return `${lens.lens === 'observe' ? 's' : 'j'}:${r.id}`; }
+function hasSub(r) {
+  if (lens.lens === 'observe') return !!(signals && signals.groups.some(g => g.path && `entity:${g.path}` === r.id));
+  return !!(r.joints && r.joints.length);
+}
+function jointRows(r, depth) {
+  return r.joints.map(j => `<div class="row sub${r.selected_joint === j.name ? ' sel' : ''}" data-joint="${escapeHtml(j.name)}" data-id="${escapeHtml(r.id)}"
+      title="${escapeHtml(`${j.name} · 带动 ${j.link}`)}${j.index === null ? '' : ` · 目标第 ${j.index} 列`}" style="padding-left:${2 + (depth + j.depth) * 14}px">
+      <span class="caret none"></span><span class="jt">${JOINT_GLYPH[j.type] || '•'}</span>
+      <span class="label">${escapeHtml(j.link)}</span><span class="idx">${j.index === null ? '' : '#' + j.index}</span></div>`);
+}
+function signalRows(group, depth) {
+  return group.rows.map(q => `<div class="row sub${q.available ? '' : ' na'}" data-signal="${escapeHtml(q.key)}" data-on="${q.enabled ? 1 : 0}"
+      title="${escapeHtml(`obs.${q.key}：${q.description || q.label}`)}" style="padding-left:${2 + depth * 14}px">
+      <span class="caret none"></span><span class="label">${escapeHtml(q.label || q.name)}</span>
+      <span class="unit">${escapeHtml([q.shape, q.unit].filter(Boolean).join(' '))}</span>
+      <span class="toggle${q.enabled ? ' on' : ''}" style="${q.enabled ? `background:var(--${lens.role})` : ''}"></span></div>`);
+}
+
+function renderLenses() {
+  const c = lens.counts || {}, trained = role => lens.train === role ? '🔥' : '';
+  const steps = [['scene', '场景', `${rows.filter(r => r.id.startsWith('entity:')).length} 个`],
+                 ['observe', '观察', lens.roles.map(r => `${r[0].toUpperCase()} ${c[r] || 0}`).join(' · ')]];
+  $('lenses').innerHTML = steps.map(([key, label, note]) =>
+    `<button data-lens="${key}" class="${lens.lens === key ? 'on' : ''}">${label}<small>${escapeHtml(note || '')}</small></button>`).join('');
+  $('roles').classList.toggle('on', lens.lens === 'observe');
+  $('roles').innerHTML = lens.roles.map(role => `<button data-role="${role}" class="${lens.role === role ? 'on' : ''}"
+      style="${lens.role === role ? `background:var(--${role})` : ''}" title="${trained(role) ? '训练中' : '固定'}">${trained(role)}${ROLE_NAMES[role] || role} 的输入 ${c[role] || 0}</button>`).join('');
+}
+
 function entityRow(r, words) {
   const physics = r.physics ? `<button class="sw ${r.physics.mode}" data-what="physics" title="${escapeHtml(r.physics.label + '：' + r.physics.hint + '（点击切换）')}">${PHYSICS[r.physics.mode]}</button>`
                             : '<button class="sw blank"></button>';
@@ -148,17 +231,21 @@ function entityRow(r, words) {
   const lock = r.selectable === null ? '<button class="sw blank"></button>' :
     `<button class="sw${r.selectable ? ' faint' : ' locked'}" data-what="selectable" title="${r.selectable ? '视图中可点选、可拖动；点击锁定' : '已锁定：视图中点不中、拖不动（列表里仍可选中编辑）；点击解锁'}">${r.selectable ? SELECT : SELECT_OFF}</button>`;
   const eye = `<button class="sw${r.hidden ? ' off' : ''}" data-what="hidden" title="${r.hidden ? '编辑器中已隐藏（不写入 scene.yaml）' : '编辑器中显示'}">${r.hidden ? EYE_OFF : EYE}</button>`;
-  const caret = r.objects ? `<span class="caret${opened.has(r.id) ? ' open' : ''}" data-open="${escapeHtml(r.id)}" title="展开场景中的物体">${CARET}</span>`
-                          : '<span class="caret none"></span>';
+  const sub = hasSub(r);
+  const caret = r.objects && lens.lens === 'scene' ? `<span class="caret${opened.has(r.id) ? ' open' : ''}" data-open="${escapeHtml(r.id)}" title="展开场景中的物体">${CARET}</span>`
+              : sub ? `<span class="caret${opened.has(subKey(r)) ? ' open' : ''}" data-open="${escapeHtml(subKey(r))}" title="${lens.lens === 'observe' ? '展开可观察的量' : '展开关节'}">${CARET}</span>`
+              : '<span class="caret none"></span>';
+  const dim = (lens.lens === 'observe' && !(r.uses || {})[lens.role] && !sub);
   const parts = r.objects ? `<span class="tag" title="导入场景中的物体${r.excluded ? `；${r.excluded} 项已移除` : ''}">${r.objects} 件${r.excluded ? ` −${r.excluded}` : ''}</span>` : '';
-  return `<div class="row${r.selected && !r.selected_object ? ' sel' : ''}${r.selected && !r.active ? ' also' : ''}${r.hidden ? ' dim' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(r.hint || '')}" draggable="${r.id.startsWith('entity:')}"
+  return `<div class="row${r.selected && !r.selected_object && !r.selected_joint ? ' sel' : ''}${r.selected && !r.active ? ' also' : ''}${r.hidden || dim ? ' dim' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(r.hint || '')}" draggable="${r.id.startsWith('entity:')}"
                style="padding-left:${2 + (words.length ? 0 : r.depth) * 14}px">
     ${caret}<span class="kind">${svg(KINDS[r.icon] || KINDS.box)}</span>
     <span class="label">${escapeHtml(r.label)}</span>
     ${r.note ? `<span class="tag">${escapeHtml(r.note)}</span>` : ''}${parts}
     ${r.motion ? `<span class="tag motion" title="场景运动">${escapeHtml(r.motion)}</span>` : ''}
+    ${lensBadges(r)}
     ${r.changed ? '<span class="dot" title="未保存的修改"></span>' : ''}
-    <span class="switches">${lock}${physics}${renderSw}${eye}</span>
+    <span class="switches">${lens.lens === 'scene' ? lock + physics + renderSw : ''}${eye}</span>
   </div>`;
 }
 
@@ -207,13 +294,28 @@ function objectRows(entity, depth, words) {
 }
 
 function render() {
+  renderLenses();
   const words = $('filter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
   $('empty').style.display = rows.length ? 'none' : 'block';
   const html = [];
   for (const r of rows) {
     const match = !words.length || words.every(w => (r.label + ' ' + r.id + ' ' + (r.note || '')).toLowerCase().includes(w));
-    const inner = r.objects && (opened.has(r.id) || (words.length && objects[r.id])) ? objectRows(r.id, r.depth + 1, words) : [];
+    let inner = [];
+    if (lens.lens === 'scene' && r.objects && (opened.has(r.id) || (words.length && objects[r.id]))) inner = objectRows(r.id, r.depth + 1, words);
+    else if (hasSub(r) && opened.has(subKey(r))) {
+      inner = lens.lens === 'observe' ? signalRows(signals.groups.find(g => `entity:${g.path}` === r.id), r.depth + 1)
+                                      : jointRows(r, r.depth + 1);
+    }
     if (match || inner.length) html.push(entityRow(r, words), ...inner);
+  }
+  if (lens.lens === 'observe' && signals) {  // quantities of no scene entity: the simulation, a component's output
+    for (const g of signals.groups.filter(g => !g.path)) {
+      const key = `s:${g.key}`, n = g.rows.filter(q => q.enabled).length;
+      html.push(`<div class="row" data-group="${escapeHtml(key)}"><span class="caret${opened.has(key) ? ' open' : ''}" data-open="${escapeHtml(key)}">${CARET}</span>
+        <span class="kind">${svg('<circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>')}</span><span class="label">${escapeHtml(g.label)}</span>
+        ${n ? `<span class="badge ${lens.role[0]}">${n}</span>` : ''}</div>`);
+      if (opened.has(key)) html.push(...signalRows(g, 1));
+    }
   }
   $('list').innerHTML = html.join('');
   const selected = $('list').querySelector('.row.sel');
@@ -252,6 +354,9 @@ function reveal() {
 }
 
 async function update() {
+  if (lens.lens === 'observe' && (!signals || signals.revision !== revision || signals.role !== lens.role)) {
+    try { signals = await api('signals?role=' + encodeURIComponent(lens.role)); } catch (error) { message(error.message); }
+  }
   // Objects of every expanded scene follow the editor's revision (removals, hidden, selection).
   const wanted = rows.filter(r => r.objects && (opened.has(r.id) || r.selected_object || $('filter').value.trim()));
   await Promise.all(wanted.filter(r => !objects[r.id] || objects[r.id].revision !== revision).map(r => loadObjects(r.id)));
@@ -264,7 +369,7 @@ async function refresh() {
     failures = 0;
     $('offline').style.display = 'none';
     revision = data.revision;
-    if (data.rows) { rows = data.rows; await update(); }
+    if (data.rows) { rows = data.rows; takeLens(data); await update(); }
   } catch (error) {
     if (++failures > 2) $('offline').style.display = 'block';
   }
@@ -274,8 +379,16 @@ async function refresh() {
 async function act(path, body) {
   try {
     const data = await api(path, body);
-    rows = data.rows; revision = data.revision; await update();
+    rows = data.rows; revision = data.revision; takeLens(data); await update();
   } catch (error) { message(error.message); }
+}
+
+function takeLens(data) {
+  const before = lens.lens;
+  lens = {lens: data.lens, role: data.role, roles: data.roles || [], counts: data.counts || {}, train: data.train};
+  if (before !== lens.lens && lens.lens === 'observe') {  // open what the component reads
+    for (const r of rows) if ((r.uses || {})[lens.role]) opened.add(`s:${r.id}`);
+  }
 }
 
 function toggleOpen(key) {
@@ -299,6 +412,9 @@ $('list').addEventListener('click', event => {
   if (more) { listed[more.dataset.more] = (listed[more.dataset.more] || PAGE) + PAGE * 5; render(); return; }
   const row = event.target.closest('.row');
   if (!row) return;
+  if (row.dataset.signal) { act('observe', {role: lens.role, key: row.dataset.signal, on: row.dataset.on !== '1'}); return; }
+  if (row.dataset.joint) { act('joint', {id: row.dataset.id, joint: row.dataset.joint}); return; }
+  if (row.dataset.group) { toggleOpen(row.dataset.group); return; }
   const button = event.target.closest('.sw');
   if (row.dataset.object !== undefined) {
     const body = {id: row.dataset.entity, object: row.dataset.object};
@@ -356,6 +472,14 @@ $('list').addEventListener('drop', event => {
   act('bind', {id: source, target: row ? row.dataset.id : null});
 });
 $('list').addEventListener('dragend', () => { clearDrop(); dragged = null; });
+$('lenses').addEventListener('click', event => {
+  const button = event.target.closest('button[data-lens]');
+  if (button) act('lens', {lens: button.dataset.lens});
+});
+$('roles').addEventListener('click', event => {
+  const button = event.target.closest('button[data-role]');
+  if (button) act('lens', {lens: 'observe', role: button.dataset.role});
+});
 $('filter').addEventListener('input', () => { if (store) store.setItem(filterKey, $('filter').value); update(); });
 
 // Keys pressed while the outliner has focus still reach the editor's shortcuts (H, F, Ctrl+S, Ctrl+Z, Esc).

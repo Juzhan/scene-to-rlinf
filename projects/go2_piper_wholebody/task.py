@@ -1,4 +1,4 @@
-"""Reward and termination terms of LeggedManip_Lab go2_piper Flat; command = planner.output [vx vy wz | ee x y z].
+"""Reward and termination terms of LeggedManip_Lab go2_piper Flat; command = [obs.command.velocity | obs.command.ee_target] = [vx vy wz | ee x y z].
 
 Where to write the task: ``Task.evaluate(obs)`` runs once per decision step for all environments and
 returns [B] tensors ``reward`` (multiplied by step_dt when summed), ``failure`` (ends the episode; there
@@ -56,7 +56,7 @@ class Task:
         robot, arm, dt = obs.robot, obs.piperx, obs.simulation.step_dt[:, 0]
         if self.index is None:
             self.index = self._indices(obs)
-        index, command = self.index, obs.planner.output
+        index, command = self.index, torch.cat((obs.command.velocity, obs.command.ee_target), -1)
         q = robot.orientation
         lin, ang = inverse_rotate(robot.linear_velocity, q), inverse_rotate(robot.angular_velocity, q)
         gravity = inverse_rotate(torch.nn.functional.normalize(obs.simulation.gravity, dim=-1), q)
@@ -116,7 +116,7 @@ class Task:
             'hip_torque_max': torque_max['hip'], 'thigh_torque_max': torque_max['thigh'],
             'calf_torque_max': torque_max['calf'],
             'joint_acc': acceleration.square().sum(-1),
-            'action_rate': (obs.executor.output - obs.executor.previous_output).square().sum(-1),
+            'action_rate': (obs.body.output - obs.body.previous_output).square().sum(-1),
             'joint_power': (velocity * effort).abs().sum(-1),
             'feet_slide': (foot_lateral * contact).sum(-1) * tilt,
             'hip_deviation': offset[:, index['hip']].abs().sum(-1) * (upright > .7),

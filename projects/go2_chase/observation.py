@@ -17,16 +17,20 @@ class SceneInfo_ball_area(ObjectView):
     size: Tensor  # ['B', 2], float, m, ball_area, 尺寸（全长）
 
 
-class SceneInfo_executor_input_ball(ObjectView):
+class SceneInfo_head(ObjectView):
+    frame_positions: Tensor  # ['B', None, 3], float, m, environment, 测量坐标系位置
+
+
+class SceneInfo_policy_input_ball(ObjectView):
     linear_velocity: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m/s, environment, 线速度（Task set 位移 / 决策步长）
     position: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m, environment, 位置
 
 
-class SceneInfo_executor_input_executor(ObjectView):
-    output: Tensor  # ['B', 5, 12], 5 帧历史 旧→新, 复位后以首帧补齐, float, 本步输出（解码前动作）
+class SceneInfo_policy_input_policy(ObjectView):
+    output: Tensor  # ['B', 5, None], 5 帧历史 旧→新, 复位后以首帧补齐, float, 本步输出（动作）
 
 
-class SceneInfo_executor_input_robot(ObjectView):
+class SceneInfo_policy_input_robot(ObjectView):
     angular_velocity: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, rad/s, environment, 根部角速度
     joint_position: Tensor  # ['B', 5, None], 5 帧历史 旧→新, 复位后以首帧补齐, float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', 5, None], 5 帧历史 旧→新, 复位后以首帧补齐, float, 关节速度（绝对值）
@@ -34,43 +38,27 @@ class SceneInfo_executor_input_robot(ObjectView):
     position: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m, environment, 根部位置
 
 
-class SceneInfo_executor_input(ObjectView):
-    ball: SceneInfo_executor_input_ball
-    executor: SceneInfo_executor_input_executor
-    robot: SceneInfo_executor_input_robot
+class SceneInfo_policy_input(ObjectView):
+    ball: SceneInfo_policy_input_ball
+    policy: SceneInfo_policy_input_policy
+    robot: SceneInfo_policy_input_robot
 
 
-class SceneInfo_executor(ObjectView):
-    input: SceneInfo_executor_input
-    output: Tensor  # ['B', 12], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 12], float, 上一步输出（解码前动作）
-
-
-class SceneInfo_head(ObjectView):
-    frame_positions: Tensor  # ['B', None, 3], float, m, environment, 测量坐标系位置
-
-
-class SceneInfo_planner_input_ball(ObjectView):
-    position: Tensor  # ['B', 3], float, m, environment, 位置
-
-
-class SceneInfo_planner_input(ObjectView):
-    ball: SceneInfo_planner_input_ball
-
-
-class SceneInfo_planner(ObjectView):
-    input: SceneInfo_planner_input
-    output: Tensor  # ['B', 3], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 3], float, 上一步输出（解码前动作）
+class SceneInfo_policy(ObjectView):
+    input: SceneInfo_policy_input
+    output: Tensor  # ['B', None], float, 本步输出（动作）
+    previous_output: Tensor  # ['B', None], float, 上一步输出（动作）
 
 
 class SceneInfo_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, robot/root, 包围盒（本体坐标的最小角, 最大角）
     default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_effort: Tensor  # ['B', None], float, 关节实际力 / 力矩
+    joint_limits: Tensor  # ['B', None, 2], float, 关节范围（下限, 上限）
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -87,31 +75,22 @@ class SceneInfo_simulation(ObjectView):
 class SceneInfo(ObjectView):
     ball: SceneInfo_ball
     ball_area: SceneInfo_ball_area
-    executor: SceneInfo_executor
     head: SceneInfo_head
-    planner: SceneInfo_planner
+    policy: SceneInfo_policy
     robot: SceneInfo_robot
     simulation: SceneInfo_simulation
 
 
-class PlannerObs_ball(ObjectView):
-    position: Tensor  # ['B', 3], float, m, environment, 位置
-
-
-class PlannerObs(ObjectView):
-    ball: PlannerObs_ball
-
-
-class ExecutorObs_ball(ObjectView):
+class PolicyObs_ball(ObjectView):
     linear_velocity: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m/s, environment, 线速度（Task set 位移 / 决策步长）
     position: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m, environment, 位置
 
 
-class ExecutorObs_executor(ObjectView):
-    output: Tensor  # ['B', 5, 12], 5 帧历史 旧→新, 复位后以首帧补齐, float, 本步输出（解码前动作）
+class PolicyObs_policy(ObjectView):
+    output: Tensor  # ['B', 5, None], 5 帧历史 旧→新, 复位后以首帧补齐, float, 本步输出（动作）
 
 
-class ExecutorObs_robot(RobotView):
+class PolicyObs_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, rad/s, environment, 根部角速度
@@ -121,22 +100,22 @@ class ExecutorObs_robot(RobotView):
     position: Tensor  # ['B', 5, 3], 5 帧历史 旧→新, 复位后以首帧补齐, float, m, environment, 根部位置
 
 
-class ExecutorObs(ObjectView):
-    ball: ExecutorObs_ball
-    executor: ExecutorObs_executor
-    robot: ExecutorObs_robot
+class PolicyObs(ObjectView):
+    ball: PolicyObs_ball
+    policy: PolicyObs_policy
+    robot: PolicyObs_robot
 
 
-Obs = ExecutorObs
-SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'head.frame_positions', 'simulation.gravity', 'ball.position', 'ball.orientation', 'ball.linear_velocity', 'ball_area.position', 'ball_area.orientation', 'ball_area.size', 'planner.output', 'planner.previous_output', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.ball.position', 'executor.input.robot.joint_position', 'executor.input.robot.joint_velocity', 'executor.input.robot.orientation', 'executor.input.robot.angular_velocity', 'executor.input.robot.position', 'executor.input.ball.position', 'executor.input.ball.linear_velocity', 'executor.input.executor.output')
+Obs = PolicyObs
+SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'robot.joint_limits', 'robot.bounds', 'head.frame_positions', 'simulation.gravity', 'ball.position', 'ball.orientation', 'ball.linear_velocity', 'ball_area.position', 'ball_area.orientation', 'ball_area.size', 'policy.output', 'policy.previous_output', 'simulation.step_dt', 'simulation.time', 'policy.input.robot.joint_position', 'policy.input.robot.joint_velocity', 'policy.input.robot.orientation', 'policy.input.robot.angular_velocity', 'policy.input.robot.position', 'policy.input.ball.position', 'policy.input.ball.linear_velocity', 'policy.input.policy.output')
 
 
-PlannerOutput = Tensor  # ['B', 3], 固定组件 forward 返回
-ExecutorOutput = Tensor  # ['B', 12], 训练组件 forward 返回 (ExecutorOutput 均值, Tensor ['B', 1] 价值)，模型另需参数 actor_logstd；build 的 config 即 train.yaml 的 actor.model（action_dim、hidden_dims 等）；解码前动作，initial 返回同形状
+Action = Tensor  # 被训练层 policy 的 forward 返回：动作 ['B', 动作个数]；个数就是模型最后一层的大小，构造参数写 actions 时得到受控关节总数（默认 decode 的情形）
+# initial_action(obs) 返回同形状的 Action（复位后第一步之前的动作，缺省为 0）
 
 
-class ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致
-    legs: Tensor  # ['B', 12], joint_position, robot: FL_hip_joint, FL_thigh_joint, FL_calf_joint, FR_hip_joint, FR_thigh_joint, FR_calf_joint, RL_hip_joint, RL_thigh_joint, RL_calf_joint, RR_hip_joint, RR_thigh_joint, RR_calf_joint
+class Targets(TypedDict):  # decode_action(action, obs: PolicyObs) 返回；实际单位，每台受控机器人一项
+    robot: Tensor  # ['B', 关节数], joint_position, robot 的全部关节，顺序同 robot.joint_position
 
 
 class TaskResult(TypedDict, total=False):  # evaluate(obs: SceneInfo) 返回；缺省 reward=0, success/failure=False

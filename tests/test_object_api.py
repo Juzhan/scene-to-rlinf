@@ -39,13 +39,13 @@ def test_generated_template_has_types_task_and_refreshes_without_touching_code(t
     task=(target/'task.py').read_bytes()
     scene=yaml.safe_load((target/'scene.yaml').read_text())
     assert 'variables' not in scene and 'task' not in scene
-    scene['control']['components']['executor']['observations'].remove('robot.angular_velocity')
+    scene['policy']['layers']['policy']['inputs'].remove('robot.angular_velocity')
     (target/'scene.yaml').write_text(yaml.safe_dump(scene,sort_keys=False))
     generate(target/'scene.yaml')
     source=(target/'observation.py').read_text()
     tree={}
     exec(compile(source,'observation.py','exec'),tree)
-    assert 'angular_velocity' not in tree['ExecutorObs_robot'].__annotations__
+    assert 'angular_velocity' not in tree['PolicyObs_robot'].__annotations__
     assert 'angular_velocity' in tree['SceneInfo_robot'].__annotations__
     assert (target/'policy.py').read_bytes()==initial
     assert (target/'task.py').read_bytes()==task

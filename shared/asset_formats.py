@@ -650,19 +650,141 @@ def usd_inertia_into_mjcf(mjcf, usd):
 
 # URDF/MJCF -> USD (Isaac Sim importers) ------------------------------------
 
+def mjcf_geom_defaults(source, target):
+    """Write ``target``: the MJCF ``source`` with every geom's default-class attributes written on the geom,
+    when some geom takes any from a class; returns how many geoms changed (0: nothing written).
+
+    The Isaac MJCF importer does not apply geom defaults of nested classes: MuJoCo Menagerie's UR5e
+    collision capsules (``<default class="collision"><geom type="capsule"/>``) became spheres. MuJoCo's
+    rule is kept: a geom's class is its ``class``, else the nearest enclosing body's ``childclass``, else
+    ``main``; a class inherits the attributes of the classes it is nested in. Asset folders and includes are
+    rewritten relative to ``target``'s folder (the Isaac importer prefixes the model folder even to absolute
+    ones), so ``target`` may sit in another directory."""
+    tree = ElementTree.parse(source)
+    root = tree.getroot()
+    classes = {}
+
+    def collect(default, inherited):
+        geom = default.find('geom')
+        attributes = {**inherited, **(geom.attrib if geom is not None else {})}
+        classes[default.get('class', 'main')] = attributes
+        for child in default.findall('default'):
+            collect(child, attributes)
+
+    for default in root.findall('default'):
+        collect(default, {})
+    changed = 0
+
+    def walk(element, childclass):
+        nonlocal changed
+        for child in element:
+            if child.tag == 'geom':
+                extra = {key: value for key, value in classes.get(child.get('class', childclass), {}).items()
+                         if key not in child.attrib}
+                child.attrib.update(extra)
+                changed += bool(extra)
+            elif child.tag in ('body', 'frame'):
+                walk(child, child.get('childclass', childclass))
+            elif child.tag == 'worldbody':
+                walk(child, childclass)
+
+    walk(root, 'main')
+    if changed:
+        folder, there = Path(source).resolve().parent, Path(target).resolve().parent
+        relative = lambda path: os.path.relpath(folder / path, there)
+        compiler = root.find('compiler')
+        if compiler is None:
+            compiler = ElementTree.SubElement(root, 'compiler')
+        for key in ('meshdir', 'texturedir'):  # MuJoCo resolves them from assetdir, else the model folder
+            compiler.set(key, relative(compiler.get(key, compiler.get('assetdir', '.'))))
+        compiler.attrib.pop('assetdir', None)
+        for include in root.iter('include'):
+            include.set('file', relative(include.get('file')))
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        tree.write(target)
+    return changed
+
+
+def mjcf_standalone_inertia(source, target):
+    """Write ``target``: ``source`` without its ``inertiagrouprange`` when that range leaves moving bodies with
+    no mass, so the geoms' own masses count; returns whether it wrote one.
+
+    Objects made to be included in a larger model (robosuite / LIBERO: ``inertiagrouprange="4 4"`` with every
+    geom in groups 0-1) take their masses from the including model's compiler. On their own MuJoCo rejects them
+    and the Isaac importer makes their bodies massless. Asset folders are rewritten relative to ``target``."""
+    import mujoco
+    root = ElementTree.parse(source).getroot()
+    compiler = root.find('compiler')
+    if compiler is None or compiler.get('inertiagrouprange') is None:
+        return False
+    try:
+        mujoco.MjModel.from_xml_path(str(source))
+        return False
+    except ValueError as error:
+        if 'mass and inertia' not in str(error):
+            return False
+    compiler.attrib.pop('inertiagrouprange')
+    folder, there = Path(source).resolve().parent, Path(target).resolve().parent
+    for key in ('meshdir', 'texturedir'):
+        compiler.set(key, os.path.relpath(folder / compiler.get(key, compiler.get('assetdir', '.')), there))
+    compiler.attrib.pop('assetdir', None)
+    for include in root.iter('include'):
+        include.set('file', os.path.relpath(folder / include.get('file'), there))
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+    ElementTree.ElementTree(root).write(target)
+    mujoco.MjModel.from_xml_path(str(target))  # it must load now
+    return True
+
+
+KIT_EXIT_GRACE = 30.0  # s the Isaac importer may take to close Kit after writing its result
+
+
 def to_usd(source, directory, name, fix_base):
-    """Run the Isaac Lab importer in the Isaac interpreter (it starts a headless Kit app)."""
+    """Run the Isaac Lab importer in the Isaac interpreter (it starts a headless Kit app). An MJCF whose geoms
+    take attributes from default classes is imported from a copy with them written out (mjcf_geom_defaults)."""
     python = os.environ.get('ISAAC_PYTHON', str(ROOT / '.venv/bin/python'))
+    # Same file name (the importer names the root prim after it) in a scratch folder
+    scratch = Path(tempfile.mkdtemp(prefix='mjcf_'))
+    if source_format(source) == 'mjcf' and mjcf_geom_defaults(source, scratch / Path(source).name):
+        source = scratch / Path(source).name
     command = [python, '-m', 'shared.asset_formats', '_isaac_import', str(source), str(directory), name]
     if fix_base:
         command.append('--fix-base')
-    subprocess.run(command, check=True, cwd=ROOT, env={
+    result = Path(directory) / '.import.json'
+    result.unlink(missing_ok=True)
+    process = subprocess.Popen(command, cwd=ROOT, env={
         **os.environ, 'OMNI_KIT_ACCEPT_EULA': 'YES',
         'PYTHONPATH': os.pathsep.join(filter(None, (str(ROOT), os.environ.get('PYTHONPATH'))))})
-    return Path(directory) / (name + '.usd'), json.loads((Path(directory) / '.import.json').read_text())
+    try:
+        # The importer writes .import.json before closing Kit, whose shutdown can hang (seen after a URDF whose
+        # links have no geometry): once the result is there, the process gets a grace period, then it is ended.
+        finished = None
+        while process.poll() is None:
+            if finished is None and result.is_file():
+                finished = time.time()
+            if finished is not None and time.time() - finished > KIT_EXIT_GRACE:
+                process.terminate()
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
+            time.sleep(.5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        shutil.rmtree(scratch, ignore_errors=True)
+    if not result.is_file():
+        raise RuntimeError(f'Isaac importer exited ({process.returncode}) without a result for {source}')
+    record = json.loads(result.read_text())
+    if 'error' in record:
+        raise RuntimeError(f'Isaac importer failed on {source}:\n{record["error"]}')
+    return Path(directory) / (name + '.usd'), record
 
 
 def _isaac_import(source, directory, name, fix_base):
+    """Closing the Kit app ends the process, so an importer error is written to .import.json for to_usd."""
+    import traceback
     from isaaclab.app import AppLauncher
     application = AppLauncher(headless=True).app
     try:
@@ -679,6 +801,9 @@ def _isaac_import(source, directory, name, fix_base):
         import isaacsim
         (Path(directory) / '.import.json').write_text(json.dumps(
             {'tool': tool, 'version': getattr(isaacsim, '__version__', 'unknown'), 'fix_base': fix_base}))
+    except Exception:  # noqa: BLE001 - reported by to_usd
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        (Path(directory) / '.import.json').write_text(json.dumps({'error': traceback.format_exc()}))
     finally:
         application.close()
 
@@ -747,12 +872,30 @@ def mjcf_bodies(path):
             colliders = bodies[model.body(model.geom_bodyid[index]).name].setdefault('colliders', {})
             kind = shapes.get(int(model.geom_type[index]), str(model.geom_type[index]))
             colliders[kind] = colliders.get(kind, 0) + 1
-    kinds = {mujoco.mjtJoint.mjJNT_HINGE: 'hinge', mujoco.mjtJoint.mjJNT_SLIDE: 'slide'}
+    kinds = {int(mujoco.mjtJoint.mjJNT_HINGE): 'hinge', int(mujoco.mjtJoint.mjJNT_SLIDE): 'slide'}  # enum members do not hash as ints
     joints = {model.joint(index).name: {
-        'type': kinds.get(model.jnt_type[index], 'other'), 'axis': data.xaxis[index].tolist(),
+        'type': kinds.get(int(model.jnt_type[index]), 'other'), 'axis': data.xaxis[index].tolist(),
         'range': model.jnt_range[index].tolist() if model.jnt_limited[index] else None}
         for index in range(model.njnt)}
     return bodies, joints
+
+
+def usd_zero_outside_limits(path):
+    """{movable joint: the limit nearest 0} for joints whose range leaves out 0 (rad or m): a knee bending only
+    one way (DeepRobotics Lite3: 0.52 to 2.79 rad). Isaac Lab rejects such an asset at its default pose 0."""
+    import math
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(str(path))
+    nearest = {}
+    for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        for schema, factor in ((UsdPhysics.RevoluteJoint, math.pi / 180.), (UsdPhysics.PrismaticJoint, 1.)):
+            if prim.IsA(schema):
+                joint = schema(prim)
+                low, high = joint.GetLowerLimitAttr().Get(), joint.GetUpperLimitAttr().Get()
+                if low is not None and high is not None and math.isfinite(low) and math.isfinite(high) \
+                        and low < high and not low <= 0. <= high:
+                    nearest[prim.GetName()] = (low if low > 0. else high) * factor
+    return nearest
 
 
 def usd_joint_order(path):
@@ -787,7 +930,7 @@ def mjcf_joint_order(path):
     import mujoco
     model = mujoco.MjModel.from_xml_path(str(path))
     return [model.joint(index).name for index in range(model.njnt)
-            if model.jnt_type[index] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)]
+            if int(model.jnt_type[index]) in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))]
 
 
 def joint_order_problems(record):
@@ -901,7 +1044,11 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
             raise FileExistsError(f'{directory} is not empty; remove it or choose another output')
     if (output / 'ASSET.json').exists():
         raise FileExistsError(f'{output / "ASSET.json"} exists; remove it or choose another output')
-    steps, formats = [], {kind: workspace_path(source)}
+    steps, formats, original = [], {kind: workspace_path(source)}, source
+    if kind == 'mjcf' and mjcf_standalone_inertia(source, output / 'mjcf' / source.name):
+        source = output / 'mjcf' / source.name  # converted and compared from here; the original stays the source
+        steps.append({'from': 'mjcf', 'to': 'mjcf', 'inertia': 'inertiagrouprange removed: masses from every geom'})
+        formats['mjcf'] = workspace_path(source)
     with tempfile.TemporaryDirectory() as scratch:
         urdf = source if kind == 'urdf' else None
         if kind == 'usd':
@@ -921,20 +1068,29 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
             steps.append({'from': kind, 'to': 'usd', **step})
             formats['usd'] = workspace_path(path)
     record = {
-        'source': workspace_path(source), 'source_format': kind, 'source_sha256': digest(source),
+        'source': workspace_path(original), 'source_format': kind, 'source_sha256': digest(original),
         **({'source_layers_sha256': usd_layers(source)} if kind == 'usd' else {}),
         'formats': formats, 'steps': steps,
         # Joint readings use this order in every backend (Isaac's own order for a USD).
         'joint_order': (usd_joint_order(ROOT / formats['usd']) if 'usd' in formats
                         else mjcf_joint_order(ROOT / formats['mjcf'])),
-        'alignment': (compare(ROOT / formats['usd'], ROOT / formats['mjcf'])
-                      if formats.keys() == {'usd', 'mjcf'} else None),
+        'alignment': (alignment_of(ROOT / formats['usd'], ROOT / formats['mjcf'])
+                      if {'usd', 'mjcf'} <= formats.keys() else None),
         'sha256': {path.relative_to(output).as_posix(): digest(path)
                    for format_ in targets if format_ != kind
                    for path in sorted(targets[format_].rglob('*')) if path.is_file()},
     }
     (output / 'ASSET.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
     return record
+
+
+def alignment_of(usd, mjcf):
+    """compare(), or why the two forms could not be compared (a written USD stays usable): e.g. an MJCF made
+    to be included in a larger model, whose bodies get no mass on their own."""
+    try:
+        return compare(usd, mjcf)
+    except Exception as error:  # noqa: BLE001 - recorded in ASSET.json, the conversion itself succeeded
+        return {'aligned': False, 'error': f'{type(error).__name__}: {error}'.strip()}
 
 
 def source_hashes(source, packages=None):
@@ -1362,22 +1518,6 @@ def scene_edit_layer(path, exclude=(), moved=None):
     layer.Export(str(staging))
     staging.replace(output)
     return output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    layer = Sdf.Layer.CreateAnonymous('.usda')
-    out = Usd.Stage.Open(layer)
-    out.GetRootLayer().subLayerPaths.append(str(path))
-    out.SetDefaultPrim(out.OverridePrim(top.GetPath()))
-    for name in names:
-        prim = stage.GetPrimAtPath(top.GetPath().AppendPath(name))
-        _editable(out, prim, top).SetActive(False)
-        beside = stage.GetPrimAtPath(top.GetPath().AppendPath(name + COLLIDER_SUFFIX))  # a gprim object's collider
-        if beside:
-            _editable(out, beside, top).SetActive(False)
-    del out, stage, prim
-    layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
-    staging = output.with_suffix(f'.{os.getpid()}.usda')
-    layer.Export(str(staging))
-    staging.replace(output)
     return output
 
 
@@ -1426,12 +1566,16 @@ def base_material(prim, cache=None):
         source = inputs.get(name)
         if source is None:
             continue
-        if source.HasConnectedSource():  # UsdPreviewSurface: diffuseColor from a UsdUVTexture
-            upstream = UsdShade.Shader(source.GetConnectedSources()[0][0].source.GetPrim())
-            file = upstream.GetInput('file') if upstream else None
-            texture = file.Get() if file else None
-            break
         value = source.Get()
+        if source.HasConnectedSource():
+            # The attribute the value comes from: a texture node's output (UsdPreviewSurface diffuseColor from a
+            # UsdUVTexture), or an input of the material's interface (SimReady robots expose their colours there).
+            produced = source.GetValueProducingAttributes()
+            if produced and UsdShade.Utils.GetType(produced[0].GetName()) == UsdShade.AttributeType.Output:
+                file = UsdShade.Shader(produced[0].GetPrim()).GetInput('file')
+                texture = file.Get() if file else None
+                break
+            value = produced[0].Get() if produced else None
         if hasattr(value, '__len__') and len(value) >= 3 and not isinstance(value, (str, Sdf.AssetPath)):
             color = [float(value[i]) for i in range(3)]
             break
@@ -1629,6 +1773,71 @@ def joint_spring_layer(path, springs):
         if not prim.HasAPI(UsdPhysics.DriveAPI, token):
             drive.CreateTypeAttr('force')
             drive.CreateMaxForceAttr(float('inf'))
+    del out, stage, joints  # no stage recomposes the layer once its path turns relative
+    layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
+    staging = output.with_suffix(f'.{os.getpid()}.usda')
+    layer.Export(str(staging))
+    staging.replace(output)
+    return output
+
+
+def joint_coupling_layer(path, couplings):
+    """A cached USD layer over ``path`` in which named joints follow others (``usd_object.couplings``):
+    a trash can's lid opening as its pedal is pressed, a dial's needle turning with its knob.
+
+    ``couplings`` maps a follower joint to ``{leader, ratio, offset}``: follower = ratio * leader + offset, in
+    rad for revolute joints and m for prismatic ones (offset defaults to 0). It is written as the PhysX mimic
+    joint schema, which OvPhysX applies and Newton imports as its mimic constraint: a physical linkage, forces
+    pass both ways (pushing the lid also lowers the pedal). A follower is not a leader. Returns the layer path."""
+    import math
+    from pxr import Sdf, Usd, UsdPhysics
+    path = Path(path).resolve()
+    if not isinstance(couplings, dict) or not couplings:
+        raise ValueError(f'{workspace_path(path)}: couplings maps follower joints to {{leader, ratio, offset}}')
+    stage = Usd.Stage.Open(str(path))
+    joints = {prim.GetName(): prim for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies())
+              if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint)}
+
+    def axis(prim):  # the mimic schema instance of a joint's own degree of freedom
+        joint = UsdPhysics.RevoluteJoint(prim) if prim.IsA(UsdPhysics.RevoluteJoint) else UsdPhysics.PrismaticJoint(prim)
+        return ('rot' if prim.IsA(UsdPhysics.RevoluteJoint) else 'trans') + (joint.GetAxisAttr().Get() or 'X')
+    edits = {}
+    for follower, coupling in couplings.items():
+        if not isinstance(coupling, dict) or set(coupling) - {'leader', 'ratio', 'offset'} or 'leader' not in coupling:
+            raise ValueError(f'{workspace_path(path)}: couplings.{follower} is {{leader, ratio, offset}}')
+        leader = coupling['leader']
+        for name in (follower, leader):
+            if name not in joints:
+                raise ValueError(f'{workspace_path(path)}: couplings names unknown joint {name!r}; movable joints: '
+                                 f'{", ".join(sorted(joints))}')
+        if leader == follower or leader in couplings:
+            raise ValueError(f'{workspace_path(path)}: couplings.{follower} follows {leader}, which '
+                             f'{"is itself" if leader == follower else "follows another joint"}; a leader moves freely')
+        values = {key: coupling.get(key, 1. if key == 'ratio' else 0.) for key in ('ratio', 'offset')}
+        for key, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f'{workspace_path(path)}: couplings.{follower}.{key} must be a finite number')
+        edits[follower] = {'leader': leader, **{key: float(value) for key, value in values.items()}}
+    key = hashlib.sha256(json.dumps({'source': source_hashes(path), 'couplings': edits,
+                                     'writer': digest(__file__)}, sort_keys=True).encode()).hexdigest()[:12]
+    output = ROOT / '.cache/usd_couplings' / f'{path.stem}_{key}.usda'
+    if output.is_file():
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateAnonymous('.usda')
+    out = Usd.Stage.Open(layer)
+    out.GetRootLayer().subLayerPaths.append(str(path))
+    if stage.GetDefaultPrim():
+        out.SetDefaultPrim(out.OverridePrim(stage.GetDefaultPrim().GetPath()))
+    for follower, edit in edits.items():
+        prim, leader = joints[follower], joints[edit['leader']]
+        instance, edited = axis(prim), _editable(out, prim, stage.GetPseudoRoot())
+        edited.AddAppliedSchema(f'PhysxMimicJointAPI:{instance}')
+        # PhysX: follower + gearing * leader + offset = 0
+        edited.CreateAttribute(f'physxMimicJoint:{instance}:gearing', Sdf.ValueTypeNames.Float).Set(-edit['ratio'])
+        edited.CreateAttribute(f'physxMimicJoint:{instance}:offset', Sdf.ValueTypeNames.Float).Set(-edit['offset'])
+        edited.CreateRelationship(f'physxMimicJoint:{instance}:referenceJoint').SetTargets([leader.GetPath()])
+        edited.CreateAttribute(f'physxMimicJoint:{instance}:referenceJointAxis', Sdf.ValueTypeNames.Token).Set(axis(leader))
     del out, stage, joints  # no stage recomposes the layer once its path turns relative
     layer.subLayerPaths[0] = os.path.relpath(path, output.parent)
     staging = output.with_suffix(f'.{os.getpid()}.usda')
@@ -2752,6 +2961,9 @@ def summary(report):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ['import']:
+        from shared.asset_import import main as import_main
+        return import_main(argv[1:])
     if argv[:1] == ['_isaac_import']:
         source, directory, name = argv[1:4]
         return _isaac_import(Path(source), Path(directory), name, '--fix-base' in argv)
@@ -2936,6 +3148,9 @@ def main(argv=None):
         record = convert(options.source, options.output, options.name, packages, options.root,
                          options.fix_base, options.keep_visuals)
         print(json.dumps(record['formats'], indent=2))
+        if record['alignment'] is None:
+            print('only one of USD / MJCF written: no alignment report')
+            return 0
         print(summary(record['alignment']))
         return 0 if record['alignment']['aligned'] else 1
     if options.mjcf is None:

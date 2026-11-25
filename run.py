@@ -72,6 +72,30 @@ def _configure_checkpoint_interval(cfg):
     cfg.runner.save_interval = ((budget + cadence - 1) // cadence) * cadence
 
 
+MICRO_BATCH = 4096  # largest micro batch run at once (memory)
+
+
+def _configure_batches(cfg):
+    """PPO splits every rollout (environments × steps) into minibatches of ``actor.global_batch_size`` and runs
+    each in micro batches of ``actor.micro_batch_size``, so each must divide the one before (RLinf asserts it
+    mid-training). ``auto`` sizes them from the rollout: the whole rollout is one minibatch, as the templates
+    had it, run in micro batches of its largest divisor up to MICRO_BATCH; explicit sizes are checked here."""
+    actor, train = cfg.get("actor"), cfg.get("env", {}).get("train")
+    if actor is None or train is None or "global_batch_size" not in actor or cfg.runner.get("task_type") == "sft":
+        return
+    samples = int(train.total_num_envs) * int(train.max_steps_per_rollout_epoch) * int(train.get("rollout_epoch", 1))
+    if actor.global_batch_size == "auto":
+        actor.global_batch_size = samples
+    if actor.micro_batch_size == "auto":
+        actor.micro_batch_size = max(size for size in range(1, min(MICRO_BATCH, actor.global_batch_size) + 1)
+                                     if actor.global_batch_size % size == 0)
+    if samples % int(actor.global_batch_size) or int(actor.global_batch_size) % int(actor.micro_batch_size):
+        raise ValueError(
+            f"每轮采样 {samples} 条（环境 {train.total_num_envs} × 步数 {train.max_steps_per_rollout_epoch}）须能被 "
+            f"actor.global_batch_size={actor.global_batch_size} 整除，后者须能被 actor.micro_batch_size="
+            f"{actor.micro_batch_size} 整除（PPO 按它们切分批次）；写 auto 则按采样数自动取")
+
+
 def declares_backend(directory, overrides=()):
     """Whether a project names its simulator backend rather than inheriting configs/state_ppo.yaml's."""
     from omegaconf import OmegaConf
@@ -100,6 +124,7 @@ def compose_project(name, config="train", overrides=(), *, register=True):
     from shared.assembly.project import follow_train_backend
     follow_train_backend(cfg, overrides)
     _configure_checkpoint_interval(cfg)
+    _configure_batches(cfg)
     extension = f"projects.{name}.project" if has_project_module else f"projects.{name}"
     os.environ["RLINF_EXT_MODULE"] = extension
     module = import_module(extension)
@@ -205,23 +230,22 @@ def main():
             if options.blender:
                 from tools.blender_editor import main as open_editor
                 raise SystemExit(open_editor(["open", *(["--scene", str(scene)] if scene else []), *remaining]))
-            if scene is None:
-                editor.error("The browser editor needs a project or --scene; use --blender for an empty environment")
-            if not scene.is_file():
+            if scene is not None and not scene.is_file():
                 editor.error(f"No scene file: {scene}")
             # The editor runs in the project's simulator environment, the one that also exports its meshes.
             python = os.environ.get("RLINF_EDITOR_PYTHON")
             if not python:
                 from shared.assembly.visuals import exporter_python, geometry_backend
-                python = exporter_python(geometry_backend(scene))
+                # Without a project the editor starts on a blank draft of the default template's backend.
+                python = exporter_python(geometry_backend(scene or ROOT / "projects/go2_goal/scene.yaml"))
             python = Path(python)
             probe = "import importlib.util, sys; sys.exit(importlib.util.find_spec('viser') is None)"
             if not python.exists() or subprocess.call([str(python), "-c", probe]) != 0:
                 editor.error(f"{python} has no viser (the web editor)\n"
                              f"  uv pip install --python {python} viser==1.1.1\n"
                              "or set RLINF_EDITOR_PYTHON to an interpreter with viser")
-            raise SystemExit(subprocess.call([str(python), str(ROOT / "tools/web_editor.py"),
-                                              "--scene", str(scene.resolve()), *remaining], cwd=ROOT))
+            target = ["--scene", str(scene.resolve())] if scene else ["--start"]  # no project: start screen
+            raise SystemExit(subprocess.call([str(python), str(ROOT / "tools/web_editor.py"), *target, *remaining], cwd=ROOT))
         if scene is None:
             editor.error('catalog requires a project or --scene')
         if remaining:

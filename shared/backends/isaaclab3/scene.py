@@ -16,7 +16,7 @@ from shared.backends.isaac.scene import scene_metadata
 from .frames import wxyz, xyzw
 
 SCENE_KEYS = {'schema_version', 'name', 'entities', 'connections', 'simulation', 'world', 'authoring',
-              'control', 'targets', 'application', 'observations', 'visualization'}
+              'control', 'policy', 'targets', 'application', 'observations', 'visualization'}
 # `newton` configures the Newton engine, `physx` the OvPhysX one; `mujoco` belongs to mjlab.
 SIMULATION_KEYS = {'dt', 'gravity', 'render_interval', 'physics_material', 'physx', 'mujoco', 'newton'}
 INITIAL_STATE = {'joint_positions', 'joint_velocities', 'linear_velocity', 'angular_velocity'}
@@ -47,15 +47,17 @@ def validate(description, settings):
     # Isaac Lab 3 keeps the native material startup event on Newton and OvPhysX.
     from shared.backends.isaac.contact_materials import validate_materials
     validate_materials(world.get('contact_materials', {}), scene_metadata(description).keys.values())
-    from .assets import RAY_SENSORS, SENSORS
+    from .assets import FREE_SENSORS, RAY_SENSORS, SENSORS
     for path, (node, _) in description.index().items():
         if isinstance(node, Abstract):
             continue
         if isinstance(node, Sensor):
             if node.factory not in SENSORS:
                 raise NotImplementedError(f'{path}: isaaclab3 implements only the sensors {list(SENSORS)}')
-            if not node.mount or not node.mount.body:
+            if node.mount is None and node.factory not in FREE_SENSORS:
                 raise ValueError(f'{path}: {node.factory} needs a mount entity and body; it follows that body')
+            if node.mount is not None and not node.mount.body:
+                raise ValueError(f'{path}: {node.factory} needs the body of {node.mount.entity} it follows')
             if node.reset is not None:
                 raise ValueError(f'{path}: sensors cannot be reset')
             if node.factory in RAY_SENSORS:
@@ -156,8 +158,9 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
             native.collision_group = -1
         if isinstance(node, Sensor):
             # prim_path is the mount body's prim, as in the isaac backend. A camera is spawned as a
-            # child of that body, as in Isaac Lab 3's own wrist cameras.
-            if getattr(native, 'spawn', None) is not None and hasattr(native, 'renderer_cfg'):
+            # child of that body, as in Isaac Lab 3's own wrist cameras; an unmounted one stands in its
+            # environment at its own prim path, its pose the offset from the environment origin.
+            if getattr(native, 'spawn', None) is not None and hasattr(native, 'renderer_cfg') and node.mount:
                 native.prim_path += '/' + (node.prim_name or key)
             if hasattr(native, 'mesh_prim_paths'):
                 # Newton reads hits from the global world only (see ray_targets).
@@ -166,7 +169,8 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
             # transformer's source frame); an unauthored pose keeps the factory's offset.
             offset = getattr(native, 'offset', getattr(native, 'source_frame_offset', None))
             if offset is not None:
-                sensor_pose = node.pose if node.pose_authored else node.pose.compose(
+                placed = node.pose if node.mount else pose  # relative to its body, else where the scene puts it
+                sensor_pose = placed if node.pose_authored else placed.compose(
                     Pose(tuple(offset.pos), wxyz(tuple(offset.rot))))
                 offset.pos, offset.rot = sensor_pose.position, xyzw(sensor_pose.orientation)
             elif node.pose_authored and node.pose != Pose():
@@ -182,7 +186,7 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
         func = getattr(spawn, 'func', None)
         if func is not None and (func if isinstance(func, str) else f'{func.__module__}:{func.__name__}') == NATIVE:
             spawn.func = SPAWN_FROM_USD
-        compensate_gravity(spawn, path)
+        compensate_gravity(spawn, path, weightless=node.gravity_compensation)
         if not node.visible:
             if spawn is None or not hasattr(spawn, 'visible'):
                 raise ValueError(f'Entity {path}: visible: false needs an asset Isaac Lab spawns from a config')
@@ -217,34 +221,59 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
     return config
 
 
-def compensate_gravity(spawn, path):
-    """Bodies spawned without gravity keep it off on every engine.
+def compensate_gravity(spawn, path, weightless=False):
+    """Bodies without gravity keep it off on every engine.
 
-    Asset presets switch gravity off with PhysX's per-body ``disable_gravity``. Newton reads that flag
-    only on the physics scene, so such bodies also get MuJoCo ``gravcomp=1``, as Isaac Lab 3's own
-    Franka differential-IK preset authors both; PhysX ignores the MuJoCo fragment. An explicit
+    Asset presets switch gravity off with PhysX's per-body ``disable_gravity``; ``weightless`` (the entity's
+    ``gravity_compensation: true``) does it for any asset. Newton reads that flag only on the physics scene, so such
+    bodies also get MuJoCo ``gravcomp=1``, as Isaac Lab 3's own Franka differential-IK preset authors both; PhysX
+    ignores the MuJoCo fragment. A legacy ``RigidBodyPropertiesCfg`` (piper_x's preset) is written as the schema
+    fragments carrying the same fields; the fragments are copies, a factory's preset stays as it is. An explicit
     gravcomp is kept."""
+    import copy
     from isaaclab.sim.spawners.utils import fragment_mapping
     from isaaclab_newton.sim.schemas import MujocoRigidBodyCfg, MujocoRigidBodyPropertiesCfg
+    from isaaclab_physx.sim.schemas import PhysxRigidBodyCfg
+    if weightless and (spawn is None or not hasattr(spawn, 'rigid_props')):
+        raise ValueError(f'Entity {path}: gravity_compensation needs an asset Isaac Lab spawns from a config')
     props = getattr(spawn, 'rigid_props', None)
-    if props is None:
-        return
-    as_mapping = isinstance(props, dict)
-    mapping = fragment_mapping(props, '')
-    if mapping is None:
-        if getattr(props, 'disable_gravity', False):
-            raise NotImplementedError(f'Entity {path}: give disable_gravity as a schema fragment so Newton can '
-                                      'compensate it')
+    mapping = {'': []} if props is None else fragment_mapping(props, '')
+    if mapping is None:  # legacy form: rewritten only when gravity is off, everything else spawns as it always did
+        if not (weightless or getattr(props, 'disable_gravity', False)):
+            return
+        mapping = {'': _fragments(props)}
+    elif props is None and not weightless:
         return
     compensated = {}
     for pattern, fragments in mapping.items():
-        fragments = list(fragments) if isinstance(fragments, (list, tuple)) else [fragments]
+        fragments = [copy.deepcopy(fragment) for fragment in
+                     (fragments if isinstance(fragments, (list, tuple)) else [fragments])]
+        if weightless:
+            if not any(hasattr(fragment, 'disable_gravity') for fragment in fragments):
+                fragments.append(PhysxRigidBodyCfg())
+            for fragment in fragments:
+                if hasattr(fragment, 'disable_gravity'):
+                    fragment.disable_gravity = True
         if (any(getattr(fragment, 'disable_gravity', None) for fragment in fragments)
                 and not any(isinstance(fragment, (MujocoRigidBodyCfg, MujocoRigidBodyPropertiesCfg))
                             and fragment.gravcomp is not None for fragment in fragments)):
             fragments.append(MujocoRigidBodyCfg(gravcomp=1.0))
         compensated[pattern] = fragments
-    spawn.rigid_props = compensated if as_mapping else compensated['']
+    spawn.rigid_props = compensated if isinstance(props, dict) else compensated['']
+
+
+def _fragments(props):
+    """A legacy ``RigidBodyPropertiesCfg`` as schema fragments: UsdPhysics' rigid-body and kinematic flags, PhysX's
+    for the rest."""
+    import isaaclab.sim as sim
+    from isaaclab_physx.sim.schemas import PhysxRigidBodyCfg
+    values = {name: getattr(props, name) for name in props.__dataclass_fields__
+              if not name.startswith('_') and getattr(props, name) is not None}
+    usd = {name: values.pop(name) for name in ('rigid_body_enabled', 'kinematic_enabled') if name in values}
+    unknown = set(values) - set(PhysxRigidBodyCfg.__dataclass_fields__)
+    if unknown:
+        raise NotImplementedError(f'rigid-body properties without a schema fragment: {sorted(unknown)}')
+    return [*([sim.UsdPhysicsRigidBodyCfg(**usd)] if usd else []), PhysxRigidBodyCfg(**values)]
 
 
 def _validate_connections(description, config, metadata):

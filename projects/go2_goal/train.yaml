@@ -1,0 +1,42 @@
+defaults:
+  - model/mlp_policy@actor.model
+  # The training algorithm: state_ppo is PPO (configs/state_ppo.yaml: algorithm.adv_type gae,
+  # loss_type actor_critic). Project models are wired to PPO only so far; GRPO / SAC are not yet.
+  - state_ppo
+  - _self_
+runner:
+  max_epochs: 1500
+  # Keep a recent recovery point without accumulating the whole history.
+  save_interval: 50
+  keep_last_checkpoints: 1
+  logger:
+    experiment_name: go2_goal
+algorithm:
+  update_epoch: 5
+env:
+  train:
+    total_num_envs: 64
+    max_steps_per_rollout_epoch: 16
+    max_episode_steps: 400
+    init_params:
+      id: Workspace-Go2-Goal-v0
+      # isaaclab3 | isaac | mjlab; physics (isaaclab3 only): newton | ovphysx.
+      # The same scene.yaml/policy.py/task.py; evaluation follows this choice.
+      backend: isaaclab3
+      physics: newton
+  # evaluate: same environment, each round runs one whole episode.
+  eval:
+    max_steps_per_rollout_epoch: ${env.train.max_episode_steps}
+actor:
+  optim:
+    lr: 0.001
+    value_lr: 0.001
+  model:
+    model_type: go2_goal_policy
+    obs_dim: null
+    action_dim: auto
+    # Policy(config) receives this section: add your own settings here and read them as config.<name>.
+    # hidden_dims: the policy's layers (and the value network PPO adds); action_std: the initial spread of the
+    # sampled actions, in the units the policy returns (here offsets in units of SCALE = 0.25 rad).
+    hidden_dims: [128, 128]
+    action_std: 1.0

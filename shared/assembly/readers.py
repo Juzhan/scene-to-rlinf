@@ -31,8 +31,7 @@ def bind_common(env, settings, path, *, bind_physical, bind_sampled_target, robo
         return lambda: env.episode_length_buf[:, None] * env.step_dt
     if path.split('.')[0] in settings.get('control', {}).get('components', {}):
         role, field, *suffix = path.split('.')
-        if field not in ('input', 'output', 'previous_output'):
-            raise ValueError(f'Unknown component information: {path}')
+        # input, output, previous_output, or an entry of a layer returning a dict
         if suffix:
             if field != 'input':
                 raise ValueError(f'Component output is a tensor: {path}')

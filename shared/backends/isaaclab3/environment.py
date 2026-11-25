@@ -53,7 +53,19 @@ def physics_config(simulation, engine='newton'):
     return physics
 
 
-def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=False):
+PREVIEW_CAMERA = 'rlinf_preview_camera'  # scene key of the camera that renders the preview viewpoint (render: camera)
+
+
+def preview_camera_config(width, height):
+    """A camera at the preview viewpoint, rendered like the scene cameras (Newton Warp, or OVRTX);
+    Preview.camera_frame gives it the viewer camera's pose and field of view before each frame."""
+    from .assets import camera
+    config = camera(width=width, height=height, data_types=('rgb',), clipping_range=(0.02, 200.0))
+    config.prim_path = '{ENV_REGEX_NS}/RLinfPreviewCamera'
+    return config
+
+
+def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=False, preview_camera=None):
     from isaaclab.envs import ManagerBasedRLEnvCfg, mdp
     from isaaclab.managers import EventTermCfg, ObservationGroupCfg, TerminationTermCfg
     from isaaclab.sim import SimulationCfg
@@ -75,6 +87,8 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
         sim.physics_material = PhysxRigidBodyMaterialCfg(**simulation['physics_material'])
     scene = build_scene_config(prepared.description, factories=prepared.factories, num_envs=num_envs,
                                env_spacing=settings.get('world', {}).get('env_spacing', 4.0))
+    if preview_camera is not None:
+        setattr(scene, PREVIEW_CAMERA, preview_camera_config(*preview_camera))
     use_renderer(scene, renderer_name(parameters))
     # Explicit actuators run on Isaac Lab's Python models, the explicit torque the isaac and mjlab
     # backends compute. Newton's native path (Isaac Lab 3's default) runs DC motors as an implicit
@@ -154,6 +168,8 @@ class Preview:
     def __init__(self, viewer, *, window, renderer='newton'):
         self.viewer, self.window, self.renderer = viewer, window, renderer
         self.origin = None
+        # render: camera draws the viewpoint with the scene cameras' renderer (preview_camera_config).
+        self.camera = viewer.get('render') == 'camera'
 
     def config(self):
         from isaaclab_visualizers.newton import NewtonGLVisualizerCfg, NewtonRTXVisualizerCfg
@@ -182,7 +198,37 @@ class Preview:
             visualizer.set_camera_view(tuple(eye), tuple(lookat))
         self.origin = origin
 
+    def camera_frame(self, native):
+        """The viewpoint as the scene cameras' renderer draws it: the preview camera moved to the viewer
+        camera (which the window's mouse and the follow mode move), environment 0, uint8 H x W x 3."""
+        import torch
+        viewer = self.visualizer(native)._viewer.camera
+        sensor = native.scene.sensors[PREVIEW_CAMERA]
+        device = native.device
+        eye = torch.tensor([[float(v) for v in viewer.pos]], device=device)
+        # Along the direction the viewer draws (yaw/pitch): its pivot is only the orbit centre, which the
+        # RTX viewer leaves in place when the view is set from an eye and a target.
+        front = viewer.get_front()
+        target = eye + torch.tensor([[float(front[i]) for i in range(3)]], device=device)
+        env = torch.tensor([0], device=device)
+        view = (tuple(eye[0].tolist()), tuple(target[0].tolist()), float(viewer.fov))
+        # Every frame: OVRTX takes a camera pose only when it is set, and drops one set before its first render.
+        sensor.set_world_poses_from_view(eye, target, env_ids=env)
+        if getattr(self, 'view', None) != view:
+            if getattr(self, 'view', (None,) * 3)[2] != view[2]:  # the visualizer derives it from its focal length
+                height, width = sensor.data.output['rgb'].torch.shape[1:3]
+                focal = height / 2 / math.tan(math.radians(view[2]) / 2)  # pixels, square
+                matrix = torch.tensor([[[focal, 0., width / 2], [0., focal, height / 2], [0., 0., 1.]]], device=device)
+                # The spawned lens's 24 mm focal length; the aperture follows (else 1 mm wide).
+                sensor.set_intrinsic_matrices(matrix, focal_length=24.0, env_ids=env)
+            sensor.update(0.0, force_recompute=True)  # otherwise the image is from before the move
+            self.view = view
+        image = sensor.data.output['rgb'].torch[0, ..., :3]
+        return (image if image.dtype == torch.uint8 else (image.clamp(0, 1) * 255).to(torch.uint8)).cpu().numpy()
+
     def frame(self, native):
+        if self.camera:
+            return self.camera_frame(native)
         # As Lab's own VideoRecorder: without continuous rendering, nothing has dispatched the
         # marker callbacks (abstract entities) since the last step, so do it before capturing.
         visualizer = self.visualizer(native)
@@ -202,15 +248,18 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
     from shared.assembly.project import prepare_scene
     if viewer is not None:
         # Preview asks Isaac to enable camera rendering for its viewport video. The Newton
-        # visualizer draws the window/video itself, so scene cameras keep the scene's own setting.
-        enable_cameras = None
+        # visualizer draws the window/video itself, so scene cameras keep the scene's own setting,
+        # unless the preview shows one of them (view/record --camera: viewer['scene_cameras']).
+        viewer = dict(viewer)
+        enable_cameras = True if viewer.pop('scene_cameras', False) or viewer.get('render') == 'camera' else None
     prepared = prepare_scene(parameters, scene_config=scene_config, project_package=project_package,
                              headless=True, enable_cameras=enable_cameras, **registries)
     viewer = complete_viewer(viewer, prepared.description)
     preview = (Preview(viewer or {}, window=headless is False, renderer=renderer_name(parameters))
                if viewer is not None or headless is False else None)
     cfg = build_config(prepared, parameters=parameters, num_envs=num_envs, seed=seed, horizon=horizon,
-                       visualize=preview is not None)
+                       visualize=preview is not None,
+                       preview_camera=(viewer or {}).get('resolution', (1280, 720)) if preview and preview.camera else None)
     if preview is not None:
         cfg.sim.visualizer_cfgs = [preview.config()]
         # Newton infers visual-geometry import from CLI visualizers or continuous rendering; a
@@ -249,6 +298,29 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
                 if preview is None or preview.window:
                     raise ValueError('Create the isaaclab3 environment with a recording viewer to render video frames')
                 return preview.frame(self)
+
+            def show_preview(self):
+                """view with render: camera: fill the window with the viewpoint as the camera renderer draws it."""
+                if preview is not None and preview.window and preview.camera:
+                    self.show_image(preview.camera_frame(self))
+
+            def camera_image(self, name):
+                """RGB (uint8 H x W x 3) of scene camera ``name`` in environment 0, from the scene's camera
+                renderer (Newton Warp, or OVRTX): what the policy reads, unlike the preview window's own view."""
+                sensor = self.scene.sensors.get(name)
+                output = getattr(getattr(sensor, 'data', None), 'output', None)
+                if output is None or 'rgb' not in output:
+                    cameras = [key for key, item in self.scene.sensors.items()
+                               if 'rgb' in (getattr(getattr(item, 'data', None), 'output', None) or {})]
+                    raise ValueError(f'No rgb camera {name!r} in the scene; rgb cameras: {cameras or "none"}')
+                image = output['rgb'].torch[0, ..., :3]
+                return (image if image.dtype == torch.uint8 else (image.clamp(0, 1) * 255).to(torch.uint8)).cpu().numpy()
+
+            def show_image(self, image):
+                """Fill the preview window with ``image`` this frame (view --camera)."""
+                if preview is None or not preview.window:
+                    raise ValueError('Create the isaaclab3 environment with a preview window to show images')
+                preview.visualizer(self)._viewer.log_image('camera', image, fullscreen=True)
 
             @property
             def window_closed(self):

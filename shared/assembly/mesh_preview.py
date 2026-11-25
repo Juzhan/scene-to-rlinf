@@ -11,8 +11,12 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 4  # 2: quadric collapse; 3: a triangle cap per object, not a scene budget; 4: textures
+VERSION = 7  # 2: quadric collapse; 3: a triangle cap per object, not a scene budget; 4: textures; 5: baked atlases;
+#  6: jointed assets unsimplified; 7: a jointed asset beyond the cap is simplified to the cap, not to TRIANGLE_BUDGET
 TRIANGLE_BUDGET = 60000
+# A jointed asset (robot, cabinet) is looked at closely, link by link: shown as modelled up to this, simplified to it
+# beyond (DeepRobotics Lite3: 1.18 M triangles). The browser stays fluid with a few such robots in a scene.
+ARTICULATED_TRIANGLES = 300_000
 MIN_PART_TRIANGLES = 256
 # Beyond this many parts (a whole indoor scene exports ~20 000) parts of one body are merged before simplifying.
 MAX_PARTS = 512
@@ -241,6 +245,9 @@ def part_targets(geometry):
     ``SCENE_CEILING`` in all (a furnished shop, a performance test) scales them down together."""
     counts = [len(part['faces']) for part in geometry['parts']]
     total = max(sum(counts), 1)
+    if geometry.get('joints'):
+        budget = min(total, ARTICULATED_TRIANGLES)  # a robot: as modelled, else down to the cap
+        return [min(count, max(MIN_PART_TRIANGLES, int(budget * count / total))) if count else 0 for count in counts]
     if not geometry.get('objects'):
         return [max(MIN_PART_TRIANGLES, int(TRIANGLE_BUDGET * count / total)) if count else 0 for count in counts]
     targets = [min(count, OBJECT_TRIANGLES) for count in counts]
@@ -380,6 +387,16 @@ def simplify_surfaces(vertices, faces, uv, pieces, target):
         used, local = np.unique(run, return_inverse=True)
         local = local.reshape(-1, 3)
         share = max(MIN_OBJECT_TRIANGLES, int(target * len(run) / total))
+        if piece.get('texture') and len(local) > share and _fragmented(vertices[used], local, uv[used]):
+            # A baked atlas (a texture island per few triangles): collapsing it would open holes along every
+            # island. The surface is simplified as one welded shape instead, in the texture's few colours.
+            for v, f, color in _baked(vertices[used], local, uv[used], piece, share):
+                out_vertices.append(v)
+                out_faces.append(f + offset)
+                out_uv.append(np.zeros((len(v), 2), dtype=np.float32))
+                out_pieces.append({**piece, 'faces': len(f), 'texture': None, 'tint': None, 'color': color})
+                offset += len(v)
+            continue
         if piece.get('texture'):
             v, f, t = _textured(vertices[used], local, uv[used], share)
         else:
@@ -395,6 +412,60 @@ def simplify_surfaces(vertices, faces, uv, pieces, target):
     if not out_faces:
         return vertices[:0], faces[:0], uv[:0], []
     return np.concatenate(out_vertices), np.concatenate(out_faces), np.concatenate(out_uv), out_pieces
+
+
+BAKED_COLOURS = 8  # colours a baked-atlas surface keeps in the preview
+FRAGMENTED = 1.5  # texture seams per welded vertex beyond which a surface counts as a baked atlas
+
+
+def _weld_keys(vertices, uv=None):
+    low, scale = vertices.min(axis=0), max(float(np.ptp(vertices, axis=0).max()), 1e-9)
+    grid = np.round((vertices - low) / scale * (2 ** 20)).astype(np.int64)
+    return grid if uv is None else np.c_[grid, np.round(uv.astype(np.float64) * 4096).astype(np.int64)]
+
+
+def _fragmented(vertices, faces, uv):
+    """Whether texture seams cut a surface into many islands (a baked atlas): far more distinct (position,
+    coordinate) corners than positions."""
+    used = np.unique(faces)
+    positions = len(np.unique(_weld_keys(vertices[used]), axis=0))
+    corners = len(np.unique(_weld_keys(vertices[used], uv[used]), axis=0))
+    return corners > FRAGMENTED * max(positions, 1)
+
+
+def _baked(vertices, faces, uv, piece, target):
+    """``[(vertices, faces, colour)]`` of a baked-atlas surface: each face takes the texture's colour at its
+    centre (times the tint), the colours are reduced to ``BAKED_COLOURS``, and the faces of each colour are
+    simplified welded (``simplify_part``) within their share of ``target``. Without the texture, one colour."""
+    tint = np.asarray(piece.get('tint') or (1., 1., 1.), dtype=float)[:3]
+    colours = None
+    try:
+        from PIL import Image
+        with Image.open(piece['texture']) as image:
+            image.draft('RGB', (512, 512))
+            pixels = np.asarray(image.convert('RGB').resize((512, 512)), dtype=np.float64) / 255.
+        centre = uv[faces].mean(axis=1) % 1.0
+        x = np.clip((centre[:, 0] * 511).astype(int), 0, 511)
+        y = np.clip(((1 - centre[:, 1]) * 511).astype(int), 0, 511)
+        colours = pixels[y, x] * tint
+    except Exception:  # noqa: BLE001 - an unreadable texture: the surface in its colour
+        pass
+    if colours is None:
+        return [(*simplify_part(vertices, faces, target), list(piece.get('color') or tint))]
+    from PIL import Image
+    strip = Image.fromarray((np.clip(colours, 0, 1) * 255).astype(np.uint8)[None])
+    quantized = strip.quantize(colors=BAKED_COLOURS, method=Image.Quantize.MEDIANCUT)
+    labels = np.asarray(quantized)[0]
+    palette = np.asarray(quantized.getpalette()[:3 * BAKED_COLOURS], dtype=float).reshape(-1, 3) / 255.
+    out = []
+    for label in np.unique(labels):
+        group = faces[labels == label]
+        share = max(MIN_OBJECT_TRIANGLES, int(target * len(group) / len(faces)))
+        used, local = np.unique(group, return_inverse=True)
+        v, f = simplify_part(vertices[used], local.reshape(-1, 3), share)
+        if len(f):
+            out.append((v, f, palette[label].tolist()))
+    return out
 
 
 def _textured(vertices, faces, uv, target):

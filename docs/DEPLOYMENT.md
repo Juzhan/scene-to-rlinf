@@ -3,7 +3,7 @@
 范围：只部署 Isaac Lab 3（下称 IL3，后端名 `isaaclab3`），物理引擎用 Newton（默认）或 OvPhysX，
 不需要 Isaac Sim / Kit。Isaac Lab 2（`isaac`）与 mjlab 后端的代码仍在仓库里，但不在本方案内部署。
 
-随仓库同步的项目：模板 `planner_executor`，以及 `piper_pick`、`go2_chase`、`go2_piper_wholebody`
+随仓库同步的项目：模板 `go2_goal`（一层）与 `planner_executor`（同一任务的两层写法），以及 `piper_pick`、`go2_chase`、`go2_piper_wholebody`
 三个案例（含已训练权重）。日常命令只有 `new`、`edit`、`check`、`view`（`record`）、`train`、`evaluate`。
 
 ## 1. 组成
@@ -30,7 +30,7 @@
 | --- | --- |
 | `run.sh` / `run.py` | 统一入口：解析项目、选择后端解释器、调用 RLinf 或预览；不实现 worker 或训练循环 |
 | `projects/<名称>/` | 用户项目：`scene.yaml`、`policy.py`、`task.py`、`train.yaml`，`observation.py` 自动生成 |
-| `shared/assembly/` | 与后端无关的公共层：场景描述与编辑（`SceneDocument`）、观察目录与类型生成、planner/executor 调度、Python Task 运行时、抽象体 |
+| `shared/assembly/` | 与后端无关的公共层：场景描述与编辑（`SceneDocument`）、观察目录与类型生成、策略各层的调度、Python Task 运行时、抽象体 |
 | `shared/backends/isaaclab3/` | IL3 绑定：资产工厂、场景编译与连接、原生控制项、读数、Task 接入、编辑器网格导出 |
 | `shared/integrations/rlinf/` | RLinf 接入：对象式策略适配（采样、logprob、value）、配置校验 |
 | `tools/create.py` | `new`：复制模板生成项目 |
@@ -114,7 +114,7 @@ go2_piper_wholebody（OvPhysX）16 条回合全部跑满 1000 步、失败 0。
 ## 3. 日常流程
 
 ```bash
-bash run.sh new my_task                       # 从模板 planner_executor 复制（backend: isaaclab3）；也可在编辑器中“新建”
+bash run.sh new my_task                       # 从模板 go2_goal 复制（backend: isaaclab3）；也可在编辑器中“新建”
 bash run.sh edit my_task                      # 网页编辑器，http://127.0.0.1:8080（--port 改端口）
 bash run.sh check my_task                     # 静态检查，刷新 observation.py
 bash run.sh view my_task --actions policy     # 实时窗口；默认零动作，--actions policy 运行项目策略，--checkpoint 指定训练权重
@@ -131,14 +131,14 @@ bash run.sh evaluate my_task env.eval.total_num_envs=16
 - 后端由项目 train.yaml 的 `env.train.init_params.backend` 决定；没写的旧项目（如 apple）沿用 `configs/state_ppo.yaml` 的 `isaac`（Isaac Lab 2），`check` 会打印 WARN。要在 IL3 上运行，先在其 train.yaml 写上 `backend: isaaclab3`。
 - 训练产物：`outputs/<项目>/runs/<时间>/`，含有效配置与项目源码快照；用
   `evaluate <项目> --snapshot <运行目录> runner.ckpt_path=<.../full_weights.pt>` 按当时的代码回放。
-- `check` 与编辑器保存时刷新 `observation.py`；改了观察或控制终点后先 `check`，再按新类型改 `policy.py` / `task.py`。
+- `check` 与编辑器保存时刷新 `observation.py`；改了实体或观察后先 `check`，再按新类型改 `policy.py` / `task.py`。
 
 要写代码的位置（详见各文件开头的说明）：
 
 | 文件 | 写什么 |
 | --- | --- |
-| `scene.yaml` | 实体、抽象体、各组件的观察选择、控制终点；用编辑器或终端修改 |
-| `policy.py` | `build_planner` / `build_executor`（网络、特征、权重加载），`decode_action`（动作 → 各终点的实际单位目标），可选 `initial_action` |
+| `scene.yaml` | 实体、抽象体，`policy`（一层或两层：模型、频率、输入；机器人的全部关节自动受控，`policy.modes` 写例外）；用编辑器或终端修改 |
+| `policy.py` | 每层一个 PyTorch 模块（`forward(obs)` 返回动作；PPO 的动作噪声和价值网络由框架补上），`decode_action`（动作 → 每台机器人全部关节的实际单位目标），可选 `initial_action` |
 | `task.py` | `evaluate(obs)` 或 `Task.evaluate(self, obs)`：返回 reward / success / failure / metrics，可选 `set`；跨步状态用 `reset(env_ids)` 或 `TaskMemory` |
 | `train.yaml` | 后端与物理引擎、环境数、回合长度、PPO 参数、模型参数 |
 
@@ -146,7 +146,7 @@ bash run.sh evaluate my_task env.eval.total_num_envs=16
 
 ### piper_pick：机械臂抓取
 
-Piper X 从地面抓起方块，抬升 4 cm 稳住 0.5 s 即成功。executor 用 `pick.pt`（在 mjlab 上训练）。
+Piper X 从地面抓起方块，抬升 4 cm 稳住 0.5 s 即成功。策略加载 `pick.pt`（在 mjlab 上训练）。
 
 ```bash
 bash run.sh view piper_pick --actions policy
@@ -156,7 +156,7 @@ bash run.sh evaluate piper_pick env.eval.total_num_envs=16 env.train.init_params
 
 ### go2_chase：四足追球
 
-Go2 追一个会逃跑的虚拟球（抽象体，由 `task.py` 的 `set` 每步移动）。executor 是
+Go2 追一个会逃跑的虚拟球（抽象体，由 `task.py` 的 `set` 每步移动）。策略是
 [go2-supermimic](https://github.com/Zhengtianjin/go2-supermimic) 发布的平地 actor（`flat.pt`，未重新训练），
 场景使用与权重一致的 supermimic 电机。另有粗糙地形配方 `--config train_terrain`。
 
@@ -200,7 +200,8 @@ bash run.sh evaluate go2_piper_wholebody env.train.init_params.physics=ovphysx
 
 | 项目 | Newton | OvPhysX | 说明 |
 | --- | --- | --- | --- |
-| planner_executor | 接口跑通 | — | 4 环境 × 16 步 smoke 契约通过；示例策略未训练 |
+| go2_goal | 接口跑通、权重更新 | — | smoke 契约通过，2 轮训练；示例策略未训练到会走 |
+| planner_executor | 接口跑通、权重更新 | — | 两层示例；smoke 与 2 轮训练通过，示例策略未训练到会走 |
 | piper_pick | 完整回合成功（150 回合 100%）；Newton 从头训练（带随机化）7 个条件均 100% | 完整回合成功（108 回合 100%）；Newton 训练的随机化策略迁移失败（6–61%） | 发布权重来自 mjlab；IL3 从头训练与条件评估见项目 README |
 | go2_chase | 完整回合成功（平地 100%，粗糙地形 95.5%） | 完整回合成功（平地 100%） | 外部发布权重，未在 IL3 训练 |
 | go2_piper_wholebody | 发布权重（Newton 带随机化训练）5 个条件完整回合，仅强推扰 1/16 翻倒，末端误差 4–6 cm | 同一权重 5 个条件 0 失败 | 同一权重在 mjlab 上 5 个条件也 0 失败；旧的 mjlab 权重在 Newton 上 63% 翻倒，已替换 |
@@ -218,7 +219,7 @@ piper_pick 在 Newton 上从头训练（带质量/摩擦随机化）后，在 7 
 - 项目只描述场景、观察、动作和任务：模型通过 `obs.robot.joint_position` 这样的对象属性读取张量，
   不依赖字段字符串或拼接好的状态向量；`observation.py` 由场景生成，给出形状、单位和坐标系。
 - Task 用 Python/Torch 直接写奖励、成功和失败；场景配置不承担任务语义。
-- planner / executor 两层，`control.train` 选择训练哪层；控制终点只声明实体、关节和控制类型，换算在 `decode_action` 中完成。
+- 策略默认一层，需要不同频率或现成模型时增加一层（`policy.layers`，两层时 `train` 选择训练哪层）；层的结果由 policy.py 定义，每台机器人的全部关节自动受控（`policy.modes` 写速度、力矩或不控制的例外），换算在 `decode_action` 中完成。
 - 后端相关代码都在 `shared/backends/<后端>/`，上层只调用各后端的同名钩子，不写 `if backend == ...`；
   某后端不支持的能力在钩子内明确报错。
 - 不修改第三方源码，不用全局 monkey patch；需要的补充放在共享接入层。

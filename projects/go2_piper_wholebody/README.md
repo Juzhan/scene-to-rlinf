@@ -8,14 +8,14 @@ Go2 背 Piper X 的全身控制：跟踪随机的机身速度命令和末端目�
 
 | 文件 | 内容 | 谁来改 |
 | --- | --- | --- |
-| `scene.yaml` | 实体、抽象体、连接、各组件的观察选择、控制终点 | `run.sh edit` 或直接编辑 |
-| `policy.py` | `build_planner`（命令采样）、`build_executor`（模型）、`decode_action`（动作→关节目标）、`initial_action` | 换模型、改动作缩放或命令范围时改这里 |
+| `scene.yaml` | 实体、抽象体、连接、各组件的观察选择；robot、piperx 的全部关节自动受控 | `run.sh edit` 或直接编辑 |
+| `policy.py` | `CommandSampler`（命令层）、`Body`（被训练层）、`decode_action`（动作→关节目标），名义姿态 `GO2_STANCE`、`PIPER_HOME` | 换模型、改动作缩放或命令范围时改这里 |
 | `task.py` | `Task.evaluate(obs)`：23 项奖励、失败条件与指标 | 改任务时改这里 |
 | `observation.py` | 由 scene.yaml 生成的观察类型（形状、单位），`check` 时刷新 | 不要手改 |
 | `train.yaml` | RLinf PPO 配方；`env.train.init_params.backend/physics` 选后端与物理引擎 | 训练时改 |
 | `weights/` | `wholebody.pt`（随项目进 git，见“权重”）、`WEIGHTS.json` | 只读 |
 
-改了 `scene.yaml` 的实体、观察或控制终点后先 `check` 刷新 `observation.py`，再按其中的类型改 `policy.py`/`task.py`。
+改了 `scene.yaml` 的实体或观察后先 `check` 刷新 `observation.py`，再按其中的类型改 `policy.py`/`task.py`。
 
 ## 场景与模型
 
@@ -26,15 +26,15 @@ Go2 背 Piper X 的全身控制：跟踪随机的机身速度命令和末端目�
 - 抽象长方体 `ee_workspace` 跟随 piperx 根部（局部中心 (0.57, 0, 0.25)，0.25×0.7×0.5 m），只跟随读数，
   不是物理约束；在编辑器里拖动它即改变末端目标范围。
 
-| 组件 | 周期 | 输入 | 输出 |
+| 层 | 周期 | 输入 | 结果 |
 | --- | --- | --- | --- |
-| planner（固定 `CommandSampler`） | 10 s，复位时也调用 | piperx、ee_workspace 的位姿与尺寸 | 6 维 `[vx, vy, wz, x, y, z]` |
-| executor（训练） | 0.02 s | 见 `scene.yaml` 中 executor 的观察 | 18 维动作 |
+| `command`（固定 `CommandSampler`） | 10 s，复位时也调用 | piperx、ee_workspace 的位姿与尺寸 | `Command`：`velocity` [vx, vy, wz]、`ee_target` [x, y, z] |
+| `body`（训练 `Body`） | 0.02 s | 见 `scene.yaml` 中 body 的输入（含 `command`） | 18 个动作 |
 
 - 命令：vx ±1、vy ±0.6、wz ±1，10% 环境站立；末端目标在 `ee_workspace` 内均匀采样，表达在 Piper 基座系。
-- executor：非对称 actor-critic，MLP [512, 256, 128]，ELU。actor 只用可部署输入（角速度、重力投影、
+- body：非对称 actor-critic，MLP [512, 256, 128]，ELU；`value(obs)` 用 `value_head`。actor 只用可部署输入（角速度、重力投影、
   关节偏移与速度、上一步动作、命令）；critic 另加机身线速度、TCP 位置、足端接触。
-- `decode_action`：腿 = 默认角 + 0.25·a[:12]，臂 joint1..6 = 默认角 + 0.25·a[12:]；夹爪不控制。
+- `decode_action`：返回 `robot`（12）、`piperx`（8）两台机器人的全部关节目标：腿 = `GO2_STANCE` + 0.25·a[:12]，臂 joint1..6 = `PIPER_HOME` + 0.25·a[12:]，夹爪保持 `PIPER_HOME` 的开度（训练动作 18 个，`policy.py` 的 `ACTIONS`）。
   机械臂增益按参考 GO2_PIPER_CFG（joint1–6 kp 50/50/80/30/30/20，kd 3/2/3/3/2.5/1）。
 - 奖励：末端位置/姿态跟踪、速度跟踪、相对机身高度（相对最低足端，目标 0.30 m）、力矩/加速度/功率/
   动作变化、足端滑移与腾空、关节偏离与对称。失败为机身触地或倾斜超过 1 rad；没有 success 定义，
@@ -54,8 +54,9 @@ actor 不堆叠 3 帧历史；腿用各后端原生 Go2 DC 电机（参考为带
 上带域随机化从头训练 6000 轮的 `global_step_6000`（种子 42，运行 `outputs/go2_piper_wholebody/runs/20261102_075914_a56abadb3214`）。
 此前的版本是 2026-10-23 在 mjlab 上训练的权重（运行 `20261023_185843_d8380ea45fb3`，无随机化），仍可从 git 历史取回；
 两者输入输出约定相同。
-scene.yaml `executor.parameters.weights` 让 `build_executor` 默认加载它；写 `null` 则随机初始化（从头训练时改成
-`null`，否则 train 是在它之上继续训练）。文件缺失时直接报错。evaluate/view 若另给 checkpoint，在此之上加载。
+scene.yaml `policy.layers.body.parameters.weights` 让框架加载它（文件里的 `model.actor_logstd` 读作 `log_std`）；
+删掉这一行则随机初始化（从头训练时删掉，否则 train 是在它之上继续训练）。2026-11-25 从 planner/executor 写法迁移成两层，
+命令从 6 维张量改为 `Command` 的两个字段，拼接顺序不变；迁移后评估（Newton）回报 141.82，迁移前 141.87。文件缺失时直接报错。evaluate/view 若另给 checkpoint，在此之上加载。
 
 ## 运行
 

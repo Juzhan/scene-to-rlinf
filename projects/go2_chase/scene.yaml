@@ -100,22 +100,14 @@ entities:
         - 0.0
         - 0.0
         - 0.0
-control:
-  train: executor
-  components:
-    planner:
-      model: .policy:build_planner
-      dimension: 3
-      period: 0.2
-      observations:
-        - ball.position
-    executor:
-      model: .policy:build_executor
+policy:
+  layers:
+    policy:
+      model: .policy:Policy
       parameters:
-        weights: weights/flat.pt
-      dimension: 12
+        actor_file: weights/flat.pt
       period: 0.02
-      observations:
+      inputs:
         - robot.joint_position
         - robot.joint_velocity
         - robot.orientation
@@ -123,7 +115,7 @@ control:
         - robot.position
         - ball.position
         - ball.linear_velocity
-        - executor.output
+        - policy
       history:
         robot.joint_position: 5
         robot.joint_velocity: 5
@@ -132,26 +124,8 @@ control:
         robot.position: 5
         ball.position: 5
         ball.linear_velocity: 5
-        executor.output: 5
-      initial: .policy:initial_action
-      decode: .policy:decode_action
-  output:
-    legs:
-      type: joint_position
-      asset_name: robot
-      joint_names:
-        - FL_hip_joint
-        - FL_thigh_joint
-        - FL_calf_joint
-        - FR_hip_joint
-        - FR_thigh_joint
-        - FR_calf_joint
-        - RL_hip_joint
-        - RL_thigh_joint
-        - RL_calf_joint
-        - RR_hip_joint
-        - RR_thigh_joint
-        - RR_calf_joint
+        policy: 5
+  decode: .policy:decode_action
 connections: []
 visualization:
   abstract:

@@ -131,47 +131,20 @@ entities:
         - 1.553576199684428e-16
         - 5.470437680172914e-16
         - -3.100059202163687e-16
-control:
-  train: executor
-  components:
-    planner:
-      model: .policy:build_planner
-      dimension: 3
-      period: 0.2
-      observations:
-        - cube.position
-        - cube.orientation
-        - piper.joint_position
-        - piper.joint_velocity
-        - piper.joint_effort
-        - piper.tcp.position
-    executor:
-      model: .policy:build_executor
+policy:
+  layers:
+    policy:
+      model: .policy:Policy
       parameters:
         weights: weights/pick.pt
-      dimension: 7
       period: 0.02
-      observations:
+      inputs:
         - piper.joint_position
         - piper.joint_velocity
         - piper.joint_effort
         - cube.position
         - tcp_frame.frame_positions
-      initial: .policy:initial_action
-      decode: .policy:decode_action
-  output:
-    arm:
-      type: joint_position
-      asset_name: piper
-      joint_names:
-        - joint1
-        - joint2
-        - joint3
-        - joint4
-        - joint5
-        - joint6
-        - gripper_joint1
-        - gripper_joint2
+  decode: .policy:decode_action
 connections: []
 authoring:
   parents: {}

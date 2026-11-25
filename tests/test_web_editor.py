@@ -68,6 +68,17 @@ def test_numpy_preview_keeps_source_parts_and_frames(tmp_path):
 
 
 @pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_newton_style_floor_tiles_the_square_and_sky_fades_down():
+    from tools.web_editor import checker_floor, sky_gradient
+    (light, light_faces), (dark, dark_faces) = checker_floor(size=4.0, cell=1.0)
+    assert len(light_faces) == len(dark_faces) == 16  # 8 cells of each colour, two triangles each
+    both = np.vstack([light, dark])
+    assert both[:, :2].min() == -2.0 and both[:, :2].max() == 2.0 and not both[:, 2].any()
+    sky = sky_gradient((68, 161, 255), (40, 44, 55), height=8)
+    assert sky.shape == (8, 4, 3) and tuple(sky[0, 0]) == (68, 161, 255) and tuple(sky[-1, 0]) == (40, 44, 55)
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_headless_editor_round_trip(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
@@ -191,7 +202,8 @@ assert editor.pick(top, (0, 0, -1), table) == cube
 editor.select(table)
 centre = np.asarray(editor.gizmo.position)
 x_axis = W.F.quat_matrix(editor.gizmo.wxyz)[:3, 0]
-assert editor._near_gizmo(centre + x_axis * W.GIZMO_SCALE * .8 + (0, 0, 2), (0, 0, -1))
+unit = editor._gizmo_unit(centre + (0, 0, 2))  # the fixed-size gizmo's world length seen from 2 m above
+assert editor._near_gizmo(centre + x_axis * unit * .8 + (0, 0, 2), (0, 0, -1))
 assert not editor._near_gizmo(centre + (-.3, -.3, 2), (0, 0, -1))
 # Choosing a parent only previews; 应用 writes it, keeps the world position, the gizmo and the open section.
 editor.open_section = '父物体'
@@ -223,9 +235,71 @@ handles['删除'].value = True
 assert 'world/table' not in editor.items and 'world/object' in editor.items
 assert not SceneDocument(editor.scene).snapshot().get('layout_parents')
 assert np.allclose(editor.info['world/object']['node'].world(), world, atol=1e-6)
+# The floor is the ground plane entity's; the faint reference grid shows only while no ground is shown.
+floor = ('entity', 'world/floor')
+assert editor.info['world/floor']['node'].shape['type'] == 'checker' and not editor.floor_grid.visible
+editor.toggle_hidden(floor)
+assert editor.floor_grid.visible
+editor.toggle_hidden(floor)
+assert not editor.floor_grid.visible
+# The app asks what a deletion changes, shows it in its own dialog and deletes only on confirmation.
+editor.select(floor)
+plan = editor.ui_get('delete', {{}})
+assert plan['paths'] == ['world/floor'] and plan['lines'][-1] == '可用 Ctrl-Z 撤回。', plan
+assert 'world/floor' in editor.items
+editor.ui_post('delete', {{'paths': plan['paths']}})
+assert 'world/floor' not in editor.items and editor.floor_grid.visible
 # Camera looking along world +Z with +X to the right: the X axis points right on screen.
 svg = W.axes_svg((1.0, 0.0, 0.0, 0.0))
 assert 'x2="26.0" y2="0.0" stroke="#e03131"' in svg, svg
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_placed_entities_are_set_down_on_the_surface_under_them(tmp_path):
+    project = tmp_path / 'lift'
+    shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    script = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import numpy as np
+import tools.web_editor as W
+from tools.web_editor import Editor
+editor = Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
+entry = next(item for item in editor.snapshot['catalog']['assets'] if item['id'] == 'dex_cube')
+def place(name, position):
+    editor._add_entity({{'name': name, 'factory': 'dex_cube', 'kind': 'entity', 'parameters': {{}},
+                        'pose': {{'position': position, 'orientation': [1, 0, 0, 0]}}}}, entry, rest=True)
+    return editor._world_points('world/' + name)
+# Sunk under the floor (here 1.05 m below the table top) or in the air, away from the table: its lowest point
+# ends REST_CLEARANCE above the floor.
+floor = editor.surface_point([-1.5, 1.5, 3.0], [0, 0, -1])[2]
+assert floor < -1.0
+for name, z in (('sunk', -1.5), ('floating', 1.0)):
+    lowest = place(name, [-1.5, 1.5, z])[:, 2].min()
+    assert abs(lowest - (floor + W.REST_CLEARANCE)) < 1e-6, (name, lowest, floor)
+# Over the table, sunk into its top: set on it, as the view's own ray finds it.
+top = editor.surface_point([0.5, 0.3, 3.0], [0, 0, -1])[2]  # clear of the scene's own cube at (0.5, 0)
+assert top > floor + 0.5, (top, floor)  # the table top, about 1 m over the floor
+lowest = place('on_table', [0.5, 0.3, -0.01])[:, 2].min()  # cutting into the table top: lifted onto it
+assert abs(lowest - (top + W.REST_CLEARANCE)) < 1e-3, (lowest, top)
+# Pressing on an object turns the view; only the gizmo moves it. Moved level with snapping, from the floor
+# onto the table, it slides up onto the top; End sets a lifted one down.
+from types import SimpleNamespace
+cube = ('entity', 'world/sunk')
+assert not editor._body_draggable('world/sunk')
+editor.select(cube)
+level = editor.gizmo.position[2]
+for phase in ('update', 'update', 'end'):
+    editor.gizmo.position = (0.5, 0.35, level)
+    editor._gizmo_moved(SimpleNamespace(phase=phase))
+assert abs(editor._world_points('world/sunk')[:, 2].min() - (top + W.REST_CLEARANCE)) < 1e-3
+editor.ui_post('pose', {{'position': [0.5, 0.35, 0.8], 'rotation': [0, 0, 0]}})
+editor.ui_post('drop', {{}})
+assert abs(editor._world_points('world/sunk')[:, 2].min() - (top + W.REST_CLEARANCE)) < 1e-3
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -282,7 +356,7 @@ gui.add_markdown = note
 assert editor.backend_problem is None, editor.backend_problem
 editor._delete('world/robot')  # The dialog names the targets and observations that go with it.
 modal = next(text for text in texts if text.startswith('删除 **robot**'))
-assert '删除控制目标：`legs`' in modal and '`robot.joint_position`' in modal, modal
+assert '不再受策略控制：`robot`' in modal and '`robot.joint_position`' in modal, modal
 assert editor.deletion_plan('world/ground')['retargeted'] == ['world/height_scanner']
 editor._delete('world/ground')
 handles['删除'].value = True
@@ -301,39 +375,47 @@ editor.server.stop()
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-def test_control_tab_edits_targets_joint_by_joint(tmp_path):
-    project = tmp_path / 'lift'
-    shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('__pycache__'))
+def test_policy_lens_sets_robot_modes_and_lists_joints(tmp_path):
+    """Robots are driven as a whole: the policy lens tints them, a robot's mode is saved as an exception in
+    control.modes, and its movable joints list in the target order with fixed links folded away."""
+    project = tmp_path / 'navigation'
+    shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
     script = f'''
 import sys
 sys.path.insert(0, {str(ROOT)!r})
 import tools.web_editor as W
 from shared.assembly.editing import SceneDocument
 editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
-arm = [f'panda_joint{{i}}' for i in range(1, 8)]
-assert editor.measured_joints()['robot'][:7] == arm, editor.measured_joints()
-editor._toggle_joint('arm', 'panda_joint3', False)
-assert editor.bindings()['arm']['joint_names'] == [j for j in arm if j != 'panda_joint3']
-editor._toggle_joint('arm', 'panda_joint3', True)  # Back in articulation order.
-assert editor.bindings()['arm']['joint_names'] == arm
-editor._toggle_joint('arm', 'panda_finger_joint1', True)  # Owned by gripper: rejected, nothing staged.
-assert editor.bindings()['arm']['joint_names'] == arm and 'error' in editor.status.content
-editor._remove_target('gripper')
-assert 'gripper' not in editor.bindings()
-editor.target_asset.value, editor.target_name.value = 'robot', 'fingers'
-editor._add_target()  # Only the joints no other target controls, each listed by name.
-assert editor.bindings()['fingers'] == {{'type': 'joint_position', 'asset_name': 'robot',
-    'joint_names': ['panda_finger_joint1', 'panda_finger_joint2']}}, editor.bindings()
+assert editor.robot_modes() == {{'robot': 'joint_position'}}
+editor.outliner_post('lens', {{'lens': 'observe', 'role': 'executor'}})  # what the executor reads and drives
+assert editor.tints == {{'world/robot': W.LENS_COLORS['executor']}}
+state = editor.outliner_post('mode', {{'id': 'entity:world/robot', 'mode': 'joint_velocity'}})
+assert [row['mode'] for row in state['rows'] if row['id'] == 'entity:world/robot'] == ['joint_velocity']
+assert editor.collect()['control_modes'] == {{'robot': 'joint_velocity'}}
 editor.save()
-output = SceneDocument(editor.scene).snapshot()['control']['output']
-assert set(output) == {{'arm', 'fingers'}} and output['arm']['joint_names'] == arm, output
+assert SceneDocument(editor.scene).snapshot()['control']['modes'] == {{'robot': 'joint_velocity'}}
+editor.outliner_post('mode', {{'id': 'entity:world/robot', 'mode': 'none'}})
+assert editor.tints.get('world/robot') == (W.LENS_COLORS['executor'] if editor.observation_uses().get('robot', {{}}).get('executor') else None)
+editor.outliner_post('mode', {{'id': 'entity:world/robot', 'mode': 'joint_position'}})  # the default again
+editor.save()
+assert 'modes' not in SceneDocument(editor.scene).snapshot()['control']
+# Joint rows: a fixed link folds into its parent, a serial chain stays at one depth, a branch indents.
+joints = [dict(name='j1', parent='base', child='l1', type='revolute'), dict(name='mount', parent='l1', child='hand', type='fixed'),
+          dict(name='f1', parent='hand', child='finger1', type='prismatic'), dict(name='f2', parent='hand', child='finger2', type='prismatic'),
+          dict(name='j2', parent='l1', child='l2', type='revolute')]
+editor.info['world/robot']['kinematics'] = {{'frames': {{}}, 'joints': joints}}
+editor.initial_display = lambda path: {{'joint_positions': {{'j1': 0, 'j2': 0, 'f1': 0, 'f2': 0}}}}
+assert [(row['name'], row['depth'], row['index']) for row in editor.joint_rows('world/robot')] == \
+    [('j1', 0, 0), ('f1', 1, 2), ('f2', 1, 3), ('j2', 1, 1)]
+editor.select_joint('world/robot', 'j2')
+assert editor.panel_context()['joint']['name'] == 'j2' and editor.selected == ('entity', 'world/robot')
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
 
-def test_training_switch_and_module_pages(tmp_path):
+def test_observe_lens_and_component_settings(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('__pycache__'))
     script = f'''
@@ -342,52 +424,44 @@ sys.path.insert(0, {str(ROOT)!r})
 import tools.web_editor as W
 from shared.assembly.editing import SceneDocument
 editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
-tabs = editor.observation_tabs
-assert list(tabs) == ['planner', 'executor'] and editor.train_role == 'executor'
-assert tabs['executor'].icon == 'flame' and tabs['planner'].icon == 'lock'
-assert '"输出控制动作 · 训练中"' in editor.train_style.content and '"生成目标 · 固定"' in editor.train_style.content
-assert 'button:nth-child(2){{--button-bg:var(--mantine-color-orange' in editor.train_style.content
-# Planner sees no module interfaces, executor only the planner's; both pages list rows alike.
-shown = {{role: [key for profile, key in editor.observation_boxes if profile == role] for role in tabs}}
-assert not any(key.startswith(('planner.', 'executor.')) for key in shown['planner']), shown['planner']
-assert 'planner.output' in shown['executor'] and not any(key.startswith('executor.') for key in shown['executor'])
-common = [key for key in shown['executor'] if key in shown['planner']]
-assert common == [key for key in shown['planner'] if key in shown['executor']]
-editor._set_train('planner')
-editor._set_train('planner')  # Already trained: no second undo step.
-assert tabs['planner'].icon == 'flame' and '"生成目标 · 训练中"' in editor.train_style.content
-assert editor.collect()['control_train'] == 'planner'
+assert list(editor.observation_order) == ['planner', 'executor'] and editor.train_role == 'executor'
+# control.output (the older form) lists its targets per asset; their modes are not switched per robot.
+assert editor.robot_modes() == {{'robot': 'joint_position'}}
+try:
+    editor.set_robot_mode.__wrapped__(editor, 'robot', 'joint_velocity')
+    raise AssertionError('a listed control.output must not take modes')
+except ValueError:
+    pass
+# Planner sees no component interfaces, executor only the planner's.
+groups = {{role: [g['key'] for g in editor.observation_groups(role)] for role in editor.observation_order}}
+assert not {{'planner', 'executor'}} & set(groups['planner']) and 'executor' not in groups['executor'], groups
+assert 'planner' in groups['executor']
+state = editor.outliner_post('train', {{'role': 'planner'}})
+assert state['train'] == 'planner' and editor.collect()['control_train'] == 'planner'
 editor.undo_edit()
 assert editor.train_role == 'executor' and 'control_train' not in editor.collect()
-assert editor.observation_tabs['executor'].icon == 'flame'
 editor.redo_edit()
-# Each module page edits only that module's inputs.
 saved = SceneDocument(editor.scene).snapshot()['control']['components']
-key = next(key for key in editor.observation_order['planner'] if key not in saved['planner']['observations']
-           and not editor.observation_boxes[('planner', key)].disabled)
-editor.observation_boxes[('planner', key)].value = True
-# Group folders holding a ticked box are highlighted client-side via :checked.
-uuid = editor.observation_boxes[('planner', key)]._impl.uuid
-assert any(f'input[id="{{uuid}}"]:checked' in getattr(item, 'content', '') for item in editor.observation_items)
-# A newly ticked term takes its catalog slot; the saved terms keep their relative order.
+key = next(row['key'] for group in editor.observation_groups('planner') for row in group['rows']
+           if not row['enabled'] and row['available'])
+editor.outliner_post('lens', {{'lens': 'observe', 'role': 'planner'}})
+editor.outliner_post('observe', {{'role': 'planner', 'key': key, 'on': True}})
+native = key.partition('.')[0]
+path = editor.native_path(native)
+assert path is None or editor.tints.get(path) == W.LENS_COLORS['planner']
 ticked = [item for item in editor.observation_order['planner'] if item in {{key, *saved['planner']['observations']}}]
-assert [item for item in ticked if item != key] == saved['planner']['observations']
 assert editor.collect()['observations'] == {{'planner': ticked}}
-editor.period_fields['planner'].value = '0.015'  # Not a multiple of dt 0.01: rejected on save.
+editor.outliner_post('component', {{'role': 'planner', 'field': 'period', 'value': '0.015'}})  # not a multiple of dt
 editor.save()
 assert 'error' in editor.status.content
-editor.period_fields['planner'].value = '0.1'
-assert editor.collect()['components'] == {{'planner': {{'period': 0.1}}}}
-editor.dimension_fields['planner'].value = 'auto'  # Only executor may resolve its dimension.
-editor.save()
-assert 'error' in editor.status.content
-editor.dimension_fields['planner'].value = '6'
+editor.outliner_post('component', {{'role': 'planner', 'field': 'period', 'value': '0.1'}})
+editor.outliner_post('component', {{'role': 'planner', 'field': 'dimension', 'value': '6'}})
 assert editor.collect()['components'] == {{'planner': {{'period': 0.1, 'dimension': 6}}}}
+assert [c['period'] for c in editor.panel_context()['components'] if c['role'] == 'planner'] == ['0.1']
 editor.save()
 saved = SceneDocument(editor.scene).snapshot()['control']
 assert saved['train'] == 'planner' and key in saved['components']['planner']['observations']
 assert saved['components']['planner']['period'] == 0.1 and saved['components']['planner']['dimension'] == 6
-assert key not in saved['components']['executor']['observations']
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -422,7 +496,8 @@ editor.initial_display = lambda path: {{'root_body': 'base', 'body_names': ['bas
 for factory in ('contact_sensor', 'frame_transformer', 'height_scanner', 'camera'):
     editor._choose_asset(factory)
     assert editor.asset_mount.visible and editor.asset_mount.value.startswith('robot'), editor.asset_mount.options
-    assert W.FREE not in editor.asset_mount.options  # isaaclab3: every sensor follows a body
+    # isaaclab3: a camera may also stand fixed in the world, every other sensor follows a body
+    assert (W.FREE in editor.asset_mount.options) == (factory == 'camera'), editor.asset_mount.options
     editor._add_asset()
     assert editor.backend_problem is None, (factory, editor.backend_problem)
 added = entities()
@@ -445,9 +520,10 @@ editor._choose_asset('ground_plane')
 editor._add_asset()
 assert entities()['world/height_scanner']['meshes'] == ['world/ground_plane', 'world/ground_plane_2']
 assert editor.backend_problem is None, editor.backend_problem
-editor._remove('world/robot', editor.deletion_plan('world/robot'))  # isaaclab3: no sensor stays without its body
+editor._remove('world/robot', editor.deletion_plan('world/robot'))  # isaaclab3: only a camera stays, fixed in the world
 left = entities()
-assert not {{path for path, item in left.items() if item['category'] == 'sensor'}}, sorted(left)
+assert {{path for path, item in left.items() if item['category'] == 'sensor'}} == {{'world/camera'}}, sorted(left)
+assert not left['world/camera'].get('mount'), left['world/camera']
 assert editor.backend_problem is None, editor.backend_problem
 editor._choose_asset('box')
 editor._add_asset()
@@ -528,7 +604,10 @@ editor.observation_enabled[(role, middle)] = True
 editor.save()
 text = editor.target.read_text()
 assert not text.lstrip().startswith('{{')
-assert yaml.safe_load(text)['control']['components'][role]['observations'] == before
+# scene.yaml lists a layer's inputs; another layer's result is selected by its name (planner.goal -> planner).
+from shared.assembly.layers import layer_tokens
+layers = yaml.safe_load(text)['policy']['layers']
+assert layers[role]['inputs'] == layer_tokens(before, layers)
 editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=180)
@@ -552,3 +631,168 @@ def test_textured_part_is_one_glb_with_a_primitive_per_surface(tmp_path):
     assert len(gltf['meshes']) == 2 and len(gltf.get('images', [])) == 1
     assert W.surface_glb(vertices, faces, surface, (178, 189, 201)) is data  # cached per arrays
     assert max(W._texture_image(str(tmp_path / 'wood.png')).size) == W.TEXTURE_PIXELS
+
+
+def test_editor_app_reads_and_edits_the_selection(tmp_path):
+    """The app's panels (tools/editor_ui) go through Editor.ui_get / ui_post: the same edits and undo as the view."""
+    project = tmp_path / 'navigation'
+    shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    scene = project / 'scene.yaml'
+    scene.write_text(scene.read_text().replace('\npolicy:', '\n- name: cube\n  factory: dex_cube\npolicy:', 1))
+    script = f'''
+import sys
+sys.path.insert(0, {str(ROOT)!r})
+import tools.web_editor as W
+from shared.assembly.editing import SceneDocument
+editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
+# Nothing selected: the scene's policy (components, robots) fills the panel.
+overview = editor.ui_get('inspector', {{}})
+assert overview['owner'] is None and not editor.ui_get('state', {{}})['dirty']
+assert [c['role'] for c in overview['scene']['components']] == ['planner', 'executor'], overview['scene']
+assert [r['key'] for r in overview['scene']['robots']] == ['robot'] and overview['scene']['automatic']
+assert set(editor.ui_get('state', {{}})['simulation']) >= {{'physics', 'renderer'}}
+editor.ui_post('gizmo', {{'mode': 'scale'}})
+assert editor.ui_get('state', {{}})['gizmo'] == 'scale' and editor.gizmo.disable_rotations and editor.gizmo.disable_sliders
+editor.ui_post('gizmo', {{'mode': 'move'}})
+# Scale is part of the transform, not of the raw parameters.
+editor.outliner_post('select', {{'id': 'entity:world/cube'}})
+data = editor.ui_get('inspector', {{}})
+assert data['scale'] == [0.8, 0.8, 0.8] and 'scale' not in [f['name'] for f in data.get('parameters', [])]  # the asset's default
+editor.ui_post('scale', {{'value': [2.0, 2.0, 1.0]}})
+assert editor.ui_get('inspector', {{}})['scale'] == [2.0, 2.0, 1.0]
+editor.ui_post('undo', {{}})
+assert editor.ui_get('inspector', {{}})['scale'] == [0.8, 0.8, 0.8]
+editor.outliner_post('select', {{'id': 'entity:world/destination'}})
+data = editor.ui_get('inspector', {{}})
+assert data['shape']['shape'] == 'point' and data['reset']['region'] == 'world/arena' and 'world/arena' in data['reset']['areas']
+editor.ui_post('pose', {{'position': [1.0, 2.0, 0.0]}})
+assert editor.ui_get('inspector', {{}})['position'][:2] == [1.0, 2.0] and editor.ui_get('state', {{}})['dirty']
+editor.ui_post('reset', {{'region': None}})
+assert editor.ui_get('inspector', {{}})['reset']['region'] is None
+editor.ui_post('undo', {{}})
+editor.ui_post('undo', {{}})
+assert editor.ui_get('inspector', {{}})['reset']['region'] == 'world/arena' and not editor.ui_get('state', {{}})['dirty']
+editor.ui_post('attach', {{'target': 'world/robot'}})  # an abstract entity follows the robot's root
+parent = editor.ui_get('inspector', {{}})['parent']
+assert (parent['kind'], parent['entity'], parent['mode']) == ('follow', 'world/robot', 'physical') and parent['modes'][0] == ['physical', '跟随']
+editor.ui_post('parent', {{'target': None}})
+assert 'parent' not in editor.ui_get('inspector', {{}})
+editor.outliner_post('select', {{'id': 'entity:world/robot'}})
+data = editor.ui_get('inspector', {{}})
+assert data['mode'] == 'joint_position' and [field['name'] for field in data['parameters']] == ['actuators']
+editor.ui_post('parameter', {{'name': 'actuators', 'value': 'supermimic'}})
+editor.ui_post('label', {{'value': '机器狗'}})  # not an identifier: only the name shown
+editor.ui_post('save', {{}})
+saved = {{item['path']: item for item in SceneDocument(editor.scene).snapshot()['entities']}}
+assert saved['world/robot']['parameters'].get('actuators') == 'supermimic' and saved['world/robot']['label'] == '机器狗'
+# An identifier renames the entity and what refers to it (observations, mounts), not its factory.
+before = {{key for keys in editor.observation_order.values() for key in keys if key.startswith('robot.')}}
+editor.ui_post('label', {{'value': 'dog'}})
+document = SceneDocument(editor.scene)
+saved = {{item['path']: item for item in document.snapshot()['entities']}}
+assert 'world/robot' not in saved and saved['world/dog']['factory'] == 'go2' and editor.selected == ('entity', 'world/dog')
+assert saved['world/dog']['label'] == 'dog'
+observed = [key for layer in document.data['policy']['layers'].values() for key in layer['inputs']]
+assert observed and not any(key.startswith('robot.') for key in observed) and any(key.startswith('dog.') for key in observed), observed
+assert all(item['mount']['entity'] == 'world/dog' for item in saved.values() if (item.get('mount') or {{}}).get('entity', '').endswith('dog'))
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+def test_editor_app_groups_parents_cameras_and_imports(tmp_path):
+    """Layout groups (Ctrl+G), the parent relation and link, the camera view and file imports through the app."""
+    project = tmp_path / 'navigation'
+    shutil.copytree(ROOT / 'projects/planner_executor', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    scene = project / 'scene.yaml'
+    scene.write_text(scene.read_text().replace('\npolicy:', '\n- name: cube\n  factory: dex_cube\n- name: cam\n  factory: camera\n'
+                                               '  pose: {position: [1, 0, 1], orientation: [1, 0, 0, 0]}\npolicy:', 1))
+    import trimesh
+    trimesh.creation.box((0.2, 0.4, 0.1)).export(tmp_path / 'crate.glb')
+    script = f'''
+import sys, time
+sys.path.insert(0, {str(ROOT)!r})
+import tools.web_editor as W
+import shared.asset_import as A
+from pathlib import Path
+W.LIBRARY, A.IMPORTED = Path({str(tmp_path / 'library.json')!r}), Path({str(tmp_path / 'imported')!r})
+editor = W.Editor({str(scene)!r}, port=0, native_preview=False)
+# The app hides viser's panels: they are not built, and errors go to the app's toast only.
+editor.ui_post('classic', {{'on': False}})
+editor.outliner_post('select', {{'id': 'entity:world/cube'}})
+assert not editor.inspector_items
+# Parent: physical (fixed) or only laid out, chosen in place.
+editor.ui_post('attach', {{'target': 'world/robot', 'mode': 'layout'}})
+parent = editor.ui_get('inspector', {{}})['parent']
+assert parent['mode'] == 'layout' and [m for m, _ in parent['modes']] == ['physical', 'layout'] and parent['body'] == ''
+editor.ui_post('undo', {{}})
+assert 'parent' not in editor.ui_get('inspector', {{}})
+# The parent dialog: what the target offers, then the cube moved onto the robot's frame.
+options = editor.ui_get('attach', {{'target': 'world/robot'}})
+assert options['mode'] == 'physical' and [m for m, _ in options['modes']] == ['physical', 'layout'] and options['linkable']
+editor.ui_post('attach', {{'target': 'world/robot', 'mode': 'layout', 'body': '', 'place': 'align'}})
+assert editor.ui_get('inspector', {{}})['position'] == [0.0, 0.0, 0.0]
+editor.ui_post('undo', {{}})
+# Ctrl+G: the selection becomes one layout group; ungrouping keeps the places.
+editor.outliner_post('select', {{'id': 'entity:world/cam', 'mode': 'toggle'}})
+editor.ui_post('group', {{}})
+assert editor.selected == ('group', 'group_1') and set(editor.snapshot['layout_groups']['group_1']['entities']) == {{'world/cube', 'world/cam'}}
+editor.ui_post('ungroup', {{}})
+assert not editor.snapshot.get('layout_groups')
+# A camera shows its view (rendered by a browser; none is connected here).
+editor.outliner_post('select', {{'id': 'entity:world/cam'}})
+data = editor.ui_get('inspector', {{}})
+assert data['camera']['width'] == 160 and [p['name'] for p in data['parameters']][:2] == ['width', 'height']
+assert editor.ui_camera() is None
+# The policy page names what each component reads, and the camera's images are typed choices.
+scene_page = editor.ui_scene()
+inputs = {{component['role']: component['inputs'] for component in scene_page['components']}}
+assert all(group['rows'] and (group['path'] is None or group['icon']) for groups in inputs.values() for group in groups), inputs
+assert not any(row['key'] == 'simulation.gravity' and not row['enabled']
+               for groups in inputs.values() for group in groups for row in group['rows'])  # a constant: not offered
+# A whole input group dropped at once is one undo step.
+role, group = next((role, group) for role, groups in inputs.items() for group in groups if group['read'] > 1)
+keys = [row['key'] for row in group['rows'] if row['enabled']]
+editor.ui_post('unread', {{'role': role, 'keys': keys}})
+assert not any(editor.observation_enabled.get((role, key)) for key in keys)
+editor.ui_post('undo', {{}})
+assert all(editor.observation_enabled.get((role, key)) for key in keys)
+editor.ui_post('parameter', {{'name': 'data_types', 'value': ['rgb', 'distance_to_image_plane']}})
+keys = [q['key'] for q in editor.ui_get('inspector', {{}})['signals']]
+assert any('distance_to_image_plane' in key or 'depth' in key for key in keys), keys  # the catalog follows at once
+# A sensor from the context menu: mounted on the robot's root link (its links come from the native export,
+# reused from the shared mesh cache when there is one) and selected; without links it says so.
+try:
+    editor.ui_post('add_sensor', {{'factory': 'camera', 'target': 'world/robot'}})
+    added = editor.items[editor.selected[1]]
+    assert added['factory'] == 'camera' and added['mount']['entity'] == 'world/robot' and added['mount']['body'], added
+except ValueError as error:
+    assert '连杆名尚未解析' in str(error), error
+# Selecting a contact sensor or a height scanner draws what it measures.
+editor.outliner_post('select', {{'id': 'entity:world/contact_forces'}})
+assert editor.sensor_marker and editor.ui_get('inspector', {{}})['parameters'][0]['name'] == 'update_period'
+editor.outliner_post('select', {{'id': 'entity:world/height_scanner'}})
+assert editor.sensor_marker
+editor.outliner_post('select', {{'id': 'entity:world/cube'}})
+assert not editor.sensor_marker
+# Import: a mesh file uploaded, converted to USD in the background, listed on the shelf and added standing on the ground.
+with open({str(tmp_path / 'crate.glb')!r}, 'rb') as stream:
+    editor.import_file('abcdefgh12', 'crate.glb', stream, Path({str(tmp_path / 'crate.glb')!r}).stat().st_size)
+assert editor.import_finish({{'batch': 'abcdefgh12', 'kind': 'object', 'name': 'crate'}})['name'] == 'crate'
+for _ in range(300):
+    if not any(job['running'] for job in editor.jobs):
+        break
+    time.sleep(.1)
+assert not any(job['error'] for job in editor.jobs), editor.jobs
+item = next(item for item in editor.snapshot['entities'] if item['name'] == 'crate')
+# A user's import is the project's: in its assets/, on its own shelf, not the workspace's.
+own = Path(editor.target).parent / 'assets'
+assert item['factory'] == 'usd_object' and item['parameters']['usd_path'] == str(own / 'crate/usd/crate.usda')
+assert abs(item['pose']['position'][2] - 0.2) < 1e-6  # glTF is Y-up: its 0.4 m Y side stands up, the bottom on the ground
+assert [entry['id'] for entry in W.load_library(own / 'library.json')] == ['crate'] and not W.load_library()
+assert 'project:crate' in editor.gallery_entries and not any(A.IMPORTED.glob('*'))
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]

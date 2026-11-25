@@ -23,17 +23,16 @@ class SceneInfo_destination(ObjectView):
 
 
 class SceneInfo_executor_input_executor(ObjectView):
-    output: Tensor  # ['B', 12], float, 本步输出（解码前动作）
+    output: Tensor  # ['B', None], float, 本步输出（动作）
 
 
 class SceneInfo_executor_input_planner(ObjectView):
-    output: Tensor  # ['B', 4], float, 本步输出（解码前动作）
+    goal: Tensor  # ['B', 3], float, 目标位置（m，环境坐标）
+    heading: Tensor  # ['B', 1], float, 目标朝向（rad，绕 z）
 
 
 class SceneInfo_executor_input_robot(ObjectView):
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
-    default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -41,21 +40,16 @@ class SceneInfo_executor_input_robot(ObjectView):
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
 
 
-class SceneInfo_executor_input_simulation(ObjectView):
-    gravity: Tensor  # ['B', 3], float, m/s^2, environment, 环境重力加速度
-
-
 class SceneInfo_executor_input(ObjectView):
     executor: SceneInfo_executor_input_executor
     planner: SceneInfo_executor_input_planner
     robot: SceneInfo_executor_input_robot
-    simulation: SceneInfo_executor_input_simulation
 
 
 class SceneInfo_executor(ObjectView):
     input: SceneInfo_executor_input
-    output: Tensor  # ['B', 12], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 12], float, 上一步输出（解码前动作）
+    output: Tensor  # ['B', None], float, 本步输出（动作）
+    previous_output: Tensor  # ['B', None], float, 上一步输出（动作）
 
 
 class SceneInfo_height_scanner(ObjectView):
@@ -73,18 +67,20 @@ class SceneInfo_planner_input(ObjectView):
 
 
 class SceneInfo_planner(ObjectView):
+    goal: Tensor  # ['B', 3], float, 目标位置（m，环境坐标）
+    heading: Tensor  # ['B', 1], float, 目标朝向（rad，绕 z）
     input: SceneInfo_planner_input
-    output: Tensor  # ['B', 4], float, 本步输出（解码前动作）
-    previous_output: Tensor  # ['B', 4], float, 上一步输出（解码前动作）
 
 
 class SceneInfo_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
+    bounds: Tensor  # ['B', 2, 3], float, m, robot/root, 包围盒（本体坐标的最小角, 最大角）
     default_joint_position: Tensor  # ['B', None], float, 默认关节位置
     default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_effort: Tensor  # ['B', None], float, 关节实际力 / 力矩
+    joint_limits: Tensor  # ['B', None, 2], float, 关节范围（下限, 上限）
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -119,19 +115,18 @@ class PlannerObs(ObjectView):
 
 
 class ExecutorObs_executor(ObjectView):
-    output: Tensor  # ['B', 12], float, 本步输出（解码前动作）
+    output: Tensor  # ['B', None], float, 本步输出（动作）
 
 
 class ExecutorObs_planner(ObjectView):
-    output: Tensor  # ['B', 4], float, 本步输出（解码前动作）
+    goal: Tensor  # ['B', 3], float, 目标位置（m，环境坐标）
+    heading: Tensor  # ['B', 1], float, 目标朝向（rad，绕 z）
 
 
 class ExecutorObs_robot(RobotView):
     # 方法 joint_names / frame_pose / jacobian / differential_ik（环境进程内可用，被训练组件内报错）；
     # frame 取本体 body 名或已命名坐标系：无
     angular_velocity: Tensor  # ['B', 3], float, rad/s, environment, 根部角速度
-    default_joint_position: Tensor  # ['B', None], float, 默认关节位置
-    default_joint_velocity: Tensor  # ['B', None], float, 默认关节速度
     joint_position: Tensor  # ['B', None], float, 关节位置（绝对值）
     joint_velocity: Tensor  # ['B', None], float, 关节速度（绝对值）
     linear_velocity: Tensor  # ['B', 3], float, m/s, environment, 根部线速度
@@ -139,27 +134,23 @@ class ExecutorObs_robot(RobotView):
     position: Tensor  # ['B', 3], float, m, environment, 根部位置
 
 
-class ExecutorObs_simulation(ObjectView):
-    gravity: Tensor  # ['B', 3], float, m/s^2, environment, 环境重力加速度
-
-
 class ExecutorObs(ObjectView):
     executor: ExecutorObs_executor
     planner: ExecutorObs_planner
     robot: ExecutorObs_robot
-    simulation: ExecutorObs_simulation
 
 
 Obs = ExecutorObs
-SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'height_scanner.position', 'height_scanner.ray_hit_positions', 'contact_forces.contact_force_samples', 'contact_forces.contact_force', 'simulation.gravity', 'arena.position', 'arena.orientation', 'arena.size', 'destination.position', 'destination.orientation', 'destination.linear_velocity', 'planner.output', 'planner.previous_output', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.destination.position', 'planner.input.destination.orientation', 'executor.input.robot.linear_velocity', 'executor.input.robot.angular_velocity', 'executor.input.robot.orientation', 'executor.input.simulation.gravity', 'executor.input.robot.joint_position', 'executor.input.robot.default_joint_position', 'executor.input.robot.joint_velocity', 'executor.input.robot.default_joint_velocity', 'executor.input.planner.output', 'executor.input.robot.position', 'executor.input.executor.output')
+SCENE_FIELDS = ('robot.position', 'robot.orientation', 'robot.linear_velocity', 'robot.angular_velocity', 'robot.joint_position', 'robot.joint_velocity', 'robot.joint_effort', 'robot.default_joint_position', 'robot.default_joint_velocity', 'robot.joint_limits', 'robot.bounds', 'height_scanner.position', 'height_scanner.ray_hit_positions', 'contact_forces.contact_force_samples', 'contact_forces.contact_force', 'simulation.gravity', 'arena.position', 'arena.orientation', 'arena.size', 'destination.position', 'destination.orientation', 'destination.linear_velocity', 'planner.goal', 'planner.heading', 'executor.output', 'executor.previous_output', 'simulation.step_dt', 'simulation.time', 'planner.input.destination.position', 'planner.input.destination.orientation', 'executor.input.robot.linear_velocity', 'executor.input.robot.angular_velocity', 'executor.input.robot.orientation', 'executor.input.robot.position', 'executor.input.robot.joint_position', 'executor.input.robot.joint_velocity', 'executor.input.planner.goal', 'executor.input.planner.heading', 'executor.input.executor.output')
 
 
-PlannerOutput = Tensor  # ['B', 4], 固定组件 forward 返回
-ExecutorOutput = Tensor  # ['B', 12], 训练组件 forward 返回 (ExecutorOutput 均值, Tensor ['B', 1] 价值)，模型另需参数 actor_logstd；build 的 config 即 train.yaml 的 actor.model（action_dim、hidden_dims 等）；解码前动作，initial 返回同形状
+# planner 的 forward 返回字典（goal、heading），下一层读 obs.planner.<名字>
+Action = Tensor  # 被训练层 executor 的 forward 返回：动作 ['B', 动作个数]；个数就是模型最后一层的大小，构造参数写 actions 时得到受控关节总数（默认 decode 的情形）
+# initial_action(obs) 返回同形状的 Action（复位后第一步之前的动作，缺省为 0）
 
 
-class ExecutorTargets(TypedDict):  # decode(action, obs: ExecutorObs) 返回；实际单位，键与 control.output 一致
-    legs: Tensor  # ['B', 12], joint_position, robot: FL_hip_joint, FR_hip_joint, RL_hip_joint, RR_hip_joint, FL_thigh_joint, FR_thigh_joint, RL_thigh_joint, RR_thigh_joint, FL_calf_joint, FR_calf_joint, RL_calf_joint, RR_calf_joint
+class Targets(TypedDict):  # decode_action(action, obs: ExecutorObs) 返回；实际单位，每台受控机器人一项
+    robot: Tensor  # ['B', 关节数], joint_position, robot 的全部关节，顺序同 robot.joint_position
 
 
 class TaskResult(TypedDict, total=False):  # evaluate(obs: SceneInfo) 返回；缺省 reward=0, success/failure=False

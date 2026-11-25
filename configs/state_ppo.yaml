@@ -72,6 +72,8 @@ env:
       backend: isaac
       obs_dim: ${actor.model.obs_dim}
       action_dim: ${actor.model.action_dim}
+      # actor.model for policy layers built in the environment process (their `config` argument).
+      model: ${actor.model}
       device: cuda:0
       task_description: ''
   eval: ${env.train}
@@ -96,8 +98,9 @@ rollout:
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 64
-  global_batch_size: 512
+  # auto: the whole rollout (environments × steps) is one minibatch, run in micro batches up to 4096 (run.py _configure_batches)
+  micro_batch_size: auto
+  global_batch_size: auto
   seed: 42
   enable_offload: false
   model:

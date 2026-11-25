@@ -56,6 +56,9 @@ def _referenced_files(value):
             # A wrapped environment's lightened visuals live in a sublayer beside it (environment_layer).
             if (visuals := path.with_suffix('.visuals.usdc')).is_file():
                 yield visuals.resolve()
+            # Isaac's URDF / MJCF importer keeps the geometry in configuration/ layers beside the top one.
+            if (configuration := path.parent / 'configuration').is_dir():
+                yield from sorted(layer.resolve() for layer in configuration.glob('*.usd*'))
 
 
 def geometry_backend(scene):
@@ -98,8 +101,9 @@ def geometry_keys(scene, document=None, *, content=False):
     Pose edits reuse root-local geometry. A key changes with the exporting backend's
     factory, its parameters and initial state, the files those parameters name, the
     backend's asset code (its ``visuals.SOURCES``), and, for project-defined factories,
-    the project's code and assets. ``content=True`` leaves the code out: equal for the same asset
-    before and after a code change, it finds the last mesh to show until the export catches up.
+    the project's code and assets. ``content=True`` leaves the code and the initial state out: equal for
+    the same asset before and after a code change or a new initial pose (editors pose its bodies from the
+    exported kinematics), it finds the last mesh to show until the export catches up.
     """
     from .assets import backend_module, factories_for
     from .editing import SceneDocument, _plain
@@ -132,7 +136,7 @@ def geometry_keys(scene, document=None, *, content=False):
                  'parameters': _plain({k: v for k, v in node.get('parameters', {}).items()
                      if not (k == 'fix_root_link' and node.get('factory') in ('piper', 'piper_x', 'm20', 'franka_panda'))
                      and k not in ('exclude', 'moved')}),  # the editor hides / moves scene objects itself
-                 'initial_state': _plain(node.get('initial_state', {})), 'dependencies': dependencies,
+                 'initial_state': {} if content else _plain(node.get('initial_state', {})), 'dependencies': dependencies,
                  'format': 1, 'seed': 42}, sort_keys=True).encode()).hexdigest()
     return keys
 

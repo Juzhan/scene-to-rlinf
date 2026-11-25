@@ -107,6 +107,21 @@ def test_height_scanner_targets_the_global_world_only(tmp_path):
             validate(world, settings)
 
 
+def test_only_a_camera_may_stand_fixed_in_the_world(tmp_path):
+    import yaml
+    settings = yaml.safe_load(SCENE.read_text())
+    settings['entities'].append({'name': 'overview', 'kind': 'sensor', 'factory': 'camera',
+                                 'pose': {'position': [-1., 0., 1.5], 'orientation': [1., 0., 0., 0.]}})
+    path = tmp_path / 'scene.yaml'
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    validate(*reversed(prepare(path, 'isaaclab3')[:2]))
+    settings['entities'][-1].update(name='contacts', factory='contact_sensor', pose=None)
+    del settings['entities'][-1]['pose']
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    with pytest.raises(ValueError, match='needs a mount'):
+        validate(*reversed(prepare(path, 'isaaclab3')[:2]))
+
+
 def test_connections_join_per_environment_entities(tmp_path):
     import yaml
     from shared.assembly.spec import Pose

@@ -171,70 +171,37 @@ entities:
         - 0.0
         - 0.0
         - 0.0
-control:
-  train: executor
-  components:
-    planner:
-      model: .policy:build_planner
-      dimension: 6
+policy:
+  train: body
+  layers:
+    command:
+      model: .policy:CommandSampler
       period: 10.0
-      observations:
+      inputs:
         - piperx.position
         - ee_workspace.position
         - ee_workspace.size
         - ee_workspace.orientation
-    executor:
-      model: .policy:build_executor
+    body:
+      model: .policy:Body
       parameters:
         weights: weights/wholebody.pt
-      dimension: auto
       period: 0.02
-      observations:
+      inputs:
         - robot.linear_velocity
         - robot.angular_velocity
         - robot.orientation
-        - simulation.gravity
         - robot.joint_position
-        - robot.default_joint_position
         - robot.joint_velocity
-        - planner.output
-        - executor.output
+        - command
+        - body
         - piperx.orientation
         - feet_contact.contact_force
         - piperx.position
         - piperx.joint_position
         - piperx.joint_velocity
         - piperx.tcp.position
-        - piperx.default_joint_position
-      initial: .policy:initial_action
-      decode: .policy:decode_action
-  output:
-    legs:
-      type: joint_position
-      asset_name: robot
-      joint_names:
-        - FL_hip_joint
-        - FR_hip_joint
-        - RL_hip_joint
-        - RR_hip_joint
-        - FL_thigh_joint
-        - FR_thigh_joint
-        - RL_thigh_joint
-        - RR_thigh_joint
-        - FL_calf_joint
-        - FR_calf_joint
-        - RL_calf_joint
-        - RR_calf_joint
-    arm:
-      type: joint_position
-      asset_name: piperx
-      joint_names:
-        - joint1
-        - joint2
-        - joint3
-        - joint4
-        - joint5
-        - joint6
+  decode: .policy:decode_action
 connections:
   - name: piperx_attachment
     parent:

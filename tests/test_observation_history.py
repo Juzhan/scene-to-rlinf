@@ -223,7 +223,8 @@ def test_offline_windows_equal_online_windows():
 
 def test_history_is_validated_at_check():
     from shared.assembly.control import component_config
-    base = yaml.safe_load((ROOT / 'projects/planner_executor/scene.yaml').read_text())['control']
+    from shared.assembly.layout import load_scene_config
+    base = load_scene_config(ROOT / 'projects/planner_executor/scene.yaml')['control']
     good = deepcopy(base)
     good['components']['executor']['history'] = {'robot.joint_position': 3}
     assert component_config(good, 'projects.planner_executor')['components']['executor']['history'] == {'robot.joint_position': 3}
@@ -240,7 +241,7 @@ def test_generated_types_show_the_time_axis():
     scene = ROOT / 'projects/planner_executor/scene.yaml'
     settings = yaml.safe_load(scene.read_text())
     plain = generate(scene, settings=deepcopy(settings), write=False)
-    settings['control']['components']['executor']['history'] = {'robot.joint_position': 3}
+    settings['policy']['layers']['executor']['history'] = {'robot.joint_position': 3}
     text = generate(scene, settings=settings, write=False)
     executor = text[text.index('class ExecutorObs_robot('):]
     line = next(l for l in executor.splitlines() if l.strip().startswith('joint_position:'))
@@ -254,19 +255,19 @@ def test_generated_types_show_the_time_axis():
 def test_deselecting_an_observation_drops_its_window():
     from shared.assembly.editing import SceneDocument
     document = SceneDocument(ROOT / 'projects/planner_executor/scene.yaml')
-    component = document.data['control']['components']['executor']
+    component = document.data['policy']['layers']['executor']
     component['history'] = {'robot.joint_position': 3, 'robot.joint_velocity': 2}
-    document.set_observations('executor', ['robot.joint_position', 'planner.output'])
+    document.set_observations('executor', ['robot.joint_position', 'planner.goal'])
     assert component['history'] == {'robot.joint_position': 3}
-    document.set_observations('executor', ['planner.output'])
+    document.set_observations('executor', ['planner.goal'])
     assert 'history' not in component
 
 
 def test_removing_an_entity_drops_the_windows_of_its_observations():
     from shared.assembly.editing import SceneDocument
     document = SceneDocument(ROOT / 'projects/planner_executor/scene.yaml')
-    planner = document.data['control']['components']['planner']
-    planner['observations'].append('simulation.gravity')
+    planner = document.data['policy']['layers']['planner']
+    planner['inputs'].append('simulation.gravity')
     planner['history'] = {'destination.position': 3, 'simulation.gravity': 2}
     document.remove_entities(['world/destination'])
     assert planner['history'] == {'simulation.gravity': 2}

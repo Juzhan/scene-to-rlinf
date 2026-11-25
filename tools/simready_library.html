@@ -115,7 +115,7 @@ const $ = id => document.getElementById(id);
 const esc = text => String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const mb = bytes => bytes == null ? '' : bytes >= 1e9 ? (bytes / 1e9).toFixed(1) + ' GB' : bytes >= 1e6 ? (bytes / 1e6).toFixed(0) + ' MB' : (bytes / 1e3).toFixed(0) + ' kB';
 const wrapName = name => esc(name).replace(/_/g, '_<wbr>');
-const preview = (entry, size) => `preview/${size}/${encodeURIComponent(entry.publisher)}/${encodeURIComponent(entry.name)}.jpg`;
+const preview = (entry, size) => `/preview/${size}/${encodeURIComponent(entry.publisher)}/${encodeURIComponent(entry.name)}.jpg`;
 const family = name => name.replace(/_[a-z]{0,2}\d{1,3}$/i, '');
 const CHUNK = 120;
 
@@ -140,7 +140,7 @@ function writeHash() {
 }
 
 async function load() {
-  const response = await fetch('api/catalog');
+  const response = await fetch('/api/catalog');
   const data = await response.json();
   if (data.loading) { setTimeout(load, 500); return; }
   state.sources = data.sources; state.license = data.license; state.problems = data.problems;
@@ -270,7 +270,7 @@ async function select(key, members) {
   };
   $('addForm').onsubmit = event => { event.preventDefault(); add(key); };
   updateJob(state.job);
-  const response = await fetch('api/asset?key=' + encodeURIComponent(key));
+  const response = await fetch('/api/asset?key=' + encodeURIComponent(key));
   const info = await response.json();
   if (state.variant !== key) return;
   if (!response.ok) { $('facts').innerHTML = `<dt>状态</dt><dd>${esc(info.error)}</dd>`; return; }
@@ -294,7 +294,7 @@ function closeDetail() {
 async function add(key) {
   const position = ['px', 'py', 'pz'].map(id => parseFloat($(id).value) || 0);
   $('addButton').disabled = true;
-  const response = await fetch('api/add', {method: 'POST', headers: {'Content-Type': 'application/json'},
+  const response = await fetch('/api/add', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                            body: JSON.stringify({key, name: $('entityName').value.trim(), position})});
   const result = await response.json();
   if (!response.ok) { $('addButton').disabled = false; message(result.error, 'error'); return; }
@@ -315,7 +315,7 @@ function updateJob(job) {
 let polling = null;
 async function poll() {
   clearTimeout(polling);
-  const job = await (await fetch('api/status')).json();
+  const job = await (await fetch('/api/status')).json();
   const was = state.job && state.job.running;
   updateJob(job);
   if (job && job.running) { polling = setTimeout(poll, 600); return; }

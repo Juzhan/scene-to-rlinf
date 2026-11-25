@@ -1,5 +1,7 @@
 defaults:
 - model/mlp_policy@actor.model
+# The training algorithm: state_ppo is PPO (configs/state_ppo.yaml: algorithm.adv_type gae,
+# loss_type actor_critic). Project models are wired to PPO only so far; GRPO / SAC are not yet.
 - state_ppo
 - _self_
 # PPO settings of LeggedManip_Lab go2_piper Flat (rsl_rl): 24 steps x 5 epochs x 4 minibatches, lr 5e-4,
@@ -63,7 +65,5 @@ actor:
     model_type: go2_piper_wholebody__planner_executor_policy
     obs_dim: null
     action_dim: auto
-    hidden_dims:
-    - 512
-    - 256
-    - 128
+    # Initial spread of the sampled actions on the unscaled action, as the reference (the weights file brings its own).
+    action_std: 1.0

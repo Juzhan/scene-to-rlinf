@@ -13,6 +13,8 @@ SIGNALS = {
     'joint_effort': ('关节实际力 / 力矩', 'joint_effort', 'joint_state', 'N / N·m', None),
     'default_joint_position': ('默认关节位置', 'default_joint_position', 'joint_state', 'rad / m', None),
     'default_joint_velocity': ('默认关节速度', 'default_joint_velocity', 'joint_state', 'rad/s / m/s', None),
+    'joint_limits': ('关节范围（下限, 上限）', 'joint_pos_limits', 'joint_state', 'rad / m', None),
+    'bounds': ('包围盒（本体坐标的最小角, 最大角）', 'bounds', 'shape', 'm · 本体坐标', 6),
     'ray_hit_positions': ('射线命中位置', 'ray_hit_positions', 'height_scan', 'm', None),
     'frame_positions': ('测量坐标系位置', 'frame_positions', 'frame_transform', 'm', None),
     'contact_force_samples': ('接触传感器采样窗口', 'contact_force_samples', 'contact_forces', 'N', None),
@@ -38,6 +40,11 @@ def signal_information(name):
     if signal == "orientation": return Information("rotation", (4,), "float", "1", "environment", key + "/root", "wxyz")
     if signal in ("linear_velocity", "angular_velocity"):
         return Information("vector", (3,), "float", "m/s" if signal == "linear_velocity" else "rad/s", "environment", axes=("xyz",))
+    if signal == "joint_limits":
+        return Information("number", (None, 2), "float", axes=("joint", "bound"))
+    if signal == "bounds":
+        # Drawn geometry at the default joint positions, in the frame of position/orientation.
+        return Information("number", (2, 3), "float", "m", key + "/root", axes=("corner", "xyz"))
     if signal in ("joint_position", "joint_velocity", "joint_effort", "default_joint_position", "default_joint_velocity"):
         # Revolute/prismatic collections can have mixed units. Do not label
         # arbitrary articulated assets as all-radian or all-torque.

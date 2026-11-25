@@ -96,7 +96,7 @@ def test_entity_categories_and_observation_bindings_follow_actual_targets(tmp_pa
 
 
 def test_box_capabilities_follow_its_mass_parameter(tmp_path):
-    """A box with a mass is a rigid root body both backends can read; a static one stays geometry only."""
+    """A box with a mass is a rigid root body both backends can read; a static one has a fixed pose and a box."""
     scene = {"schema_version": 1, "name": "world", "entities": [
         {"name": "pad", "factory": "box", "parameters": {"size": [.2, .2, .01], "mass": .5},
          "reset": {"region": "world/area"}},
@@ -107,8 +107,9 @@ def test_box_capabilities_follow_its_mass_parameter(tmp_path):
     assert "root_state" in entities["world/pad"]["capabilities"]
     assert "root_state" not in entities["world/wall"]["capabilities"]
     ids = {entry["id"] for entry in report["observations"]}
-    assert {"pad.position", "pad.linear_velocity"} <= ids
-    assert "wall.position" not in ids
+    assert {"pad.position", "pad.linear_velocity", "pad.bounds"} <= ids
+    assert {"wall.position", "wall.orientation", "wall.bounds"} <= ids and "wall.linear_velocity" not in ids
+    assert not any(entry.startswith("area.bounds") for entry in ids)
 
 
 
@@ -145,7 +146,7 @@ def test_camera_image_shape_and_empty_component_selection_while_editing():
     settings = yaml.safe_load((ROOT / "projects/piper_pick/scene.yaml").read_text())
     camera = next(item for item in settings["entities"] if item["name"] == "wrist_camera")
     camera.setdefault("parameters", {}).update(width=64, height=48)
-    settings["control"]["components"]["planner"]["observations"] = []  # Just deleted its only entity.
+    settings["policy"]["layers"]["policy"]["inputs"] = []  # Just deleted its only entity.
     report = describe_scene(settings, directory=ROOT / "projects/piper_pick")
     rgb = next(entry for entry in report["observations"] if entry["id"] == "wrist_camera.rgb")
     assert list(rgb["information"]["shape"]) == [48, 64, 3], rgb["information"]
@@ -188,11 +189,11 @@ def test_selected_image_must_be_rendered_by_its_camera(tmp_path):
     shutil.copytree(ROOT / "projects/piper_pick", project, ignore=shutil.ignore_patterns(".cache", "__pycache__"))
     scene = project / "scene.yaml"
     document = SceneDocument(scene)
-    terms = document.data["control"]["components"]["executor"]["observations"] + ["wrist_camera.distance_to_camera"]
+    terms = list(document.data["policy"]["layers"]["policy"]["inputs"]) + ["wrist_camera.distance_to_camera"]
     with pytest.raises(ValueError, match="data_types"):
-        apply_edits(scene, {"revision": document.revision, "observations": {"executor": terms}})
+        apply_edits(scene, {"revision": document.revision, "observations": {"policy": terms}})
     revision = SceneDocument(scene).revision
-    apply_edits(scene, {"revision": revision, "observations": {"executor": terms},
+    apply_edits(scene, {"revision": revision, "observations": {"policy": terms},
                         "entities": [{"path": "world/wrist_camera",
                                       "changes": {"parameters": {"data_types": ["rgb", "distance_to_camera"]}}}]})
     saved = SceneDocument(scene)

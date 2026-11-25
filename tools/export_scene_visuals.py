@@ -202,8 +202,15 @@ def _export(scene, visuals, prepared, revision, *, force=False):
             body_transforms = {}
             if 'links' in state:
                 inverse = _matrix(*state['root_pose']).GetInverse()
+                # Link prims by name: directly under the asset (Isaac Lab's robots), or deeper in an imported or
+                # SimReady USD (/M20/Geometry/base_link, LIBERO's /microwave/_body_0/object).
+                bodies = {}
+                for candidate in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+                    if candidate.HasAPI(UsdPhysics.RigidBodyAPI):
+                        bodies.setdefault(candidate.GetName(), candidate)
                 for name, pose in state['links'].items():
                     body_prim = stage.GetPrimAtPath(prim_path + '/' + name)
+                    body_prim = body_prim if body_prim else bodies.get(name)
                     if body_prim:
                         body_transforms[str(body_prim.GetPath())] = (
                             transforms.GetLocalToWorldTransform(body_prim).GetInverse(), _matrix(*pose))
@@ -232,7 +239,14 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                 first = np.repeat(starts, sizes)
                 step = np.arange(sizes.sum()) - np.repeat(np.cumsum(sizes) - sizes, sizes) + 1
                 material = base_material(child, textures)
-                uv = _corner_uvs(mesh, indices, len(points)) if material and material['texture'] else None
+                # Faces bound to materials of their own (GeomSubsets: a CAD part of plastic and metal).
+                looks = [] if node.factory == 'terrain' else [
+                    (np.asarray(subset.GetIndicesAttr().Get() or [], dtype=np.int64), look)
+                    for subset in UsdGeom.Subset.GetAllGeomSubsets(mesh)
+                    if subset.GetElementTypeAttr().Get() == UsdGeom.Tokens.face
+                    and (look := base_material(subset.GetPrim(), textures))]
+                textured = bool(material and material['texture']) or any(look['texture'] for _, look in looks)
+                uv = _corner_uvs(mesh, indices, len(points)) if textured else None
                 if uv is not None:
                     # A vertex per (point, texture coordinate): corners on a UV seam keep their own.
                     uv_cells = np.round(uv * 4096).astype(np.int64)
@@ -259,10 +273,25 @@ def _export(scene, visuals, prepared, revision, *, force=False):
                     vertices, faces = vertices[used], faces.reshape(-1, 3)
                     uv = uv[used] if uv is not None else None
                     record['note'] = 'Native generated terrain tile, seed42/env0; local zero is this tile centre. Other training copies hidden.'
+                pieces = [{'faces': len(faces), 'texture': material['texture'] if uv is not None else None,
+                           'tint': material['tint'], 'color': material['color']}] if material else None
+                if looks:
+                    # Faces regrouped by material, one surface run each (mesh_preview.join_surfaces).
+                    owner = np.full(len(counts), -1, dtype=np.int64)
+                    for index, (members, _) in enumerate(looks):
+                        owner[members[members < len(counts)]] = index
+                    triangle_owner = np.repeat(owner, sizes)
+                    order = np.argsort(triangle_owner, kind='stable')
+                    faces, triangle_owner = faces[order], triangle_owner[order]
+                    plain = material or {'texture': None, 'tint': None, 'color': [.75, .75, .75]}
+                    pieces = []
+                    for index in np.unique(triangle_owner):
+                        look = plain if index < 0 else looks[index][1]
+                        pieces.append({'faces': int((triangle_owner == index).sum()), 'tint': look['tint'], 'color': look['color'],
+                                       'texture': look['texture'] if uv is not None else None})
+                    material = max(pieces, key=lambda piece: piece['faces'])  # the part's colour: its largest surface
                 parts.append({'name': str(child.GetPath()), 'vertices': vertices, 'faces': faces,
-                              'color': material['color'] if material else None, 'uv': uv,
-                              'pieces': [{'faces': len(faces), 'texture': material['texture'] if uv is not None else None,
-                                          'tint': material['tint'], 'color': material['color']}] if material else None})
+                              'color': material['color'] if material else None, 'uv': uv, 'pieces': pieces})
             frames = {}
             for body_path, (_, live) in body_transforms.items():
                 transform = Gf.Transform(live * inverse)
@@ -272,7 +301,7 @@ def _export(scene, visuals, prepared, revision, *, force=False):
             joint_frames = []
             if 'links' in state:
                 positions = record['initial_state']['joint_positions']
-                for joint_prim in Usd.PrimRange(prim):
+                for joint_prim in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
                     if not joint_prim.IsA(UsdPhysics.Joint):
                         continue
                     joint = UsdPhysics.Joint(joint_prim)

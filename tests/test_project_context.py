@@ -65,7 +65,8 @@ def test_new_environment_is_a_trainable_template_copy(tmp_path, monkeypatch):
         text = scene.read_text()
         assert not text.lstrip().startswith('{')  # Block YAML, as written by run.py new.
         data = yaml.safe_load(text)
-        assert data['control']['output'] and set(data['control']['components']) == {'planner', 'executor'}
+        # No policy.output: the policy drives every joint of each robot (control.automatic_outputs).
+        assert 'output' not in data['policy'] and list(data['policy']['layers']) == ['policy']
         assert {'policy.py', 'task.py', 'train.yaml', 'observation.py'} <= {path.name for path in scene.parent.iterdir()}
         published = starter.publish_draft(scene, 'fresh_env')
         assert published == tmp_path / 'fresh_env/scene.yaml' and published.read_text() == text

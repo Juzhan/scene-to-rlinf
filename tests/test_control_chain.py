@@ -120,9 +120,10 @@ def test_project_models_and_configuration_have_no_simulator_glue():
         assert not (project / 'controllers.py').exists()
         assert not (project / 'terms.py').exists()
         assert not any('isaaclab' in p.read_text() for p in project.glob('*.py'))
-        cfg = settings(name)
+        from shared.assembly.layout import load_scene_config
+        cfg = load_scene_config(project / 'scene.yaml')  # a policy: is read as the internal control mapping
         for component in cfg['control']['components'].values():
-            assert component['model'].startswith('.policy:build_')
+            assert component['model'].startswith('.policy:')
 
 
 def test_executor_auto_dimension_is_resolved_from_native_control(monkeypatch):
@@ -135,12 +136,13 @@ def test_generated_project_uses_new_roles_without_legacy_files(tmp_path):
     from tools.create import create_project
     target, files = create_project('example', destination=tmp_path)
     cfg = yaml.safe_load((target / 'scene.yaml').read_text())
-    assert cfg['control']['train'] == 'executor'
-    assert cfg['control']['components']['planner']['model'] == '.policy:build_planner'
-    assert cfg['control']['components']['executor']['dimension'] == 'auto'
+    # The default template is one policy layer; its size comes from the model, not scene.yaml.
+    assert list(cfg['policy']['layers']) == ['policy'] and 'control' not in cfg
+    assert cfg['policy']['layers']['policy']['model'] == '.policy:Policy'
+    assert 'dimension' not in cfg['policy']['layers']['policy']
     assert set(files) == {'README.md', '__init__.py', 'policy.py', 'scene.yaml', 'train.yaml', 'task.py', 'observation.py'}
     assert 'env.py' not in files
-    assert 'example__planner_executor_policy' in (target / 'train.yaml').read_text()
+    assert 'example__go2_goal_policy' in (target / 'train.yaml').read_text()
     assert not (target / 'controllers.py').exists()
 
 
@@ -149,7 +151,8 @@ def test_computed_information_and_component_interfaces_are_discoverable():
     # Public catalog is shared with the editor; names are not hard-coded in UI.
     catalog = describe_scene(ROOT / 'projects/planner_executor/scene.yaml')
     entries = {item['id']: item for item in catalog['observations']}
-    assert {'planner.output', 'executor.output', 'destination.position', 'destination.orientation'} <= entries.keys()
+    # planner returns a dict: its entries are the planner's outputs; the trained executor's output is its action.
+    assert {'planner.goal', 'planner.heading', 'executor.output', 'destination.position', 'destination.orientation'} <= entries.keys()
     assert 'distance' not in entries
     assert entries['destination.position']['available']
 
@@ -190,15 +193,42 @@ def test_physical_output_reset_only_restores_selected_environments(monkeypatch):
 
 def test_control_endpoint_rejects_hidden_scaling():
     from shared.assembly.control import component_config
-    cfg = settings('planner_executor')['control']
-    cfg['output']['legs']['scale'] = .25
+    from shared.assembly.layout import load_scene_config
+    cfg = load_scene_config(ROOT / 'projects/planner_executor/scene.yaml')['control']
+    cfg['output'] = {'legs': {'type': 'joint_position', 'asset_name': 'robot', 'joint_names': ['FL_hip_joint'],
+                              'scale': .25}}
     with pytest.raises(ValueError, match='scaling in policy'):
         component_config(cfg, 'projects.planner_executor')
 
 
 def test_component_without_observations_is_named_at_check():
     from shared.assembly.control import component_config
-    cfg = settings('planner_executor')['control']
+    from shared.assembly.layout import load_scene_config
+    cfg = load_scene_config(ROOT / 'projects/planner_executor/scene.yaml')['control']
     cfg['components']['planner']['observations'] = []
-    with pytest.raises(ValueError, match='planner 尚未选择观察'):
+    with pytest.raises(ValueError, match='planner 尚未选择输入'):
         component_config(cfg, 'projects.planner_executor')
+
+
+def test_without_control_output_every_robot_is_driven_by_name():
+    """go2_piper_wholebody: the dog and the arm are robots; the cube and the terrain stay passive."""
+    from shared.assembly.control import automatic_outputs, effective_outputs
+    from shared.assembly.layout import load_world_spec
+    scene = ROOT / 'projects/go2_piper_wholebody/scene.yaml'
+    world = load_world_spec(scene)
+    from shared.assembly.layout import load_scene_config
+    scene_settings = load_scene_config(scene)  # its policy: read as the internal control mapping
+    outputs = effective_outputs(scene_settings['control'], world)
+    assert outputs == {name: {'type': 'joint_position', 'asset_name': name, 'joint_names': ['.*']}
+                       for name in ('robot', 'piperx')}
+    assert list(automatic_outputs(world, {'piperx': 'none', 'robot': 'joint_velocity'})) == ['robot']
+    assert automatic_outputs(world, {'robot': 'joint_effort'})['robot']['type'] == 'joint_effort'
+    with pytest.raises(ValueError, match='not robots: dex_cube'):
+        automatic_outputs(world, {'dex_cube': 'none'})
+    with pytest.raises(ValueError, match='maps robot names'):
+        automatic_outputs(world, {'robot': 'joint_speed'})
+    with pytest.raises(ValueError, match='modes applies'):
+        effective_outputs({'output': outputs, 'modes': {'robot': 'none'}}, world)
+    result, _ = compile_control(scene_settings, {}, project_package='projects.go2_piper_wholebody',
+                                backend='isaaclab3', world=world)
+    assert result['control']['output'] == outputs and 'modes' not in result['control']

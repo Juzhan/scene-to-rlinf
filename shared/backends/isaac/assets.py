@@ -228,18 +228,26 @@ def terrain(terrain_generator, physics_material, material, **parameters):
     )
 
 
-def height_scanner(pattern, **parameters):
+def height_scanner(pattern: dict, update_period: float = 0.0, max_distance: float = 1e6,
+                   ray_alignment: Literal["base", "yaw", "world"] = "base", **parameters):
     from isaaclab.sensors import RayCasterCfg, patterns
 
     grid = dict(pattern)
     grid["size"] = tuple(grid["size"])
-    return RayCasterCfg(prim_path="", **parameters, pattern_cfg=patterns.GridPatternCfg(**grid))
+    return RayCasterCfg(prim_path="", update_period=update_period, max_distance=max_distance,
+                        ray_alignment=ray_alignment, **parameters, pattern_cfg=patterns.GridPatternCfg(**grid))
 
 
-def contact_sensor(**parameters):
+def contact_sensor(update_period: float = 0.0, history_length: int = 0, track_air_time: bool = False,
+                   force_threshold: float | None = None, **parameters):
+    """Net contact force on the mount body (or every body its pattern matches), the last ``history_length``
+    steps, and air/contact time when ``track_air_time``."""
     from isaaclab.sensors import ContactSensorCfg
 
-    return ContactSensorCfg(prim_path="", **parameters)
+    if force_threshold is not None:  # else Isaac Lab's own default
+        parameters["force_threshold"] = force_threshold
+    return ContactSensorCfg(prim_path="", update_period=update_period, history_length=history_length,
+                            track_air_time=track_air_time, **parameters)
 
 
 @checked(camera_parameters)

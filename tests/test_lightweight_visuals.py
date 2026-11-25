@@ -160,3 +160,40 @@ def test_textured_surfaces_keep_coordinates_through_simplification():
     error = np.abs(coords[textured] - expected)
     error[:, 0] = np.minimum(error[:, 0], 1 - error[:, 0])  # the seam at u = 0 / 1
     assert np.median(error) < .01
+
+
+def test_a_baked_atlas_is_simplified_closed_in_its_colours(tmp_path):
+    """A texture island per triangle (a baked atlas): collapse would open holes along every island, so the
+    surface is simplified welded, one solid surface per texture colour."""
+    pytest.importorskip('fast_simplification')
+    trimesh = pytest.importorskip('trimesh')
+    from PIL import Image
+    from shared.assembly.mesh_preview import _fragmented, simplify_surfaces
+    sphere = trimesh.creation.icosphere(subdivisions=5)
+    faces = np.asarray(sphere.faces)
+    vertices = np.asarray(sphere.vertices)[faces].reshape(-1, 3)  # every triangle its own island
+    triangles_ = np.arange(len(vertices)).reshape(-1, 3)
+    uv = np.random.default_rng(0).random((len(vertices), 2)).astype(np.float32)
+    Image.fromarray(np.full((8, 8, 3), 200, np.uint8)).save(tmp_path / 'atlas.png')  # one colour: one closed surface
+    assert _fragmented(vertices, triangles_, uv)
+    piece = {'faces': len(triangles_), 'texture': str(tmp_path / 'atlas.png'), 'tint': [1, 1, 1], 'color': [.4, .4, .4]}
+    v, f, _, pieces = simplify_surfaces(vertices, triangles_, uv, [piece], 2000)
+    assert len(f) <= 4000 and all(not p['texture'] for p in pieces) and len(pieces) == 1
+    assert np.allclose(pieces[0]['color'], 200 / 255, atol=.02)
+    assert sum(p['faces'] for p in pieces) == len(f)
+    mesh = trimesh.Trimesh(v, f, process=True)
+    # Welded and collapsed: hardly any open edges, where collapsing the islands left most edges open.
+    edges = mesh.edges_sorted
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+    assert (counts == 1).mean() < .2
+
+
+def test_jointed_assets_are_shown_as_modelled_up_to_a_ceiling():
+    from shared.assembly.mesh_preview import ARTICULATED_TRIANGLES, TRIANGLE_BUDGET, part_targets
+    parts = [{'faces': np.zeros((100_000, 3), int)}, {'faces': np.zeros((150_000, 3), int)}]
+    assert part_targets({'parts': parts, 'joints': [{'name': 'j'}]}) == [100_000, 150_000]
+    assert sum(part_targets({'parts': parts, 'joints': []})) < 100_000  # a static asset shares the budget
+    # Beyond the ceiling (Lite3: 1.18 M) it is simplified to the ceiling, not to a static asset's budget.
+    huge = [{'faces': np.zeros((900_000, 3), int)}, {'faces': np.zeros((300_000, 3), int)}]
+    targets = part_targets({'parts': huge, 'joints': [{'name': 'j'}]})
+    assert TRIANGLE_BUDGET * 4 < sum(targets) <= ARTICULATED_TRIANGLES and targets[0] == 3 * targets[1]

@@ -147,10 +147,20 @@ _PARAMETER_LABELS = {
     "camera": {"width": "宽度（像素）", "height": "高度（像素）", "data_types": "输出图像",
                "focal_length": "焦距（mm，水平孔径 20.955 mm）", "clipping_range": "近 / 远裁剪面（m）",
                "depth_clipping": "超出远裁剪面的深度"},
+    "contact_sensor": {"update_period": "更新周期（s，0 为每个物理步）", "history_length": "历史帧数",
+                       "track_air_time": "记录腾空 / 着地时间", "force_threshold": "接触判定力（N，空为默认）"},
+    "height_scanner": {"pattern": "扫描网格（m）", "update_period": "更新周期（s，0 为每个物理步）",
+                       "max_distance": "最远距离（m）", "ray_alignment": "射线朝向"},
+    "frame_transformer": {"target_body": "目标连杆", "target_position": "目标点偏移（m）",
+                          "target_orientation": "目标朝向（wxyz）", "target_name": "读数名称"},
+    "clear_sky": {"intensity": "亮度"},
+    "dome_light": {"intensity": "亮度", "color": "颜色 RGB（0–1）"},
     "box": {"size": "边长 xyz（m）", "mass": "质量（kg，空为静态）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
     "ball": {"radius": "半径（m）", "mass": "质量（kg）", "color": "颜色 RGB（0–1）", "friction": "摩擦系数"},
     "usd_object": {"usd_path": "USD 文件", "mass": "质量（kg，空则取 USD）", "scale": "缩放", "fix_root_link": "固定根部",
                    "springs": "关节弹簧（关节名 → {stiffness, damping, target}，SI 单位）",
+                   "couplings": "关节联动（跟随关节 → {leader, ratio, offset}：跟随 = ratio × 主动 + offset）",
+                   "actuators": "关节驱动增益（关节名正则 → {stiffness, damping, effort_limit}）",
                    "exclude": "移除的场景物体（相对默认 prim 的路径）",
                    "prim": "取出的场景物体（相对默认 prim 的路径）",
                    "moved": "移动过的场景物体（路径 → 位姿，场景坐标）"},
@@ -164,6 +174,7 @@ _MOUNT_BODY_PARAMETERS = {"frame_transformer": ("target_body",)}
 _OPTION_LABELS = {
     "rgb": "RGB 彩色", "distance_to_image_plane": "深度 · 到成像平面", "distance_to_camera": "深度 · 到光心",
     "normals": "表面法向", "max": "取远裁剪面距离", "zero": "置 0", "none": "保留 inf",
+    "base": "随机身倾斜", "yaw": "只随偏航（竖直向下）", "world": "世界竖直",
 }
 
 
@@ -264,14 +275,18 @@ project registries and metadata are discovered for ordinary Python packages.
     if isinstance(source, Mapping):
         if directory is None:
             raise ValueError("An in-memory scene catalog requires directory")
-        settings = deepcopy(dict(source))
+        from .layers import normalize
+        settings = normalize(deepcopy(dict(source)), Path(directory))
     else:
         source = Path(source).resolve()
         source_path = source
         directory, settings = source.parent, load_scene_config(source)
     package = _project_package(directory)
     from .project import project_registry
-    assets, terms, _ = project_registry(package, backend=None)
+    from .visuals import geometry_backend
+    # Every backend's asset names, with the project's own backend's factories (their parameters) for shared ones.
+    prefer = geometry_backend(source_path or Path(directory) / 'scene.yaml') if (source_path or directory) else None
+    assets, terms, _ = project_registry(package, backend=None, prefer=prefer)
     asset_docs, term_docs = {}, {}
     if package:
         from importlib.util import find_spec
@@ -296,6 +311,8 @@ project registries and metadata are discovered for ordinary Python packages.
         capabilities = asset_capabilities(node.factory, list(docs.get("capabilities", builtin[2])), node.parameters,
                                           node.kinematic)
         category = entity_category(capabilities, node.kind, node.factory)
+        if category in ("object", "robot"):
+            capabilities.append("shape")  # a body with geometry: bounds, and the pose of a static one
         entities.append({"path": path, "native_key": metadata.keys[path], "factory": node.factory,
                          "supported_backends": asset_backends(node.factory),
                          "category": category, "category_label": CATEGORIES[category],
@@ -446,7 +463,8 @@ project registries and metadata are discovered for ordinary Python packages.
     for entity in entities:
         images = image_outputs(assets.get(entity["factory"]), entity["parameters"])
         for signal, (label, function, capability, units, dimension) in SIGNALS.items():
-            if capability not in entity["capabilities"] and not (signal == "position" and "height_scan" in entity["capabilities"]):
+            if capability not in entity["capabilities"] and not (signal == "position" and "height_scan" in entity["capabilities"]) \
+                    and not (signal in ("position", "orientation") and "shape" in entity["capabilities"]):
                 continue
             if capability == "image" and signal not in images:
                 continue  # Only outputs the camera renders (its data_types parameter).
@@ -512,18 +530,34 @@ project registries and metadata are discovered for ordinary Python packages.
         from shared.backends.isaac.derived import variable_information
         computed = {name: variable_information(settings, name, terms.get("signals")) for name in settings['variables']}
     from .control import declared_dimension
-    for role in settings.get('control', {}).get('components', {}):
-        for field in ('input', 'output', 'previous_output'):
-            dimension = declared_dimension(settings['control'], role) if field != 'input' else None
-            computed[role + '.' + field] = Information('number', (dimension,), 'float')
-    interfaces = {'input': '最近基础输入（对象结构）', 'output': '本步输出（解码前动作）',
-                  'previous_output': '上一步输出（解码前动作）'}
+    control = settings.get('control') or {}
+    structure = control.get('structure') or {}
+    part_labels = {}
+    for role in control.get('components', {}):
+        computed[role + '.input'] = Information('number', (None,), 'float')
+        parts = (structure.get(role) or {}).get('parts')
+        if parts:  # a layer returning a dict: its entries, as policy.py writes them
+            for part in parts:
+                shape = (structure[role].get('shapes') or {}).get(part)
+                computed[f'{role}.{part}'] = Information('number', tuple(shape) if shape else (None,), 'float')
+                part_labels[f'{role}.{part}'] = structure[role].get('notes', {}).get(part) or part
+            continue
+        for field in ('output', 'previous_output'):
+            computed[role + '.' + field] = Information('number', (declared_dimension(control, role),), 'float')
+    layered = control.get('layers') is True
+    interfaces = {'input': '最近基础输入（对象结构）',
+                  'output': '本步输出（动作）' if layered else '本步输出（解码前动作）',
+                  'previous_output': '上一步输出（动作）' if layered else '上一步输出（解码前动作）',
+                  **part_labels}
     for name, info in computed.items():
-        observations.append({'id': name, 'label': interfaces.get(name.rsplit('.', 1)[-1], name) if '.' in name else name,
+        observations.append({'id': name, 'label': interfaces.get(name, interfaces.get(name.rsplit('.', 1)[-1], name)) if '.' in name else name,
                              'description': '组件接口' if '.' in name else '用户定义的计算信息',
                              'requires': [], 'information': info.describe(), 'units': info.unit,
                              'dimension': info.shape[0] if info.shape else 1, 'profile': 'states', 'parameters': {},
-                             'selected_in': selected.get(name, []), 'observation_selectable': name not in settings.get('variables', {}), **availability([])})
+                             'selected_in': selected.get(name, []), **availability([]),
+                             # A layer's last inputs are for Task code (obs.<layer>.input), not another input.
+                             'observation_selectable': name not in settings.get('variables', {})
+                                                       and not (layered and name.endswith('.input'))})
     for item in observations:
         item["source_groups"] = {"default": term_sources(item, {})}
         for profile, selection in settings.get("observations", {}).items():

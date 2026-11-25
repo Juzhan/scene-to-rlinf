@@ -131,6 +131,21 @@ def test_editing_writes_motion_and_visible_only_when_set(tmp_path):
     assert 'motion' not in document.entities['world/cube'] and 'visible' not in document.entities['world/cube']
 
 
+def test_gravity_compensation_is_written_only_when_on_and_read_into_the_scene(tmp_path):
+    from shared.assembly.layout import load_world_spec
+    path = tmp_path / 'scene.yaml'
+    path.write_text('schema_version: 1\nname: world\nentities:\n  - {name: arm, factory: piper_x, kind: robot}\n')
+    document = SceneDocument(path)
+    document.set_entity('world/arm', {'gravity_compensation': True})
+    assert document.entities['world/arm']['gravity_compensation'] is True
+    with pytest.raises(ValueError, match='true or false'):
+        document.set_entity('world/arm', {'gravity_compensation': 'yes'})
+    document.set_entity('world/arm', {'gravity_compensation': False})
+    assert 'gravity_compensation' not in document.entities['world/arm']
+    path.write_text('schema_version: 1\nname: world\nentities:\n  - {name: arm, factory: piper_x, gravity_compensation: true}\n')
+    assert load_world_spec(path, backend='isaaclab3').root.children[0].gravity_compensation is True
+
+
 def test_custom_motion_calls_the_project_function_with_the_scene(monkeypatch):
     import sys
     import types

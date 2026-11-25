@@ -27,7 +27,7 @@ def validate_project(description, settings, terms, *, tasks=None, factories=None
     if 'object_api' not in terms:
         raise ValueError('mjlab projects use the shared Python task.py contract; native Isaac task presets are not portable')
     if require_training and 'control' not in settings:
-        raise ValueError('Declare the shared planner/executor control configuration')
+        raise ValueError('Declare the policy (scene.yaml policy: layers, decode)')
     keys = {path.removeprefix(description.root.name + '/').replace('/', '__')
             for path, (node, _) in description.index().items() if node.factory}
     targets = target_catalog(settings)
@@ -36,11 +36,11 @@ def validate_project(description, settings, terms, *, tasks=None, factories=None
     for source in targets:
         if '.target.' in source and source.split('.target.')[0].replace('.', '__') not in keys:
             raise ValueError(f'Target references unknown entity: {source}')
-    for role, component in settings.get('control', {}).get('components', {}).items():
+    layers = settings.get('control', {}).get('components', {})
+    for role, component in layers.items():
         for source in component['observations']:
-            if source in targets or source in frames or source == 'simulation.gravity' or source in {
-                    role + '.output', role + '.previous_output', 'planner.output'}:
-                continue
+            if source in targets or source in frames or source == 'simulation.gravity' or source.split('.')[0] in layers:
+                continue  # scene targets, robot frames, gravity, or a layer's output
             parsed = parse_signal(source)
             if parsed is None or parsed[0] not in keys:
                 raise ValueError(f'Unknown entity observation: {source}')
