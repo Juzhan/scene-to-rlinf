@@ -283,6 +283,61 @@ editor.server.stop()
 
 
 @pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
+def test_scene_clicks_with_ctrl_or_shift_extend_the_selection(tmp_path):
+    """Ctrl/Cmd-click in the 3D view toggles and Shift-click adds, building the same selection the outliner
+    rows do, so the gizmo, hiding and deleting act on all of them."""
+    project = tmp_path / 'lift'
+    shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    script = f'''
+import sys
+from types import SimpleNamespace
+sys.path.insert(0, {str(ROOT)!r})
+import numpy as np
+import tools.web_editor as W
+editor = W.Editor({str(project / 'scene.yaml')!r}, port=0, native_preview=False)
+robot, table = ('entity', 'world/robot'), ('entity', 'world/table')
+click_cbs = {{entry.modifier: entry.callback for entry in editor.server.scene._scene_pointer_cb
+             if entry.event_type == 'click'}}
+assert set(click_cbs) == {{None, 'cmd/ctrl', 'shift'}}, sorted(click_cbs, key=str)
+
+
+def click(modifier, origin, direction=(0, 0, -1)):
+    """A click as viser delivers it: the modifier decides which registered callback fires."""
+    event = SimpleNamespace(ray_origin=origin, ray_direction=direction, modifier=modifier, client=None, client_id=0,
+                            screen_pos=((0.5, 0.5),))
+    click_cbs[modifier](event)
+
+
+above_robot = (0., 0., 2.)
+above_table = np.asarray(editor.info['world/table']['node'].world())[:3, 3] + (0.3, 0, 2)
+sky = (0., 0., 20.)
+assert editor.pick(above_robot, (0, 0, -1)) == robot and editor.pick(above_table, (0, 0, -1)) == table
+click(None, above_table)
+assert editor.selection() == [table] and editor.selected == table
+click('cmd/ctrl', above_robot)  # the robot joins; the table keeps its highlight
+assert set(editor.selection()) == {{robot, table}} and editor.selected == robot
+rows = {{row['id']: row for row in editor.outliner_get('state', {{}})['rows']}}
+assert rows['entity:world/robot']['selected'] and rows['entity:world/table']['selected']
+click('shift', above_table)  # already selected: Shift keeps it and only makes it active
+assert set(editor.selection()) == {{robot, table}} and editor.selected == table
+click('cmd/ctrl', above_robot)  # Ctrl-clicking a selected object drops it
+assert editor.selection() == [table]
+click('cmd/ctrl', sky, (0, 0, 1))  # a modifier click on empty space keeps the selection
+assert editor.selection() == [table]
+click('shift', above_robot)  # Shift-click adds
+assert set(editor.selection()) == {{robot, table}} and editor.selected == robot
+assert editor._near_gizmo(above_robot, (0, 0, -1))  # the gizmo sits here, so a click on it changes nothing
+click('cmd/ctrl', above_robot)
+assert set(editor.selection()) == {{robot, table}}
+click(None, sky, (0, 0, 1))  # a plain click on empty space clears it
+assert editor.selection() == [] and editor.selected is None
+editor.server.stop()
+'''
+    result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.skipif(find_spec('viser') is None, reason='viser (web editor) not installed')
 def test_placed_entities_are_set_down_on_the_surface_under_them(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))

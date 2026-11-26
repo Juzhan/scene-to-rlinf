@@ -953,6 +953,10 @@ class Editor:
         self.load()
         self.server.on_client_connect(self._client_connected)
         self.server.scene.on_click()(self._scene_clicked)
+        # Ctrl/Cmd-click toggles, Shift-click adds: the same selection the outliner's rows build.
+        self.server.scene.on_click(modifier='cmd/ctrl')(
+            functools.partial(self._scene_clicked_extend, mode='toggle'))
+        self.server.scene.on_click(modifier='shift')(functools.partial(self._scene_clicked_extend, mode='add'))
         if native_preview and self._needs_native():
             self.start_export()
         threading.Thread(target=self._watch_changes, daemon=True).start()
@@ -1730,6 +1734,27 @@ class Editor:
             return
         self.select(owner)
 
+    @action
+    def _scene_clicked_extend(self, event, mode='toggle'):
+        """Ctrl/Cmd-click toggles the object under the pointer in the selection, Shift-click adds it.
+
+        The outliner's Ctrl/Shift-click on its rows builds the same set: the clicked one becomes active (it
+        carries the gizmo and the inspector) and the others move, hide and delete with it. A click on empty
+        space keeps the set, and placing a new entity or picking a parent stays a plain click."""
+        if self.placing or self.parent_picking:
+            return
+        origin = np.asarray(event.ray_origin, float)
+        if self.gizmo.visible and self._near_gizmo(origin, event.ray_direction):
+            return  # the transform handles keep working for a multi-selection
+        owner = self.pick(origin, event.ray_direction)  # no cycling: a modifier click is not a second click
+        node = getattr(self, 'hit_nodes', {}).get(owner)
+        self.last_hit = {'path': owner[1], 'body': self.hit_body(owner[1], node)} if owner and owner[0] == 'entity' else None
+        if owner and getattr(node, 'object', None):  # a part of an imported scene: its row is not a browser owner
+            self.select_object(owner[1], node.object)
+            return
+        if owner is not None:
+            self.extend_selection(owner, mode)
+
     def hit_body(self, path, node):
         """The link of ``path`` that a picked mesh belongs to ('' for its root)."""
         bodies = {id(body): name for name, body in self.info[path]['bodies'].items()}
@@ -1807,11 +1832,14 @@ class Editor:
         return [*self.also_selected, *([self.selected] if self.selected else [])]
 
     def extend_selection(self, owner, mode, owners=()):
-        """Ctrl/Cmd-click (``toggle``) adds or drops ``owner``; Shift-click (``range``) selects ``owners``
-        (the rows between the active one and ``owner``); the clicked one becomes active."""
+        """Ctrl/Cmd-click (``toggle``) adds or drops ``owner``; Shift-click selects ``owners`` (``range``: the
+        outliner rows between the active one and ``owner``) or adds just ``owner`` (``add``, a scene click);
+        the clicked one becomes active."""
         current = self.selection()
         if mode == 'range':
             chosen = [o for o in owners if self._node_of(o) is not None and o != owner] + [owner]
+        elif mode == 'add':
+            chosen = current if owner in current else [*current, owner]
         elif owner in current:
             chosen = [o for o in current if o != owner]
             owner = chosen[-1] if chosen else None
