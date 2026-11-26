@@ -48,8 +48,9 @@
 
 - 用户模型接收 obs: Obs（或 PlannerObs / ExecutorObs），使用 obs.robot.joint_position、
   obs.robot.wrist_camera.rgb 等属性。项目代码不依赖字段字符串、全局 states 向量或内部传输格式。
-- 项目只保留 README.md 一份说明。函数返回约定作为类型生成在 observation.py（PlannerOutput/ExecutorOutput/
-  ExecutorTargets/TaskResult），policy.py/task.py 用它们标注返回值；只从 scene.yaml 确定，不确定的维度写 None。
+- 项目只保留 README.md 一份说明。函数返回约定作为类型生成在 observation.py（每层的 `<层>Obs`、被训练层的 Action、
+  decode_action 的 Targets、TaskResult；旧 control: 写法仍是 PlannerOutput/ExecutorOutput/ExecutorTargets），
+  policy.py/task.py 用它们标注返回值；只从 scene.yaml 确定，不确定的维度写 None。
 - observation.py 从场景公共信息目录和观察选择生成，提供带 Tensor 注解的嵌套类及形状、单位、
   坐标系说明。生成文件不要手改；check/启动及 Blender 保存时更新，policy.py/task.py 不覆盖。
 - Policy 类型只暴露选中的字段；SceneInfo 暴露完整基础信息，Task 按需读取，不预先复制全部图像。
