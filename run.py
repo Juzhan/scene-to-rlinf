@@ -7,6 +7,9 @@ import subprocess
 from pathlib import Path
 import sys
 
+if sys.version_info < (3, 11):
+    raise SystemExit(f"Python 3.11 or newer is required; {sys.version.split()[0]} at {sys.executable}")
+
 ROOT = Path(__file__).resolve().parent
 RLINF = Path(os.environ.get("RLINF_ROOT", ROOT / "third_party/RLinf-upstream")).resolve()
 os.environ['RLINF_ROOT'] = str(RLINF)
@@ -178,6 +181,9 @@ def execute(cfg, operation):
 
 
 
+BACKEND_MARKER = "RLINF_BACKEND_INTERPRETER"
+
+
 def use_backend_interpreter(environment):
     """Restart under the interpreter the configured simulator backend declares."""
     from shared.assembly.assets import selected_backend
@@ -186,8 +192,9 @@ def use_backend_interpreter(environment):
         interpreter = backend_interpreter(selected_backend(environment.init_params))
     except RuntimeError as error:
         raise SystemExit(str(error)) from None
-    if interpreter != sys.executable:
+    if interpreter != sys.executable and not os.environ.get(BACKEND_MARKER):
         print(f"backend {environment.init_params.backend}: using {interpreter}", flush=True)
+        os.environ[BACKEND_MARKER] = "1"
         os.execv(interpreter, [interpreter, str(ROOT / "run.py"), *sys.argv[1:]])
 def main():
     if any(value == '--backend' or value.startswith('--backend=') for value in sys.argv[1:]):
@@ -232,18 +239,11 @@ def main():
                 raise SystemExit(open_editor(["open", *(["--scene", str(scene)] if scene else []), *remaining]))
             if scene is not None and not scene.is_file():
                 editor.error(f"No scene file: {scene}")
-            # The editor runs in the project's simulator environment, the one that also exports its meshes.
-            python = os.environ.get("RLINF_EDITOR_PYTHON")
-            if not python:
-                from shared.assembly.visuals import exporter_python, geometry_backend
-                # Without a project the editor starts on a blank draft of the default template's backend.
-                python = exporter_python(geometry_backend(scene or ROOT / "projects/go2_goal/scene.yaml"))
-            python = Path(python)
-            probe = "import importlib.util, sys; sys.exit(importlib.util.find_spec('viser') is None)"
-            if not python.exists() or subprocess.call([str(python), "-c", probe]) != 0:
-                editor.error(f"{python} has no viser (the web editor)\n"
-                             f"  uv pip install --python {python} viser==1.1.1\n"
-                             "or set RLINF_EDITOR_PYTHON to an interpreter with viser")
+            # The editor runs in the environment that has viser; it exports meshes through the backend's own.
+            from shared.assembly import runtimes
+            python = Path(runtimes.interpreter(("editor",)))
+            if not python.exists() or runtimes.missing(("editor",), python):
+                editor.error(runtimes.message(("editor",)))
             target = ["--scene", str(scene.resolve())] if scene else ["--start"]  # no project: start screen
             raise SystemExit(subprocess.call([str(python), str(ROOT / "tools/web_editor.py"), *target, *remaining], cwd=ROOT))
         if scene is None:
@@ -383,13 +383,26 @@ def main():
     if args.operation == "check":
         import json
         from omegaconf import OmegaConf
-        from rlinf.envs import get_env_cls
-        from shared.integrations.rlinf.upstream import validate_runtime
-        validate_runtime(cfg)
+        try:
+            from rlinf.envs import get_env_cls
+            from shared.integrations.rlinf.upstream import validate_runtime
+        except ModuleNotFoundError:
+            # Without the training framework check still validates the project against the
+            # registered native configuration; only the trainer registration stays unchecked.
+            get_env_cls = None
+        else:
+            validate_runtime(cfg)
 
         environment = cfg.env.eval if cfg.runner.only_eval else cfg.env.train
+        # Compiling the native control terms needs the simulator backend, not a running simulator.
+        from shared.assembly.project import Project
+        if isinstance(getattr(module, "project", None), Project):
+            use_backend_interpreter(environment)
         print(OmegaConf.to_yaml(cfg, resolve=True))
-        print(f"Environment: {get_env_cls(environment.env_type, environment).__name__}")
+        if get_env_cls is not None:
+            print(f"Environment: {get_env_cls(environment.env_type, environment).__name__}")
+        else:
+            print("Environment: native (the train group is not installed; trainer registration is not checked)")
         check = getattr(module, "check", None)
         if check is not None:
             print(json.dumps(check(cfg), indent=2, ensure_ascii=False))
@@ -410,7 +423,7 @@ def main():
         return preview(cfg, preview_options, recording=args.operation == "record")
     if args.operation == "smoke":
         from tools.smoke import smoke
-        return smoke(cfg)
+        return smoke(cfg, module)
     if not args.board:
         return execute(cfg, args.operation)
     from tools.board import start_board, stop_board
@@ -422,4 +435,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # The entry point (not run.main(), which tests call in-process) moves to the interpreter that
+    # provides this command's dependency group, or says which group is missing.
+    from shared.assembly.runtimes import command_groups, ensure
+    ensure(command_groups(sys.argv[1:]), arguments=sys.argv[1:])
     main()

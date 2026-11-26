@@ -388,3 +388,5 @@ def test_named_observation_transport_preserves_partial_terminal_rows(make_enviro
     # Row 0 advanced in the next episode during the second chunk slot; restore
     # its clean reset at the chunk boundary without losing its first terminal.
     assert transport.reset_calls == [[0,1,2],[0,1,2],[0]]
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

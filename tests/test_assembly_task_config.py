@@ -274,3 +274,5 @@ def test_compiled_configs_work_in_real_sdk_manager_constructors(sdk, project_nam
     if vars(groups[category]):
         with pytest.raises(AttributeError, match='debug_vis'):
             manager_type(vars(groups[category]), environment)
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

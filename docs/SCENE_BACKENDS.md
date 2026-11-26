@@ -28,16 +28,19 @@
 | `project.py` | `PROJECT_TERMS`（是否接受项目 terms.py 的原生 term）、`UNKEYED_FACTORIES`（项目 assets.py 无后端键的 `FACTORIES` 是否属于该后端）、`validate_scene`、`validate_project`；可选 `inspect_scene`（显式 `--backend` 的场景单独检查/查看，未提供时明确报错） | prepare_scene、backend_scene（网页编辑器每次写入后经它提示）、scene_backend |
 | `control.py` | `install_terms`：挂接策略的原生控制项 | compile_control |
 | `environment.py` | `make_environment`；预览窗口可提供 `window_closed` | Project、preview |
+| `native_terms.py`（可选） | 术语在原生管理器里的实现路径（`observation`/`action`/`reward`/`signal` 四个函数），供场景目录显示；不提供时用该后端自己的模块路径。isaac 返回 `isaaclab.envs.mdp.*`，mjlab/isaaclab3 各自绑定，不伪造 | shared/assembly/catalog.py |
 | `randomization.py` | `validate(randomizations, settings)`：静态检查 `init_params.randomization` 经 `shared/assembly/randomization.resolve` 得到的声明，不支持时用 `unsupported` 报错（isaac）；isaaclab3/mjlab 另由本后端 environment 把 `settings['_randomization']` 绑成原生事件项 | prepare_scene、本后端 environment |
 | `robot.py` | `robots(env, settings)`：返回 `shared.assembly.robot.Kinematics` 子类实例，实现 `joint_names`/`joint_position`/`body_names`/`body_pose`/`body_jacobian` 五个原语 | 本后端 control.py、python_task.py 注入到固定组件、decode/initial 与 Task 的观察对象 |
-| `visuals.py`（可选） | 编辑器网格导出：`SOURCES`（使导出网格缓存失效的源文件 glob）、`launch_options`/`launch`（启动原生场景）、`snapshot`（返回各连杆位姿，wxyz）。没有该模块的后端（目前 mjlab）在编辑器中只显示示意代理。导出是增量的，只生成未缓存的实体；编辑器导出的是未保存的工作副本 `.scene.yaml.<pid>.editing`，网格缓存仍记在 `scene.yaml` 名下；只剩静态几何（桌子、无质量 box、地形地块）时不启动物理求解器（Newton 的 MuJoCo 求解器拒绝没有关节的模型）。关节体与刚体都记录 `body_names`/`root_body`，传感器可挂在刚体上（没有连杆网格帧的刚体，如 USD Cube，以实体自身位姿作 root_body 预览）；已导出却没有 body 的静态物体不列为挂载目标。导出在后端的 `INTERPRETER` 中运行，可用 `RLINF_EXPORT_PYTHON` 覆盖；编辑器本身也在同一解释器中运行（需装 viser），可用 `RLINF_EDITOR_PYTHON` 覆盖 | shared/assembly/visuals.py、tools/export_scene_visuals.py、web_editor |
+| `visuals.py`（可选） | 编辑器网格导出：`SOURCES`（使导出网格缓存失效的源文件 glob）、`launch_options`/`launch`（启动原生场景）、`snapshot`（返回各连杆位姿，wxyz）。没有该模块的后端（目前 mjlab）在编辑器中只显示示意代理。导出是增量的，只生成未缓存的实体；编辑器导出的是未保存的工作副本 `.scene.yaml.<pid>.editing`，网格缓存仍记在 `scene.yaml` 名下；只剩静态几何（桌子、无质量 box、地形地块）时不启动物理求解器（Newton 的 MuJoCo 求解器拒绝没有关节的模型）。关节体与刚体都记录 `body_names`/`root_body`，传感器可挂在刚体上（没有连杆网格帧的刚体，如 USD Cube，以实体自身位姿作 root_body 预览）；已导出却没有 body 的静态物体不列为挂载目标。导出在后端的 `INTERPRETER` 中运行，可用 `RLINF_PYTHON` 覆盖；编辑器本身在装了 viser 的解释器中运行（`shared/assembly/runtimes.py` 查找，同样可用 `RLINF_PYTHON` 覆盖） | shared/assembly/visuals.py、tools/export_scene_visuals.py、web_editor |
 
 机器人能力接口（`shared/assembly/robot.py`）：生成的 `ExecutorObs`/`PlannerObs`/`SceneInfo` 中 `kind: robot` 的节点以及资产能力含 `joint_state` 的带关节物体（如 `usd_articulation` 柜子，`robot_interface(node)` 判定）继承 `RobotView`，提供 `joint_names()`、`frame_pose(frame)`、`jacobian(frame)`、`differential_ik(frame, position, orientation=None, *, damping, max_step)`，按环境批量计算，环境坐标系、米、wxyz。`frame` 取本体 body 名或命名坐标系；命名坐标系由资产默认（`ASSET_FRAMES`，如 Franka、Piper X 的 `tcp`）加机器人实体的 `frames`（同名覆盖）组成，名称不得与方法、信息字段或子实体重名。命名坐标系同时是观察候选 `<机器人>.<坐标系>.position|orientation`，由公共层经 `frame_pose` 读取，后端无需编译传感器（mjlab 因此允许机器人实体声明 `frames`，非机器人实体仍报错）；`frame_transformer` 传感器保持为独立读数，不算机器人坐标系。运动链由该坐标系决定，不配置关节列表，scene.yaml 也不出现 IK。命名坐标系偏移、雅可比参考点平移和阻尼最小二乘步在公共层计算；后端只提供原语，也可覆盖方法改用原生求解。雅可比在 body 原点处，世界轴，列序同 `joint_position`：Isaac 读 PhysX `get_jacobians()`（其线速度行参考连杆质心，后端平移到连杆原点），mjlab 调 `mujoco_warp.jac` 并在 body 原点取值。这些方法只在环境进程可用；训练组件在 policy worker 只收到张量，调用时明确报错。`differential_ik` 返回一步后的绝对关节目标，不施加关节限位，大误差时用 `max_step` 限制单步。
 
 新后端实现这些模块后加入 `BACKENDS`；暂不支持的能力在钩子内明确报错，不在上层补分支。
-仍有少量非分支的 Isaac 依赖留在上层：check 报告的 native_key、历史公式 Task 校验、观察选择解析（`isaac.task_config._selection`）与 Isaac 导出的可视化缓存键。
+上层的公共部分已不再导入具体后端包：native_key 与观察选择解析在 `shared/assembly/scene_metadata.py` 与
+`shared/assembly/native_terms.py`，历史公式 Task 的校验在 `shared/assembly/legacy/sources.py`；原生实现路径由后端的
+`native_terms.py` 声明。Isaac 导出的可视化缓存键仍按后端 `visuals.py` 声明，属后端自身。
 
-`env.train.init_params.backend` 是公共后端选择（默认 isaac）。写在 train.yaml 或在命令行覆盖都可以，评估都随训练后端切换；只有显式写 `env.eval.init_params.backend` 时评估才单独选择。选 mjlab 时 run.py 自动改用 `.venv-mjlab` 重新启动（主 `.venv` 没有 mjlab）；显式设置了 `RLINF_PYTHON` 时不替换，缺 mjlab 则直接报错。`run.py check <project> --backend mjlab` 对完整项目检查同一配置及后端能力；也可用标准 Hydra override。没有第二份 mjlab train.yaml。
+`env.train.init_params.backend` 是公共后端选择（默认 isaaclab3；isaac 即 Isaac Lab 2 不再维护）。写在 train.yaml 或在命令行覆盖都可以，评估都随训练后端切换；只有显式写 `env.eval.init_params.backend` 时评估才单独选择。选 mjlab 时 run.py 自动改用 `.venv-mjlab` 重新启动（主 `.venv` 没有 mjlab）；显式设置了 `RLINF_PYTHON` 时不替换，缺 mjlab 则直接报错。`run.py check <project> --backend mjlab` 对完整项目检查同一配置及后端能力；也可用标准 Hydra override。没有第二份 mjlab train.yaml。
 
 mjlab 已接入原生 ManagerBasedRlEnv 和未修改的 RLinf PPO，可通过统一入口 check/smoke/train/evaluate。stock RLinf 中 env_type 仍使用现有 isaaclab 注册槽位，它负责进程和批次传输；项目工厂按 backend 构建真实 mjlab 环境，不启动 Isaac Sim。内部名称不代表仿真后端，项目无需另写 worker 或 runner。
 
@@ -78,7 +81,7 @@ Go2 两后端共用 `assets/go2/`：Isaac 5.1 `go2.usd`（`source/` 内 URL vend
 
 ## 资产双格式
 
-`run.py asset convert` 让同一资产同时具备 USD（Isaac）与 MJCF（MuJoCo/mjlab）：USD→URDF 用 Isaac Sim 自带的 `isaacsim.asset.exporter.urdf`（nvidia.srl UsdToUrdf，仅需 pxr），URDF→MJCF 用 MuJoCo 编译器，URDF/MJCF→USD 用 Isaac Lab `UrdfConverter`/`MjcfConverter`。目前没有成熟的直接 USD→MJCF 工具，所以经 URDF 中转。
+`run.py asset convert` 让同一资产同时具备 USD（Isaac）与 MJCF（MuJoCo/mjlab）：USD→URDF 用 Isaac Sim 自带的 `isaacsim.asset.exporter.urdf`（nvidia.srl UsdToUrdf，仅需 pxr），URDF→MJCF 用 MuJoCo 编译器，URDF→USD 用 `urdf-usd-converter`（`import` 组）、MJCF→USD 用 `mujoco-usd-converter`（`usd` 组），都不启动 Kit。目前没有成熟的直接 USD→MJCF 工具，所以经 URDF 中转。
 
 - 资产目录统一为 `assets/<名>/`：ASSET.json、`mjcf/`，有本地覆盖时再加入口 USD；引用的上游文件按原仓库（或 URL）相对路径原样复制到 `source/`，`source/SOURCE.json` 记录 `{repository, commit}` 或 `{url}`，以及逐文件 sha256。`run.py asset check` 先核对这些 sha256。
   - Git 来源：`run.py asset vendor <上游 USD/URDF/MJCF> assets/<名>`。带上它加载的全部文件（MJCF 跟随 `<include>` 与 compiler 的 meshdir/texturedir/assetdir）、所用 ROS 包的 package.xml（`package://` 由此在 `source/` 内解析），以及从模型目录到仓库根各级的 LICENSE/COPYING。只接受已提交、未修改的上游文件。
@@ -105,7 +108,7 @@ Go2 两后端共用 `assets/go2/`：Isaac 5.1 `go2.usd`（`source/` 内 URL vend
 - 质量按 PhysX 实际语义比较：UsdPhysics 中 mass ≤ 0 或未写表示由碰撞体按密度积分；既无正质量又无碰撞体的刚体，PhysX 给默认 1 kg。旧检查直接比较写入的 0，漏掉了 Piper X 导出 URDF 留下的空 `world` 连杆（浮动安装时臂多 1 kg，MJCF 为 0）。现在这类本体按 1 kg 计入，只在 USD 中存在时列为不对齐；`assets/piper_x/piper_x.usda` 给 `world` 写了 0.001 kg 与极小惯量，保留该本体（连接焊接在它上面）。按碰撞体推算质量的本体（Isaac 5.1 Panda 全部连杆）列在 `masses_from_colliders`，两引擎各按自己的碰撞形状积分，不逐项比较：Panda 实测 PhysX 18.78 kg、MuJoCo 19.73 kg。
 - 未比较：碰撞体尺寸与位姿（MuJoCo 网格取凸包，PhysX 按 USD 碰撞近似）、由碰撞体推算的质量、接触与摩擦、执行器。执行器由后端工厂分别声明，等价性另需动态验收。
 - Piper X：`assets/piper_x/mjcf/` 由 `assets/piper_x/piper_x.usda`（Isaac 实际加载的 USD）生成，与直接从厂商 URDF 编译的结果在 50 组随机关节角下连杆位置差 1e-7 m、质量矩阵差 1e-7。厂商仓库自带的 `scripts/urdf_to_mjcf.py` 写死路径且把执行器增益（120/80）写进 MJCF，与 Isaac 配置不一致，未采用。
-- URDF/MJCF→USD 方向已接入命令，但尚未在本机实测（需要启动 Isaac，避开正在运行的训练）。
+- URDF/MJCF→USD 都已实测：`run.py asset convert` 转 piper_x 与带 `<mimic>` 的夹爪 URDF、go2 与 piper_x 的 MJCF 都跑过，逐项比对（身体、关节顺序、驱动、焊点、对齐）见 [docs/PACKAGING_PLAN.md](PACKAGING_PLAN.md) 的“3.1 实施”。两个转换器都要 `usd-exchange`，因此 `usd-core` 不在同一环境：`import` 组用 usd-exchange 提供 pxr，`usd` 组另有自己的一份。
 
 已转换且两后端都有工厂的资产（`assets/<名>/` 下 USD、`mjcf/`、ASSET.json，`run.py asset check` 全部对齐）：
 
@@ -190,7 +193,7 @@ PhysX 按广度优先列出关节（Go2：4 个 hip、4 个 thigh、4 个 calf�
 
 ## 程序化地形
 
-两条路线，名称与参数相同（Isaac Lab 子地形配置的同名字段，见 `shared/backends/isaac/assets.py` 的 `TERRAIN_VARIANTS`，未知名称直接报错并列出可选项；列表自动转为元组）。
+两条路线，名称与参数相同（Isaac Lab 子地形配置的同名字段，见 `shared/backends/isaaclab3/assets.py` 的 `TERRAIN_VARIANTS`，未知名称直接报错并列出可选项；列表自动转为元组）。
 
 **1. 地形资产（两个后端通用，推荐用于固定场地）。** 参数化物体尚未支持，所以先生成一次，再当普通静态物体用：
 
@@ -208,7 +211,7 @@ entities:
 
 - 不给 `--param` 时使用 `shared/terrain_assets.py` 的 `PRESETS`（即下面验证所用参数）。`python run.py asset terrain all assets/terrains` 按预设把 21 种地块写到 `assets/terrains/<地形名>/`，已有 ASSET.json 的跳过；本机已生成全部 21 块，`asset check` 均通过。
 - Web 编辑器资产架自动列出 `assets/terrains/*/ASSET.json` 中的地块（类别“地面 / 地形”，名称取 ASSET.json 的 `terrain.label`），添加后就是指向该 USD 的 `usd_object`。21 块的网格与缩略图已预先生成到 `.cache/`；新生成的地块首次添加时由 Isaac 后台导出一次网格。
-- 生成在 Isaac 解释器内由 Isaac Lab 完成（启动无界面 Kit，约数秒），写出 `usd/<名>.usda`、`mjcf/<名>.xml` 和 ASSET.json；`usd_object` 与 `mjcf_for` 按普通资产的方式找到记录的 MJCF，不需要地形专用工厂。
+- 生成由 Isaac Lab 3 的子地形生成器完成（纯 Python/numpy，在 `.venv-il3` 里直接运行，不启动 Kit 或仿真，约数秒；`RLINF_PYTHON` 可换解释器），写出 `usd/<名>.usda`、`mjcf/<名>.xml` 和 ASSET.json；`usd_object` 与 `mjcf_for` 按普通资产的方式找到记录的 MJCF，不需要地形专用工厂。同样的变体、尺寸、难度与种子在同一 Isaac Lab 版本下逐字节相同（对照 `assets/terrains/` 已生成的地块）。
 - 地块以实体原点为中心、边长 `--size`。ASSET.json 的 `terrain.spawn_origin` 是原 Isaac 子地形给出的出生点（相对地块中心，例如楼梯顶平台 z=1.5），可作为机器人初始位置的参考。
 - 每环境一份的静态物体（不填 `mass` 的 `box`/`usd_object`、地块、桌子等）在 Isaac 中由克隆一次放好：写的位姿加环境原点，之后不再移动，复位只重放机器人和带质量的物体。Isaac Lab 在克隆前为它们建 `XformPrimView`，视图里只有 env_0；早先的实现在启动与每次复位时按全部 env_ids 写它，GPU 上越界（加了 `height_scanner` 后表现为崩溃），且 Fabric 写入并不移动 PhysX 静态碰撞体。同理，使用 `factory: terrain`（TerrainImporter 自带环境原点，与克隆网格不同）时不能再有每环境静态物体，启动时报错：改为 `scope: global`（全场只有一份，按世界坐标放置），或改成带质量的刚体（`box`/`usd_object` 填 `mass`；`seattle_table` 没有质量参数）。预览读数 `<名>.pose` 取 env_0 的局部位姿用于所有环境。
 - USD 保留原始三角形作为一个静态网格碰撞体。MuJoCo 的网格碰撞取凸包，非凸地形不能整体转成一个网格，因此 MJCF 按可精确表示的部件重建：轴对齐封闭块 → box；其他封闭凸体 → 凸包网格；规则高度网格的开放曲面 → hfield；平坦开放地块 → 薄板。封闭非凸块或不规则曲面直接拒绝，不做近似。
@@ -235,13 +238,14 @@ entities:
   - 各引擎忽略对方的块（与 mjlab 忽略 `physx` 相同）；dt/gravity 仍写在 `simulation`。
 - 网页编辑器“项目”页的“仿真（train.yaml）”栏切换物理引擎与渲染器：可选项来自各后端 `project.SIMULATION_CHOICES`（isaaclab3 为 newton/ovphysx 与 newton/ovrtx，isaac、mjlab 为空），与场景修改一样在保存时写入 `train.yaml` 的 `env.train.init_params.physics/renderer`，只改这一两行，注释与格式不动；`view`、评估都按它运行。性能参考：`franka_apple_crate` 加入 SimReady 铝梯（13 个部件、均为 SDF 碰撞）后，OvPhysX 每物理子步从 2.4 ms 升到 9.1 ms，单环境预览每步约 50 ms（约 20 fps，预览上限为 1/step_dt = 50 fps）；Newton 为 3.4 ms/子步、每步约 19 ms；Newton GL 画面每帧约 10–12 ms。
 - 渲染器由 `env.*.init_params.renderer` 选择（`+env.train.init_params.renderer=ovrtx`），与物理引擎独立组合，评估同样跟随训练的选择：`newton`（默认）预览用 Newton GL、场景相机用 Newton Warp；`ovrtx` 预览用 IL3 的 `NewtonRTXVisualizerCfg`（OVRTX 路径追踪，带软阴影），场景相机换成 IL3 的 `OVRTXRendererCfg`。两者都免 Kit，不需要 isaacsim；`ovrtx` 需在 `.venv-il3` 另装 `ovrtx`（约 2.2 GB，见 requirements.txt）。其他值报错。
-- 资产：Go2 用 IL3 `UNITREE_GO2_CFG`（DC 电机，同 Isaac 5.1 配置，但小腿力矩上限与 Isaac Lab 2.x 不同，行为与权重不可互换）加载工作区 vendored 的 `assets/go2` USD；ground_plane、dome_light、box、ball 用 IL3 原生 spawner（地面为 IL3 默认的浅色米制棋盘，不同于 isaac 后端的深色网格，见下文预览）。地面 USD 与贴图 vendor 在 `assets/ground_plane`（Isaac 6.2 资产，`source/SOURCE.json` 记录 URL 与 sha256），运行时不联网；IL3 只对它的远程默认地址按 2 m 一格缩放 UV，后端的 `_spawn_vendored_ground` 对本地副本做同样的缩放，保持 1 m 棋盘格。usd_object 由本后端按 USD 物理结构生成（见上文 SimReady）；piper、piper_x、clear_sky、terrain、seattle_table、dex_cube、usd_robot、contact_sensor 直接复用 isaac 后端工厂：这些 Isaac Lab 2 配置经 IL3 保留的 PhysX schema 别名仍可用，且不含四元数（根位姿由 scene.py 按 xyzw 写入）；其中 PhysX 专有字段（求解迭代、combine mode）在 OvPhysX 上生效，Newton 忽略，与 IL3 自带预设一致。
-- anymal_c 用 IL3 `ANYMAL_C_CFG`（ANYdrive LSTM 执行器网络），franka_panda 用 IL3 `FRANKA_PANDA_LEGACY_CFG`，USD 与执行器网络都换成工作区 vendored 的 Isaac 5.1 副本；m20 复用 isaac 工厂。IL3 的按引擎 articulation 属性片段没有 `fix_root_link`，固定基座由 spawner 的 `UsdFileCfg.fix_root_link` 设置（isaac 工厂使用的旧别名 `ArticulationRootPropertiesCfg` 仍带该字段，所以 piper/piper_x/m20 无需改动）。临时项目（各机器人站在地面上、随机动作）在 Newton 与 OvPhysX 上 `run.py smoke` 均通过契约检查，仅为接口跑通。
+- 资产：Go2 用 IL3 `UNITREE_GO2_CFG`（DC 电机，同 Isaac 5.1 配置，但小腿力矩上限与 Isaac Lab 2.x 不同，行为与权重不可互换）加载工作区 vendored 的 `assets/go2` USD；ground_plane、dome_light、box、ball 用 IL3 原生 spawner（地面为 IL3 默认的浅色米制棋盘，不同于 isaac 后端的深色网格，见下文预览）。地面 USD 与贴图 vendor 在 `assets/ground_plane`（Isaac 6.2 资产，`source/SOURCE.json` 记录 URL 与 sha256），运行时不联网；IL3 只对它的远程默认地址按 2 m 一格缩放 UV，后端的 `_spawn_vendored_ground` 对本地副本做同样的缩放，保持 1 m 棋盘格。usd_object 由本后端按 USD 物理结构生成（见上文 SimReady）；piper、piper_x、m20（`isaaclab3/robots/`）、clear_sky、terrain、seattle_table、dex_cube、usd_robot 原是 isaac 后端的工厂，2026-11-26 起由本后端自己维护（连同接触材质、初始状态、抽象体标记），不再从 `shared/backends/isaac/` 导入：这些配置是 Isaac Lab 的 RigidBodyPropertiesCfg / ArticulationCfg 写法，经 IL3 保留的 PhysX schema 别名可用，且不含四元数（根位姿由 scene.py 按 xyzw 写入）；其中 PhysX 专有字段（求解迭代、combine mode）在 OvPhysX 上生效，Newton 忽略，与 IL3 自带预设一致。
+- anymal_c 用 IL3 `ANYMAL_C_CFG`（ANYdrive LSTM 执行器网络），franka_panda 用 IL3 `FRANKA_PANDA_LEGACY_CFG`，USD 与执行器网络都换成工作区 vendored 的 Isaac 5.1 副本。IL3 的按引擎 articulation 属性片段没有 `fix_root_link`，固定基座由 spawner 的 `UsdFileCfg.fix_root_link` 设置（piper/piper_x/m20 的配置用的旧别名 `ArticulationRootPropertiesCfg` 仍带该字段，所以无需改动）。临时项目（各机器人站在地面上、随机动作）在 Newton 与 OvPhysX 上 `run.py smoke` 均通过契约检查，仅为接口跑通。
 - 执行器路径：IL3 默认 `SimulationCfg.use_newton_actuators=True`，由 Newton 原生执行 DCMotor 等配置，但原生 DC 电机是隐式 PD，与 isaac/mjlab 后端的显式力矩计算不同，且不支持 IL3 自带之外的执行器类。后端在 `environment.build_config` 中固定设为 `False`，所有场景都走 Isaac Lab 的 Python 显式执行器（OvPhysX 读同一开关）。依据：go2_piper_wholebody 的 mjlab 权重在 Newton 原生路径上平均约 64 步即失败，在 Python 路径上稳定（见项目 README）；go2_chase 的 supermimic 电机（`DelayedDCMotorCfg`）本就只能走 Python 路径。
 - go2 工厂参数 `actuators`：`native`（默认，IL3 `UNITREE_GO2_CFG`）或 `supermimic`（go2-supermimic 发布权重所用的显式 DC 电机：hip/thigh 与 calf 两组增益、力矩与饱和、转子 armature、0–2 物理步随机指令延迟，以及站姿 hip ±0.1/thigh 0.9/calf −1.8）。数值只写一次（`shared/assembly/assets.py` 的 `GO2_SUPERMIMIC`），IL3 用 `DelayedDCMotorCfg`（`shared/backends/isaaclab3/actuators.py`，DCMotor 加 IL3 `DelayBuffer`，按环境复位时抽延迟），mjlab 用原生 `DelayedActuatorCfg(DcMotorActuatorCfg)`；isaac 后端没有对应实现，选 supermimic 时报错。go2_chase 的 flat.pt 用 supermimic 在 Newton/OvPhysX/mjlab 平地上 100%/100%/98.6% 碰到球（见项目 README）；切换执行器路径前，同一权重在 Newton 原生 DC 电机上 16 环境 20 s 摔倒 23 次。
-- 未提供 `urdf_robot`：IL3 免 Kit 环境没有 URDF 导入器。URDF 机器人先用 `run.py asset convert` 转成 USD，再用 `usd_robot`；在 IL3 上选 urdf_robot 时 check 报未知工厂。
+- 未提供 `urdf_robot`：IL3 免 Kit 环境没有 URDF 导入器。URDF 机器人先用 `run.py asset convert` 转成 USD（这一步不启动 Kit），再用 `usd_robot`；在 IL3 上选 urdf_robot 时 check 报未知工厂。
 - Newton 对 USD 组合错误零容忍：Isaac Lab 2 / OvPhysX 只警告的无效引用，Newton 的 `parse_usd` 直接报错退出。`assets/piper_x` 的源 `base.usd` 原有一条指向不存在 `</visuals/world>` 的空引用（`/agx_arm/world/visuals`，对合成结果无贡献），已删除（原文件备份于 /tmp/piperx_backup）；go2、粗糙地形、dex_cube 已检查无组合错误。新资产应在 `run.py asset convert` 环节排除此类引用。
 - 碰撞体位置：Isaac Sim 旧 URDF 导入器把 `CollisionAPI`/`MeshCollisionAPI` 施加在装碰撞网格的 Xform（`collisions/<link>/node_STL_BINARY_`、M20 的 `collisions/collision_N`）上。Kit PhysX（isaac 后端）碰撞其下几何，而 UsdPhysics 只在 Gprim 上定义碰撞体，Newton 与 OvPhysX 都跳过它们，于是 piper、piper_x、M20 整机没有碰撞（夹爪穿过方块、末端可穿地）。后端把 USD 资产的 `spawn_from_usd` 换成 `spawners.spawn_from_usd`：在 env_0 生成后、克隆前把这些 API（含 collisionEnabled 与 approximation）移到其下 Gprim，只对途经的 instanceable 祖先取消实例化；资产文件不改，isaac 后端不受影响。go2、方块等本就在 Gprim 上，不受影响。
+- 导入 USD 的身体路径：转换器保留自己的嵌套层级（`Geometry/<连杆>/<子连杆>`），只由固定关节连接的叶子连杆留成 Xform 帧；场景里仍写 `<实体>/<身体名>`，后端用 `usd_body_paths` 换成文件里的实际子路径（`scene.body_subpath`）：传感器的挂载身体、`frame_transformer` 的 `target_body`、连接（Newton 与 OvPhysX）的两端都按这张表解析，只在有东西挂上去时才读该 USD；名字不在表里时报错并列出可用的身体名；读不到 USD（文件不存在、没有 default prim）时直接报出实体与文件，不落到“没有这个身体”的提示上。接触传感器的身体名模式（如 `.*_wheel`）放在所匹配身体共同的父级下，匹配到的身体不在同一父级（嵌套链上的各节）时报错，要求逐个按名字挂。
 - 关节顺序：IL3 的 `ArticulationCfg.joint_ordering` 原生支持按名重排（读数、动作、雅可比列同步），后端把 ASSET.json 的 `joint_order` 填入，因此读数不再换序；顺序不符时 `robot.joint_layout` 报错。
 - IL3 四元数为 xyzw，只在 `frames.py` 边界换成公共 wxyz；读数、抽象体命令项、区域复位与机器人接口均按 wxyz 对外。
 - 形状读数（`readers._geometry`）：`bounds`、静态物体的 `position`/`orientation` 在第一次读取时从舞台读一份环境副本（每环境克隆一份的实体取它所在环境原点，全局实体按各环境原点换算），之后是常量。参考坐标系与根部读数相同：刚体和铰接体取资产内没有父关节的刚体（根连杆），静态物体取实体 prim；包围盒只含 default/render 用途的几何，按当时舞台上的关节位置（即默认关节位置）。`joint_limits` 读原生 `joint_pos_limits`。已在 zz_dual_arm_microwave 上核对 Newton 与 OvPhysX 读数一致（微波炉 0.34×0.26×0.19 m、门限位 [-2.094, 0]、桌面顶 0.75 m）。isaac、mjlab 后端未实现这三项，选中时 check 报错，Task 读取时报错。
@@ -325,7 +329,11 @@ go2_piper_wholebody 用 mjlab 训练的 `weights/wholebody.pt`（运行 `2026102
 - test_scene_backends.py：真实 mjlab/MuJoCo 模型的初始关节、父子旋转、动态刚体和短 CPU 参考步进。
 - test_portable_project.py：同一项目两后端配置一致；对象读取与惰性 Task；原生 mjlab ActionTerm 配置/实例调用公共执行链、实际单位解码、部分环境复位；错误执行器模式拒绝。
 - 原有场景、控制链、对象接口和 Python Task 配置回归测试。
-- test_isaaclab3_backend.py：isaaclab3 静态布局与 isaac 一致且不导入 SDK、四元数边界、未接入能力在仿真前拒绝（含 contact_materials 校验）、标记轴向旋转、高度扫描器 meshes 只接受全部全局形状、连接只接受环境内实体及 weld 相对位姿、相机工厂与 isaac 同签名且参数在 SDK 前校验；URDF 导入器式 instanceable Xform 碰撞体移到其下 Mesh 并保留 approximation；渲染器只接受 newton/ovrtx；装有 isaaclab_newton / isaaclab_ov 时检查 `simulation.newton` / `simulation.physx` 覆盖原生预设。
+- test_urdf_conversion.py：`urdf-usd-converter` 转出的嵌套身体路径与固定关节帧、`joint_order`、无驱动关节、
+  自由/固定根的焊点处理，固定关节叶子连杆记为 ASSET.json `frames` 并在 `robot_frames` 里可读，以及与 MuJoCo
+  编译出的 MJCF 对齐（没装转换器时跳过）。
+- test_mjcf_conversion.py：`mujoco-usd-converter` 的同一组契约，对源 MJCF 做对齐（`usd` 组，没装转换器时跳过）。
+- test_isaaclab3_backend.py：isaaclab3 静态布局与 isaac 一致且不导入 SDK、四元数边界、未接入能力在仿真前拒绝（含 contact_materials 校验）、读不到的 USD 报出实体与文件、标记轴向旋转、高度扫描器 meshes 只接受全部全局形状、连接只接受环境内实体及 weld 相对位姿、相机工厂与 isaac 同签名且参数在 SDK 前校验；URDF 导入器式 instanceable Xform 碰撞体移到其下 Mesh 并保留 approximation；渲染器只接受 newton/ovrtx；装有 isaaclab_newton / isaaclab_ov 时检查 `simulation.newton` / `simulation.physx` 覆盖原生预设。
 
 - test_mjlab_runtime.py：ANYmal-C 的 LSTM 执行器每步输出与 Isaac 计算方式逐项一致、只复位指定环境的隐状态；可选 RUN_MJLAB_GPU=1，验证 GPU 并行推进、单环境截断/复位、复位前最终观察和返回 Tensor 独立快照；普通测试验证后端接口缓存隔离。
 - test_stock_rlinf.py：实际原生训练及评估的观察合并路径；共享边界处理评估的字典列表，不改上游源码。

@@ -145,7 +145,8 @@ def test_a_urdf_without_its_meshes_stops_before_converting(tmp_path):
 def test_a_ros_xacro_is_expanded_with_its_packages_found_in_the_upload(tmp_path):
     import os
     import subprocess
-    python = os.environ.get('ISAAC_PYTHON', str(A.ROOT / '.venv/bin/python'))
+    from shared.assembly.runtimes import declared_python
+    python = str(declared_python('isaac', A.ROOT))
     if subprocess.run([python, '-c', 'import xacro'], capture_output=True).returncode:
         pytest.skip('xacro is not installed in the Isaac interpreter')
     package = tmp_path / 'source' / 'arm_description'
@@ -329,3 +330,5 @@ def test_an_open_mesh_collides_through_its_hull_with_authored_inertia(tmp_path):
     rotation = np.array(Gf.Matrix3d(Gf.Rotation(properties.GetPrincipalAxesAttr().Get())))  # rows: principal axes
     tensor = rotation.T @ np.diag(properties.GetDiagonalInertiaAttr().Get()) @ rotation
     assert np.allclose(tensor, hull.moment_inertia * 2.0 / hull.volume, atol=1e-6)
+
+pytestmark = pytest.mark.group_import  # runs in the [import] dependency group

@@ -156,7 +156,7 @@ def test_camera_outputs_follow_data_types_and_parameters_are_typed():
     import pytest
     import yaml
     from shared.assembly.assets import check_parameters
-    from shared.backends.isaac.assets import FACTORIES
+    from shared.backends.isaaclab3.assets import FACTORIES
     settings = yaml.safe_load((ROOT / "projects/piper_pick/scene.yaml").read_text())
     camera = next(item for item in settings["entities"] if item["name"] == "wrist_camera")
     camera["parameters"] = {"width": 64, "height": 48, "data_types": ["distance_to_image_plane", "normals"]}
@@ -199,3 +199,7 @@ def test_selected_image_must_be_rendered_by_its_camera(tmp_path):
     saved = SceneDocument(scene)
     assert saved.data["application"]["enable_cameras"] is True
     assert saved.entities["world/wrist_camera"]["parameters"]["data_types"] == ["rgb", "distance_to_camera"]
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

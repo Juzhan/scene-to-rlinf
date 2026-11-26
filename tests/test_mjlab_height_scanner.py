@@ -262,3 +262,5 @@ def test_step_target_hits_and_misses():
     torch.testing.assert_close(hits[inside][:, 2], torch.full((int(inside.sum()),), .2), atol=2e-4, rtol=0)
     torch.testing.assert_close(hits[inside][:, :2], (starts[..., :2] - origins[:, None, :2])[inside], atol=2e-4, rtol=0)
     assert torch.isinf(hits[outside]).all()  # Isaac: misses are inf (mjlab reports -1)
+
+pytestmark = pytest.mark.group_mjlab  # runs in the [mjlab] dependency group

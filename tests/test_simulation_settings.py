@@ -33,3 +33,5 @@ def test_choices_come_from_the_backend_and_only_their_lines_change(tmp_path):
     assert simulation_settings(scene)[2] == {'physics': 'newton', 'renderer': 'ovrtx'}
     with pytest.raises(ValueError, match='physics must be one of'):
         write_simulation_settings(scene, {'physics': 'bullet'})
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

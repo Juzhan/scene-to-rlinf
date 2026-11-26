@@ -107,3 +107,5 @@ def test_anymal_lstm_actuator_follows_isaac_network_and_resets_per_env():
     scene.reset(torch.tensor([1], device='cuda:0'))
     assert actuator._hidden[:, 1].abs().sum() == 0 and actuator._cell[:, 1].abs().sum() == 0
     assert actuator._hidden[:, 0].abs().sum() > 0
+
+pytestmark = pytest.mark.group_mjlab  # runs in the [mjlab] dependency group

@@ -42,3 +42,5 @@ def test_subprocess_failure_reaches_the_env_worker(mode, message):
             transport.step(torch.zeros(2, 1))
     finally:
         transport.isaac_lab_process.kill()
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

@@ -1,0 +1,29 @@
+# Exact package set of [editor]; regenerate with tools/setup_env.py --lock.
+# Frozen from .venv-il3/bin/python, .venv/bin/python so every group built from these
+# files keeps one version of each shared package.
+antlr4-python3-runtime==4.9.3
+certifi==2026.7.22
+charset-normalizer==3.3.2
+hydra-core==1.4.0.dev1
+idna==3.10
+imageio==2.38.1
+markdown-it-py==4.2.0
+mdurl==0.1.2
+msgspec==0.22.0
+numpy==2.5.1
+omegaconf==2.4.0
+packaging==26.0
+pillow==12.3.0
+pygments==2.20.0
+pyyaml==6.0.3
+requests==2.32.3
+rich==14.3.4
+ruamel-yaml==0.18.17
+ruamel-yaml-clib==0.2.15
+tqdm==4.70.0
+trimesh==4.11.1
+typing-extensions==4.16.0
+urllib3==2.8.0
+viser==1.1.1
+websockets==16.1.1
+zstandard==0.25.0

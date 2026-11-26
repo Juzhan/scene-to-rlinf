@@ -68,3 +68,5 @@ def test_assess_cli_delegates_to_the_existing_evaluator(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run.py", "assess", "go2_stairs", "--snapshot", "saved-run"])
     run.main()
     assert received == [["go2_stairs", "--snapshot", "saved-run"]]
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

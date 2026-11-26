@@ -49,3 +49,7 @@ def test_saved_variables_have_one_shared_observation_and_task_entry():
     assert rows[0].observation is None
     assert rows[0].owner == '共享变量'
     assert not any(r.reference == 'distance' for r in properties(data, variables={}))
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

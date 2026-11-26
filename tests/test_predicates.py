@@ -63,3 +63,5 @@ def test_open_fraction_measures_from_the_limit_nearest_the_default():
 def test_upright_reads_the_local_up_axis():
     tipped = node('bowl', orientation=[[1., 0., 0., 0.], [math.cos(math.pi / 4), math.sin(math.pi / 4), 0., 0.]])
     assert upright(tipped, .1).tolist() == [True, False]
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

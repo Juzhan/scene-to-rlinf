@@ -71,3 +71,5 @@ class StackProgressTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

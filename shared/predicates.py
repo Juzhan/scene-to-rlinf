@@ -14,7 +14,7 @@ item. Holding a relation for some time is TaskMemory.hold.
 """
 import torch
 from shared.assembly.abstract import rotate
-from shared.policy_math import inverse_rotate
+from shared.policy import inverse_rotate
 
 
 def box(node):

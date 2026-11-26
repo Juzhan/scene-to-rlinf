@@ -35,6 +35,31 @@ bash run.sh evaluate my_task env.eval.total_num_envs=16
 显示 RLinf 记录的指标（默认 `http://127.0.0.1:6006`，被占用时顺延，`--board-port` 改起始端口）；
 曲线只反映奖励与损失，实际行为仍用 `view/record/evaluate` 查看。
 
+## 依赖组与按需安装
+
+环境按用途分组（详细设计与实施状态见 [docs/PACKAGING_PLAN.md](docs/PACKAGING_PLAN.md)）：
+
+| 组 | 能做什么 |
+| --- | --- |
+| `core` | `new`、`catalog`、终端编辑 `scene.yaml`、生成 `observation.py`；`check` 另需项目后端组 |
+| `editor` | 网页编辑器（`edit`），不需要仿真器 |
+| `import` | `asset import`：网格、USD、URDF/MJCF 的登记与预览；URDF 转 USD 不需要 Isaac Sim（MJCF 转换另需 `usd` 组） |
+| `usd` | MJCF 转 USD（`mujoco-usd-converter`）；它自带的 MuJoCo 4.x 与 `import` 组的 3.12 不能同装，所以单独一个环境 |
+| `isaaclab3` | `check`、`view`、`record`、`smoke`、`evaluate` 的仿真部分 |
+| `train` | `train`、用训练检查点 `evaluate`（RLinf、ray） |
+| `deploy` | 真机推理只需要 `torch` |
+| `isaac`、`mjlab` | 冻结后端，各自 SDK |
+
+```bash
+python3 tools/setup_env.py --check --python .venv-il3/bin/python --with isaaclab3,train  # 缺哪个组
+python3 tools/setup_env.py --with core,editor --env .venv-editor                          # PyPI 组，用 requirements/ 的锁文件
+python3 tools/setup_env.py --with isaaclab3,train --env .venv-il3 --isaaclab-source ~/repos/IsaacLab-3.0
+```
+
+`run.py` 的命令缺组时只打印一行提示（`需要 [train]：tools/setup_env.py --with train`），
+并在工作区里找装有该组的解释器自动切换；唯一的环境变量覆盖是 `RLINF_PYTHON`。
+测试按组标记：`pytest -m group_core`，或 `WORKSPACE_TEST_GROUP=core pytest tests` 只收集该组。
+
 ## 用户需要维护什么
 
 | 文件 | 职责 |
@@ -165,7 +190,7 @@ bash run.sh edit --scene path/scene.yaml --port 8093 --no-native-preview
 
 “添加”页的陈列栏以卡片列出可用资产，`assets/terrains/` 下的地块列在“地面 / 地形”类。添加传感器时在“安装到 / 安装连杆”中选择所在实体和连杆（默认选中的实体，否则第一个机器人的根部），新传感器直接以安装状态写入；接触、高度扫描、坐标变换传感器只能安装在连杆上，相机还可选“不安装，固定在世界中”（各后端由 `FREE_SENSORS` 声明，Isaac Lab 3 也支持）。连杆名来自原生网格导出，导出完成前添加会提示稍候。坐标变换的 `target_body` 默认取安装实体根部，在检查器中从该实体的连杆里选择。新高度扫描器以全部全局地面为射线目标；已瞄准全部地面的扫描器在新增全局地面时自动加入它，删掉地面后再添加的地面也会自动成为目标。示意图缓存在 `.cache/asset_thumbnails/`。导入的文件属于当前项目：放进 `projects/<项目>/assets/<名称>/source/`，转换结果与记录在同一目录，登记在该项目的 `assets/library.json`，只出现在这个项目的资产架（标“本项目导入”），复制项目或用它作模板时一起带走；新项目要先保存再导入（`shared/asset_import.py`，命令行 `run.py asset import <文件或目录> --project <项目> --kind object|robot|scene`）。不给 `--project` 时放进工作区的 `assets/imported/`、登记在 `assets/library.json`，供所有项目使用，这是维护者扩展公共资产的方式。转换：ROS 的 `.urdf.xacro` 先用 xacro 展开（`$(find 包名)` 是上传文件里写着这个名字的 `package.xml` 所在的文件夹，不需要装 ROS；缺包时写明包名）。URDF 的网格按 `package://` 的包、URDF 旁的相对路径、再按路径结尾在上传的文件里找；缺外观网格或无法替代的碰撞网格时在转换前停止并列出文件（请导入整个文件夹），只缺碰撞网格时用该连杆的外观网格并写明；惯量不满足三角不等式的连杆按 MuJoCo 的做法取主惯量平均值并写明；URDF 的 `<mimic>` 写成 `usd_object.couplings`。URDF 不含关节增益，Isaac 导入器自带的增益在轻的连杆上会发散，所以 URDF 机器人一律给默认 PD。URDF / MJCF 走 `run.py asset convert`（Isaac 导入器生成 USD，MuJoCo 编译 MJCF，记录对齐结果，转换器留下的空引用会去掉；为被别的模型包含而写的 MJCF，如 robosuite / LIBERO 物体用 `inertiagrouprange` 排除了全部几何体，单独导入时去掉该项、按几何体自身质量计算；Isaac 导入器把被动关节阻尼写成力上限为 0 的驱动，包装层把力上限改为不限，否则 PhysX 不施加阻尼、Newton 拒绝该关节；MJCF 的 site 是参考点和区域标记，导入器会把它们变成可见形状，包装层把它们隐藏）；USD 直接使用，按场景导入时包装成静态环境并补碰撞体；网格写成 USD，物体是一个刚体：每个部件另生成封闭凸包作碰撞体（不可见），质量按凸包以 500 kg/m³ 估算（可在“高级”里改 `mass`），质心与转动惯量按凸包写明，下载的网格常不封闭，不让引擎从显示网格推算；场景是静态三角网格碰撞。导入的机器人（`usd_object`）关节由参数 `actuators`（关节名正则 → `stiffness`/`damping`/可选 `effort_limit`，Isaac Lab 隐式 PD）驱动，USD 没有写驱动刚度时导入自动填默认 PD（刚度 100、阻尼 10）并提示，按机器人在“高级”里调整（如 R1 Pro 的虚拟底座关节需要很高刚度）；编辑器给已有策略的项目添加机器人时，新机器人默认“不控制”（`control.modes: none`），已有 `decode_action` 不受影响，要训练它再改为“位置”并补上 decode。glTF / OBJ 按 Y 轴向上转成 Z 向上；网格文件不带单位，尺寸像毫米或厘米时会提示在变换里设缩放。FBX 等需要本机装有 Blender。SimReady 资产是平台提供的公共资产（下载与包装放在工作区 `assets/`）；其中关节有驱动刚度的按机器人添加，如 M20，可展开连杆、设置控制。导入后用 `view` 核对关节、碰撞和质量。从资产架拖入视图、点选位置放置或导入时，物体按自身底面范围向下取样，落在下方最高表面（地形起伏、桌面）上方 3 cm，不按原点高度摆放；放下后若仍与其他物体或静态场景（导入的建筑、地形）相交，状态栏写明对象和相交深度，因为仿真开始时引擎会把相交的物体弹开或让它穿过地形。按坐标填写的位置保持不变。
 
-网页先显示示意代理和上次导出的网格；新资产或改了参数时在后台用仿真后端的解释器导出原生网格（`RLINF_EXPORT_PYTHON` 可指定），导出后保留 2 分钟供接连导入复用，空闲或编辑器退出时自动结束；`--no-native-preview` 关闭启动时的自动导出。网格按实体缓存，同一资产与参数在各项目和陈列栏间共用。点击保存（或 Ctrl-S）才写 `scene.yaml` 并更新 `observation.py`；添加、删除、组合、安装等结构操作先把面板中的修改并入工作副本再应用，原生网格导出也读取工作副本。浏览器内不运行物理仿真，布局结果以 `view` 为准。
+网页先显示示意代理和上次导出的网格；新资产或改了参数时在后台用仿真后端的解释器导出原生网格（`RLINF_PYTHON` 可指定），导出后保留 2 分钟供接连导入复用，空闲或编辑器退出时自动结束；`--no-native-preview` 关闭启动时的自动导出。网格按实体缓存，同一资产与参数在各项目和陈列栏间共用。点击保存（或 Ctrl-S）才写 `scene.yaml` 并更新 `observation.py`；添加、删除、组合、安装等结构操作先把面板中的修改并入工作副本再应用，原生网格导出也读取工作副本。浏览器内不运行物理仿真，布局结果以 `view` 为准。
 
 ## 命令与验证边界
 
@@ -174,7 +199,7 @@ bash run.sh edit --scene path/scene.yaml --port 8093 --no-native-preview
 - `smoke`：短程接口、终止与复位检查，不代表策略学会任务。
 - `train` / `evaluate`：调用 RLinf 训练或评估。
 - `catalog`：列出场景可读的信息目录。
-- `asset convert <源文件> <资产目录>`、`asset check <资产目录>`、`asset terrain <地形名|all> <资产目录>`：维护资产用，生成并比对 USD 与 MJCF、生成地形地块，写 `ASSET.json`；需要 `.venv-mjlab`，详见 [docs/SCENE_BACKENDS.md](docs/SCENE_BACKENDS.md)。
+- `asset convert <源文件> <资产目录>`、`asset check <资产目录>`、`asset terrain <地形名|all> <资产目录>`：维护资产用，生成并比对 USD 与 MJCF、生成地形地块，写 `ASSET.json`；地形生成用 Isaac Lab 3 的生成器（`.venv-il3`，不需要 Isaac Sim）；URDF 转 USD 用 `urdf-usd-converter`（`import` 组），MJCF 转 USD 用 `mujoco-usd-converter`（`usd` 组），都不启动 Kit；两者都没装时才回退到带 Isaac 导入器的解释器（Isaac Sim 环境）。详见 [docs/SCENE_BACKENDS.md](docs/SCENE_BACKENDS.md)。
 
 新训练写独立实验目录。快照保存有效配置和项目源码；观察顺序、训练角色、控制周期、解码函数、终点类型与关节顺序变化都属于接口变化。`--allow-scene-change` 不允许绕过模型接口检查。
 回放 checkpoint 时只比较运行会导入的项目模块和场景配置内容；Python 按去掉注释与文档字符串的语法树比较，README 等无关文件或只改注释不算差异。不一致时报错列出文件名并给出 `--snapshot <快照路径>`；`policy.py` 的改动属于策略语义，`--allow-scene-change` 也不放行。

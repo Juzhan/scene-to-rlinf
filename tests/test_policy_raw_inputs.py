@@ -112,3 +112,5 @@ def test_policy_layers_keep_rollout_and_update_consistent(project,model):
     torch.testing.assert_close(update['values'],rollout['prev_values'])
     (-update['logprobs'].mean()+update['values'].square().mean()).backward()
     assert network.net[0].weight.grad.abs().sum()>0 and adapter.log_std.grad is not None
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

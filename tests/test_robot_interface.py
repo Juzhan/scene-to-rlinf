@@ -183,3 +183,5 @@ def test_named_frame_is_an_observation_read_through_the_robot_interface():
                               robots={'arm': arm}.__getitem__)
     expected = arm.frame_pose('tool')
     assert torch.equal(position(), expected[0]) and torch.equal(orientation(), expected[1])
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

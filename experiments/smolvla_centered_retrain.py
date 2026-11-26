@@ -122,7 +122,7 @@ def main():
     if metadata["residual_start_step"] != 10:
         raise ValueError("Unexpected training initialization or residual activation")
     del model
-    command = [sys.executable, "tools/smolvla_libero_probe.py", "--suite", "libero_spatial", "--task-id", "8",
+    command = [sys.executable, "experiments/smolvla_libero_probe.py", "--suite", "libero_spatial", "--task-id", "8",
                "--bowl-on-plate", "--clear-table", "--closer-m", "0.10", "--center-layout", "--vary-layout",
                "--layout-seed", str(layout_seed), "--seed", str(policy_seed), "--episodes", "10",
                "--evaluate-residual", str(model_root), "--output", str(root / "evaluation"), *comparison_arguments]

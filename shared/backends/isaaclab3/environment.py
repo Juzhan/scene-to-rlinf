@@ -108,7 +108,7 @@ def build_config(prepared, *, parameters, num_envs, seed, horizon, visualize=Fal
                                                         params={'asset_names': asset_names})
         events['assembly_defaults'] = EventTermCfg(func=reset_authored_assets, mode='reset',
                                                    params={'asset_names': asset_names})
-    from shared.backends.isaac.contact_materials import events as material_events
+    from .contact_materials import events as material_events
     from .randomization import events as randomization_events
     scene_events = {**material_events(settings.get('world', {}).get('contact_materials', {})),
                     **randomization_events(settings.get('_randomization', ()), settings,
@@ -274,7 +274,7 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
     try:
         import torch
         from isaaclab.envs import ManagerBasedRLEnv
-        from shared.integrations.rlinf.terminal import TerminalObservationMixin, validate_terminal_observations
+        from shared.backends.terminal import TerminalObservationMixin, validate_terminal_observations
         from .scene import newton_connections, physx_connections, refresh_newton_frames
 
         class NativeEnv(TerminalObservationMixin, ManagerBasedRLEnv):

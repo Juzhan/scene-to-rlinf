@@ -14,7 +14,7 @@ nominal poses and the scales below; changing them needs a new training run.
 """
 import torch
 from torch import Tensor, nn
-from shared.policy_math import inverse_rotate
+from shared.policy import inverse_rotate
 from .observation import Action, BodyObs, CommandObs, Targets
 
 ACTION_SCALE = .25

@@ -12,8 +12,7 @@ The standing pose and the scale are the policy's own constants, the same on the 
 to ``destination``; replace it when the robot or task changes.
 """
 import torch
-from shared.policy import flat, mlp
-from shared.policy_math import inverse_rotate, relative_goal, yaw
+from shared.policy import flat, inverse_rotate, mlp, relative_goal, yaw
 from torch import nn
 from .observation import Action, PolicyObs, Targets
 

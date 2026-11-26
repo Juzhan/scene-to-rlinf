@@ -37,9 +37,9 @@ def test_project_assets_and_terms_are_local_lazy_and_share_camera_selection(tmp_
     path = write_scene(package / "scene.yaml", scene)
     try:
         options = dict(scene_config=path, project_package=package.name)
-        state = prepare_scene({}, **options)
+        state = prepare_scene({'backend': 'isaac'}, **options)
         assert "world/camera" not in state.description.index()
-        vision = prepare_scene({}, enable_cameras=True, **options)
+        vision = prepare_scene({'backend': 'isaac'}, enable_cameras=True, **options)
         assert "world/camera" in vision.description.index()
         assert "image" in vision.terms["observations"]
         from shared.backends.isaac.assets import FACTORIES
@@ -47,7 +47,7 @@ def test_project_assets_and_terms_are_local_lazy_and_share_camera_selection(tmp_
         scene["entities"][0]["parameters"] = {"misspelled":1}
         write_scene(path, scene)
         with pytest.raises(ValueError, match="world/cube.*misspelled") as error:
-            prepare_scene({}, **options)
+            prepare_scene({'backend': 'isaac'}, **options)
         assert str(path) in str(error.value)
     finally:
         for suffix in (".assets", ".terms", ""):
@@ -59,7 +59,8 @@ def test_both_projects_have_one_entry_and_no_user_environment_or_noop_components
     from run import compose_project
     from shared.assembly.project import Project
     before = set(sys.modules)
-    cfg, module = compose_project(name)
+    # These older projects name no backend; they were written for Isaac Lab 2 (the default is now isaaclab3).
+    cfg, module = compose_project(name, overrides=['env.train.init_params.backend=isaac', 'env.eval.init_params.backend=isaac'])
     report = module.check(cfg)
     assert isinstance(module.project, Project)
     assert report["scene_config"] == str(ROOT / "projects" / name / "scene.yaml")
@@ -79,7 +80,7 @@ def test_invalid_term_is_rejected_before_application_launch(tmp_path, monkeypatc
     path = write_scene(tmp_path / "scene.yaml", scene)
     monkeypatch.setattr(environment, "launch_application", lambda *_: pytest.fail("Launched before validation"))
     with pytest.raises(ValueError, match="unknown terms.*misspelled"):
-        environment.make_environment({}, 2, 0, 8, scene_config=path)
+        environment.make_environment({'backend': 'isaac'}, 2, 0, 8, scene_config=path)
 
 
 def test_custom_task_terms_can_be_checked_without_constructing_a_preset(tmp_path):
@@ -89,10 +90,10 @@ def test_custom_task_terms_can_be_checked_without_constructing_a_preset(tmp_path
     scene["task"] = {"preset":"custom"}
     scene["observations"] = {"states":["local_measurement"]}
     path = write_scene(tmp_path / "scene.yaml", scene)
-    prepared = prepare_scene({}, scene_config=path, tasks={"custom":native_factory})
+    prepared = prepare_scene({'backend': 'isaac'}, scene_config=path, tasks={"custom":native_factory})
     assert prepared.tasks["custom"] is native_factory
     with pytest.raises(ValueError, match="Unknown task preset"):
-        prepare_scene({}, scene_config=path)
+        prepare_scene({'backend': 'isaac'}, scene_config=path)
 
 
 @pytest.mark.parametrize("terms", [None, {}, SimpleNamespace()])
@@ -122,3 +123,5 @@ def test_native_time_limit_preserves_existing_terms_and_rejects_reserved_collisi
     config.terminations = {"workspace_time_limit": SimpleNamespace(func=lambda env: None)}
     with pytest.raises(ValueError, match="reserved"):
         _ensure_native_horizon(config)
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

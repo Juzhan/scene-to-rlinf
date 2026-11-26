@@ -16,6 +16,7 @@ def lift_copy(tmp_path):
 
 
 def test_observation_types_declare_function_contracts(tmp_path):
+    pytest.importorskip("torch")  # the generated module annotates tensors, so it imports torch to be exec'd
     project = lift_copy(tmp_path)
     text = generate(project / 'scene.yaml', write=False)
     assert "PlannerOutput = Tensor  # ['B', 3], 固定组件" in text
@@ -79,9 +80,12 @@ def test_new_environment_is_a_trainable_template_copy(tmp_path, monkeypatch):
 
 def test_edit_opens_browser_by_default(monkeypatch, tmp_path):
     import run
+    from shared.assembly import runtimes
     python = tmp_path / 'python'
     python.touch()
-    monkeypatch.setenv('RLINF_EDITOR_PYTHON', str(python))
+    # One interpreter override; the fake path only has to be chosen and launched.
+    monkeypatch.setenv(runtimes.OVERRIDE, str(python))
+    monkeypatch.setattr(runtimes, 'missing', lambda groups, python=None, root=None: [])
     launched = []
     monkeypatch.setattr(run.subprocess, 'call', lambda command, **kwargs: launched.append(command) or 0)
     for extra in ([], ['--web'], ['--port', '8091']):
@@ -92,3 +96,5 @@ def test_edit_opens_browser_by_default(monkeypatch, tmp_path):
         assert command[:2] == [str(python), str(run.ROOT / 'tools/web_editor.py')]
         assert command[2:4] == ['--scene', str(run.ROOT / 'projects/piper_pick/scene.yaml')]
         assert command[4:] == (['--port', '8091'] if '--port' in extra else [])
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

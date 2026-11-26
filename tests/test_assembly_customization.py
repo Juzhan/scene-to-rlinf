@@ -121,3 +121,4 @@ def test_lift_default_robot_is_preserved_and_copy_can_customize_its_camera(tmp_p
     assert world.index()["world/robot"][0].frames == expected.frames
     assert (target / "assemblies/arm.yaml").is_file()
 
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

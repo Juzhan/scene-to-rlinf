@@ -35,3 +35,5 @@ def test_simple_executor_named_binding_does_not_copy():
     from projects.assembly_go2.policy import decode_action
     action = torch.randn(2, 12)
     assert decode_action(action, None)['legs'] is action
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

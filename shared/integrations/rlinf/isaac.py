@@ -10,9 +10,7 @@ from rlinf.envs.sim.isaaclab.isaaclab_env import IsaaclabBaseEnv
 
 from .tensors import _make_environment, _prepare_actions, _validate_config, _wrap_observations
 from .observations import pack, copy_rows, same_schema
-
-_ENVIRONMENT_FACTORIES = {}
-
+from shared.assembly.project import _ENVIRONMENT_FACTORIES  # noqa: F401 - one registry, shared with preview
 
 class EnvironmentFailure(RuntimeError):
     """Exception raised inside the Isaac subprocess, sent back as a result."""
@@ -97,7 +95,8 @@ class IsaacAssemblyRLinfEnv(IsaaclabBaseEnv):
     """
 
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
-        self.factory = _ENVIRONMENT_FACTORIES.get(cfg.init_params.id)
+        from shared.assembly.project import environment_factory
+        self.factory = environment_factory(cfg.init_params.id)
         _validate_config(cfg, factory=self.factory)
         self._closed = False
         super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
@@ -258,21 +257,18 @@ class IsaacAssemblyRLinfEnv(IsaaclabBaseEnv):
 
 
 def get_isaac_assembly_factory(task_id):
-    return _ENVIRONMENT_FACTORIES.get(task_id)
+    """The project's constructor; the registry belongs to shared.assembly.project (no training import)."""
+    from shared.assembly.project import environment_factory
+    return environment_factory(task_id)
 
 
-def register_isaac_assembly_env(task_id, *, factory):
+def register_isaac_assembly_env(task_id, *, factory=None):
     from rlinf.envs.sim.isaaclab import REGISTER_ISAACLAB_ENVS
+    from shared.assembly.project import register_environment_factory
 
-    if not isinstance(task_id, str) or not task_id:
-        raise ValueError("task_id must be a nonempty string")
     registered = REGISTER_ISAACLAB_ENVS.get(task_id)
     if registered is not None and registered is not IsaacAssemblyRLinfEnv:
         raise ValueError(f"Task {task_id} is already registered")
-    if not callable(factory):
-        raise TypeError("Environment factory must be callable")
-    previous = _ENVIRONMENT_FACTORIES.get(task_id)
-    if previous is not None and previous != factory:
-        raise ValueError(f"Task {task_id} already has an environment factory")
-    _ENVIRONMENT_FACTORIES[task_id] = factory
+    if factory is not None:
+        register_environment_factory(task_id, factory=factory)
     REGISTER_ISAACLAB_ENVS[task_id] = IsaacAssemblyRLinfEnv

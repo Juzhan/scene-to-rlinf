@@ -1152,3 +1152,5 @@ def test_terrain_variants_reject_unknown_names_and_name_isaac_config_classes():
         terrain_variant("ramp", {})
     assert {"stairs", "inverted_stairs", "gap", "slope", "rough", "stepping_stones"} <= set(TERRAIN_VARIANTS)
     assert all(name.startswith(("Mesh", "Hf")) and name.endswith("TerrainCfg") for name in TERRAIN_VARIANTS.values())
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

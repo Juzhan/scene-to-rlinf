@@ -687,3 +687,5 @@ def test_a_coupled_joint_follows_its_leader_through_the_physx_mimic_schema(tmp_p
                              ({'lid': {'leader': 'door'}}, 'unknown joint')):
         with pytest.raises(ValueError, match=match):
             joint_coupling_layer(tmp_path / 'bin.usda', couplings)
+
+pytestmark = pytest.mark.group_mjlab  # runs in the [mjlab] dependency group

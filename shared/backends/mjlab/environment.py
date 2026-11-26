@@ -1,7 +1,7 @@
 """Common project configuration bound to mjlab's native vector environment."""
 import math
 from shared.backends.environment import Environment
-from shared.integrations.rlinf.terminal import snapshot
+from shared.backends.terminal import snapshot
 from shared.backends.mjlab.scene import HIDDEN_GEOM_GROUP
 from shared.backends.mjlab.abstract_terms import guarded_visualizer
 

@@ -406,3 +406,5 @@ def test_static_meshes_keep_cloned_placement_and_reject_terrain_origins(placemen
         authored_reset_assets(scene, world)
     scene.steps = Rigid()
     assert authored_reset_assets(scene, world) == ["robot", "box", "steps"]
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

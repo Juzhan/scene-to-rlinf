@@ -320,3 +320,5 @@ def test_drawer_stack_rejects_incomplete_or_invalid_outcomes(env, case):
         assert result["failure"][0]
     values["contacts.cube_support"][:] = 0
     assert task.evaluate(ObjectView(values))["metrics"]["hold_seconds"][0] == 0
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

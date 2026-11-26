@@ -110,7 +110,7 @@ def test_memory_partial_reset_does_not_mix_episodes():
 
 
 def test_task_runtime_is_once_per_step_lazy_and_resettable(monkeypatch):
-    from shared.backends.isaac.python_task import Runtime
+    from shared.backends.isaaclab3.python_task import Runtime
     class Task:
         def __init__(self):self.memory=TaskMemory();self.calls=0
         def evaluate(self,obs):
@@ -119,7 +119,7 @@ def test_task_runtime_is_once_per_step_lazy_and_resettable(monkeypatch):
     task=Task()
     modules={'example.task':SimpleNamespace(Task=lambda:task),
              'example.observation':SimpleNamespace(SceneInfo=ObjectView,SCENE_FIELDS=('robot.position','camera.rgb'))}
-    monkeypatch.setattr('shared.backends.isaac.python_task.import_module',modules.__getitem__)
+    monkeypatch.setattr('shared.backends.isaaclab3.python_task.import_module',modules.__getitem__)
     env=SimpleNamespace(num_envs=2,device='cpu',common_step_counter=1,extras={})
     runtime=Runtime(env,{'module':'example'},{})
     value=torch.tensor([[1.,0.,0.],[2.,0.,0.]])
@@ -161,23 +161,23 @@ def test_rlinf_transport_keeps_custom_fields_including_terminal_images():
 
 
 def test_nonfinite_task_result_names_item_environments_and_metrics(monkeypatch):
-    from shared.backends.isaac.python_task import Runtime
+    from shared.backends.isaaclab3.python_task import Runtime
     def evaluate(obs):
         distance=torch.tensor([1.,float('nan'),2.])
         return {'reward':1-distance,'metrics':{'distance':distance,'speed':torch.zeros(3)}}
     modules={'example.task':SimpleNamespace(evaluate=evaluate),
              'example.observation':SimpleNamespace(SceneInfo=ObjectView,SCENE_FIELDS=())}
-    monkeypatch.setattr('shared.backends.isaac.python_task.import_module',modules.__getitem__)
+    monkeypatch.setattr('shared.backends.isaaclab3.python_task.import_module',modules.__getitem__)
     runtime=Runtime(SimpleNamespace(num_envs=3,device='cpu',common_step_counter=1,extras={}),{'module':'example'},{})
     with pytest.raises(ValueError,match=r"reward is non-finite in 1 environments \(first \[1\].*non-finite metrics: \['distance'\]$"):
         runtime.compute()
 
 
 def _set_runtime(monkeypatch, value):
-    from shared.backends.isaac.python_task import Runtime
+    from shared.backends.isaaclab3.python_task import Runtime
     modules={'example.task':SimpleNamespace(evaluate=lambda obs:{'set':value}),
              'example.observation':SimpleNamespace(SceneInfo=ObjectView,SCENE_FIELDS=())}
-    monkeypatch.setattr('shared.backends.isaac.python_task.import_module',modules.__getitem__)
+    monkeypatch.setattr('shared.backends.isaaclab3.python_task.import_module',modules.__getitem__)
     settings={'name':'world','entities':[
         {'name':'robot','factory':'dex_cube'},
         {'name':'area','kind':'abstract','shape':'rectangle','size':[1.,1.]},
@@ -189,7 +189,7 @@ def _set_runtime(monkeypatch, value):
 
 
 def test_task_set_is_taken_once_in_the_step_it_was_returned(monkeypatch):
-    from shared.backends.isaac.python_task import task_set
+    from shared.backends.isaaclab3.python_task import task_set
     position=torch.tensor([[1.,0.,.2],[2.,0.,.2]])
     runtime,env=_set_runtime(monkeypatch,{'ball':position})
     result=runtime.compute()
@@ -217,3 +217,5 @@ def test_task_set_rejects_bad_entries_naming_the_entity(monkeypatch,value,match)
     runtime,_=_set_runtime(monkeypatch,value)
     with pytest.raises(ValueError,match=match):
         runtime.compute()
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

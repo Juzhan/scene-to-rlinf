@@ -148,3 +148,5 @@ def test_retick_observation_returns_to_its_catalog_slot():
     selected = ['a', 'c']  # b was unticked and saved; ticking it again puts it between a and c.
     assert [key for key in observation_order(selected, catalog) if key in {*selected, 'b'}] == ['a', 'b', 'c']
     assert observation_order(['x', 'a'], catalog)[:2] == ['x', 'a']
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

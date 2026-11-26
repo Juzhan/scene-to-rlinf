@@ -159,7 +159,7 @@
   dimension）照常读取运行，两者不能同时写。
 - 默认模板 go2_goal 是一层；分层只用于不同频率、现成不训练的模型或需单独替换的部分。编辑器“增加一层 / 去掉一层”
   改同一份 scene.yaml，增加时在 policy.py 末尾追加起始代码。场景项目的 train.yaml 必须写明
-  `env.train.init_params.backend`（新项目为 isaaclab3）；未写明的旧项目沿用 configs/state_ppo.yaml 的 isaac，check 给出 WARN。
+  `env.train.init_params.backend`（新项目为 isaaclab3）；没写的项目用 configs/state_ppo.yaml 的默认 isaaclab3，check 给出 WARN。Isaac Lab 2（`isaac`）不再维护：IL3 与 mjlab 不从 `shared/backends/isaac/` 导入任何东西，它可以整个删除；仍要在 IL2 上跑的旧项目须在 train.yaml 写明 `backend: isaac`。
 - 层的结果由代码定义：forward 返回 Tensor，或张量字典 `{'goal': ..., 'heading': ...}`（每项后写 `# [B, ...] 说明`），
   下一层读 `obs.<层>.<键>`。键名与注释从 policy.py 里 `return {...}` 静态读出（不导入），形状写不出的为 None，运行时第一步测得并核对；
   编辑器箭头上显示键名，注释在悬停提示里。不为层的输出写维度配置，也没有专门的结果类。被训练层返回一个动作张量。
@@ -209,6 +209,23 @@
 - `third_party/RLinf` 暂存历史实验的补丁，不是新项目运行依赖。依赖 adaptive_kl_target、SAC 样本预算等扩展的旧配方须显式选择历史 RLINF_ROOT，不能静默忽略配置。
 - 历史 YAML 公式实现收于 `shared/assembly/legacy`；Python Task 主路径不导入它。新项目不使用该包。
 - 依赖审计及当前验证边界见 `docs/RLINF_INTEGRATION.md`。不要把 CPU 协议测试或本地梯度更新描述为 RLinf 分布式训练验收。
+
+## 依赖组与解释器
+
+- 环境按用途分组（`core`、`editor`、`import`、`usd`、`isaaclab3`、`train`、`deploy`，以及冻结的 `isaac`、`mjlab`）；
+  组名、每组必装模块、命令 → 组、解释器查找都在 `shared/assembly/runtimes.py`，PyPI 部分在 `pyproject.toml` 的 extras，
+  安装脚本 `tools/setup_env.py`（锁文件在 `requirements/`）。设计与实施状态见 `docs/PACKAGING_PLAN.md`。
+- 新增命令或模块时先判断它属于哪一组：只读场景/生成类型的代码不得导入 torch、仿真 SDK 或训练框架（后端只经
+  `backend_module` 的钩子访问，见 `docs/SCENE_BACKENDS.md`）。缺组时给同一句提示，不抛裸 ImportError。
+- 解释器覆盖只有一个环境变量 `RLINF_PYTHON`（`RLINF_EDITOR_PYTHON`、`RLINF_EXPORT_PYTHON`、`ISAAC_PYTHON` 已移除）；
+  后端的 `INTERPRETER` 声明保留。新增测试在文件末尾写 `pytestmark = pytest.mark.group_<组>`，标明能跑它的最小环境。
+- `usd` 组只装 `mujoco-usd-converter`（自带 `mujoco-core` 4.x），在 `.venv-usd` 里：`import` 组的 `mujoco` 3.12 被 Newton 钉住，
+  两者都提供 `mujoco` 模块，不能同装。URDF 转换器在 `import` 组，MJCF 转换器在 `usd` 组；`to_usd` 各自找装了对应包的解释器，
+  都没有时才用 Isaac 导入器。
+- `shared/` 顶层的 `isaac_state`、`observations`、`rewards`、`terrains`、`policies`、`policy_math` 只是旧路径转发；
+  实现分别在 `shared/backends/isaac/legacy/` 与 `shared/policy.py`，新代码不要再从顶层旧路径导入。
+- 历史实验驱动在 `experiments/`（需要旧环境或自写训练循环），不进产品命令；`tools/` 只保留 `run.py` 子命令的
+  实现和维护工具。`go2_evaluation` 留在 `tools/`，它实现 `run.py assess`。
 
 ## mjlab 接入阶段
 

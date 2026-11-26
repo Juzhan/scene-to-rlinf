@@ -116,3 +116,5 @@ def test_unrelated_assets_do_not_change_reset_samples(make_world):
         torch.testing.assert_close(original.scene.rigid_objects[name].state,
                                    expanded.scene.rigid_objects[name].state)
     assert original.rng.getstate() == expanded.rng.getstate()
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

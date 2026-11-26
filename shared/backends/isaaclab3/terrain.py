@@ -1,9 +1,10 @@
 """Generate one Isaac Lab sub-terrain tile as raw triangle meshes.
 
-Runs in the Isaac interpreter (it starts a headless Kit app); shared.terrain_assets
+Isaac Lab 3's terrain generators are plain Python (numpy), so this runs in the IL3
+environment without starting an application or simulator. shared.terrain_assets
 launches it and turns the meshes into backend-neutral assets:
 
-    python -m shared.backends.isaac.terrain <variant> <output.npz> <size> <difficulty> <seed> <parameters json>
+    python -m shared.backends.isaaclab3.terrain <variant> <output.npz> <size> <difficulty> <seed> <parameters json>
 """
 import dataclasses
 import json
@@ -14,11 +15,9 @@ from pathlib import Path
 
 def main(argv):
     variant, output, size, difficulty, seed, parameters = argv
-    from isaaclab.app import AppLauncher
-    application = AppLauncher(headless=True).app
     try:
         import numpy as np
-        from shared.backends.isaac.assets import terrain_variant
+        from shared.backends.isaaclab3.assets import terrain_variant
 
         np.random.seed(int(seed))
         config = terrain_variant(variant, json.loads(parameters))
@@ -32,11 +31,11 @@ def main(argv):
                  **{f'{kind}{index}': np.asarray(getattr(mesh, kind))
                     for index, mesh in enumerate(meshes) for kind in ('vertices', 'faces')})
     except BaseException:
-        # Kit exits with status 0 when closed; the caller detects failure by the missing output file.
+        # The caller detects failure by the missing output file and names the variant.
         traceback.print_exc()
-    finally:
-        application.close()
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))

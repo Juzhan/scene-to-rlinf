@@ -6032,7 +6032,10 @@ class Editor:
         if getattr(self, 'thumbnail_thread', None) and self.thumbnail_thread.is_alive():
             self.report('示意图正在生成中')
             return
-        from shared.backends.isaac.assets import FACTORIES  # noqa: F401 - availability check below
+        # Only shared factories can be built in a standalone scene, by the editor's export backend.
+        from shared.assembly.assets import factories_for
+        from shared.assembly.visuals import geometry_backend
+        FACTORIES = factories_for(geometry_backend(GALLERY_SCENE))  # noqa: F841 - availability check below
         entities, wanted = [], {}
         for choice, entry in self._gallery().items():
             if keys is not None and entry['key'] not in keys:
@@ -6094,6 +6097,14 @@ class Editor:
         if suffix == '.urdf':
             if kind != 'robot':
                 raise ValueError('URDF 请按“机器人（带关节）”导入')
+            from shared.assembly.assets import factories_for
+            backend = geometry_backend(self.scene)
+            if 'urdf_robot' not in factories_for(backend):
+                # Only the frozen Isaac Lab 2 backend converts a URDF while building the scene; the others
+                # need the converted USD, which `run.py asset import` writes once.
+                raise ValueError(f'{backend} 后端不能直接用 URDF 生成实体：先转换 USD —— '
+                                 f'run.py asset import {stored} --kind robot --project <项目>，'
+                                 '再从资产架添加生成的 USD')
             factory, parameters = 'urdf_robot', {'urdf_path': stored, 'fix_base': self.import_fixed.value}
         elif suffix in ('.usd', '.usda', '.usdc', '.usdz'):
             # Objects follow their USD bodies: dynamic, with passive joints (cabinet doors, drawers) if any.

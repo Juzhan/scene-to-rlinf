@@ -13,6 +13,28 @@ import sys
 from .assets import DEFAULT_BACKEND, backend_module, selected_backend
 
 
+# Task id -> environment constructor. Kept here, not in the training integration, so
+# ``view``/``record``/``smoke`` construct the same environment without the training framework.
+_ENVIRONMENT_FACTORIES = {}
+
+
+def register_environment_factory(task_id, *, factory):
+    """Make ``task_id`` constructible outside the trainer; a second different factory is an error."""
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("task_id must be a nonempty string")
+    if not callable(factory):
+        raise TypeError("Environment factory must be callable")
+    previous = _ENVIRONMENT_FACTORIES.get(task_id)
+    if previous is not None and previous != factory:
+        raise ValueError(f"Task {task_id} already has an environment factory")
+    _ENVIRONMENT_FACTORIES[task_id] = factory
+
+
+def environment_factory(task_id):
+    """The registered constructor for ``task_id``, or None."""
+    return _ENVIRONMENT_FACTORIES.get(task_id)
+
+
 def require_online_backend(parameters):
     selected_backend(parameters)
 
@@ -24,14 +46,15 @@ def backend_interpreter(backend):
     path of a separate environment). That interpreter is chosen automatically unless the
     user named one with ``RLINF_PYTHON``.
     """
+    from . import runtimes
     package = import_module(f'shared.backends.{selected_backend({"backend": backend})}')
     sdk = getattr(package, 'SDK', None)
     if sdk is None or util.find_spec(sdk) is not None:
         return sys.executable
     interpreter = getattr(package, 'INTERPRETER', None)
     candidate = Path(__file__).resolve().parents[2] / interpreter if interpreter else None
-    if os.environ.get('RLINF_PYTHON') or candidate is None or not candidate.is_file():
-        raise RuntimeError(f'{sys.executable} has no {sdk}; set RLINF_PYTHON to an interpreter with {sdk}'
+    if os.environ.get(runtimes.OVERRIDE) or candidate is None or not candidate.is_file():
+        raise RuntimeError(f'{sys.executable} has no {sdk}; {runtimes.message((backend,))}'
                            + (f' (e.g. {interpreter})' if interpreter else ''))
     return str(candidate)
 
@@ -72,10 +95,11 @@ def project_registry(package=None, *, factories=None, terms=None, tasks=None, ba
     ``backend=None`` is the static view used for generated types and the catalog: asset names of every
     backend (``prefer``'s factories, the project's backend, win a shared name, else the default backend's),
     terms as on the default backend. Preparing a scene for one backend still rejects an asset that backend lacks."""
-    from .assets import BACKENDS, factories_for
+    from .assets import factories_for, installed_backends
 
-    last = prefer if prefer in BACKENDS else DEFAULT_BACKEND
-    chosen = (*(name for name in BACKENDS if name != last), last) if backend is None else (backend,)
+    present = installed_backends()
+    last = prefer if prefer in present else DEFAULT_BACKEND
+    chosen = (*(name for name in present if name != last), last) if backend is None else (backend,)
     assets, registered_terms, registered_tasks = {}, {}, {}
     for name in chosen:
         assets.update(factories_for(name))
@@ -111,7 +135,7 @@ def project_registry(package=None, *, factories=None, terms=None, tasks=None, ba
 
 def _selected_sources(settings):
     """Observation sources chosen in observation groups and control components."""
-    from shared.backends.isaac.task_config import _selection
+    from .native_terms import selection as _selection
     from .layers import normalize
     settings = normalize(settings)
     sources = [name for group, selection in settings.get('observations', {}).items()
@@ -245,7 +269,7 @@ def check_project(cfg, *, scene_config, project_package=None, **registries):
     if authored:  # automatic targets (no control.output) drive all joints of each robot
         from .control import require_listed_joints
         require_listed_joints(authored)
-    from shared.backends.isaac.scene import scene_metadata
+    from .scene_metadata import scene_metadata
     index = prepared.description.index()
     metadata = scene_metadata(prepared.description)
     joints = prepared.description.ordered_connections()
@@ -259,7 +283,7 @@ def check_project(cfg, *, scene_config, project_package=None, **registries):
     task_evaluation = None
     if 'object_api' not in prepared.terms:
         from .legacy.task import evaluation_config
-        from shared.backends.isaac.task_evaluation import validate_sources
+        from .legacy.sources import validate_sources
         task_evaluation = validate_sources(evaluation_config(prepared.settings),
                                            prepared.terms.get("signals"), prepared.settings)
     return {"scene_config": str(prepared.path), "entities": list(index),
@@ -297,38 +321,67 @@ class Project:
         return make_environment(parameters, num_envs, seed, horizon, scene_config=self.scene_config,
                                 project_package=self.package, **options)
 
+    def trained_component(self):
+        """``(component, layered)`` from scene.yaml: the trained layer's entry, and whether this is a
+        ``policy.layers`` project (its ``weights`` are then the whole adapter's checkpoint)."""
+        from .control import component_config
+        from .layout import load_scene_config
+        settings = load_scene_config(self.scene_config)
+        if 'control' not in settings:
+            return {}, False
+        control = component_config(settings['control'], self.package)
+        return control['components'][control['train']], control.get('layers') is True
+
+    def model_builder(self):
+        """``build(config, torch_dtype)`` for the trained component: the layer's model, or ``build_model``.
+
+        Weights that are a checkpoint of the whole PPO adapter stay with the adapter (register);
+        a fixed layer's own ``weights`` are loaded here.
+        """
+        policy = import_module(self.package + ".policy")
+        from .layout import load_scene_config
+        settings = load_scene_config(self.scene_config)
+        if 'control' not in settings:
+            return policy.build_model
+        from .control import component_config, load_factory
+        control = component_config(settings['control'], self.package)
+        selected = control['components'][control['train']]
+        if control.get('layers') is True:
+            from .policy_runtime import build_layer
+            drives = control['train'] == control['driver']
+
+            def build_layer_model(config, torch_dtype):
+                # Weights of the trained layer are a checkpoint of the whole adapter (see register).
+                trained = {**selected, 'parameters': {k: v for k, v in selected.get('parameters', {}).items()
+                                                      if k != 'weights'}}
+                return build_layer(trained, actions=config.action_dim if drives else None,
+                                   model_config=config).to(dtype=torch_dtype)
+            return build_layer_model
+        factory = load_factory(selected['model'])
+
+        def build_fixed_layer(config, torch_dtype):
+            return factory(config=config, torch_dtype=torch_dtype, **selected.get('parameters', {}))
+        return build_fixed_layer
+
     def register(self):
-        from rlinf.models import register_model
-        from shared.integrations.rlinf.isaac import register_isaac_assembly_env
+        """Register the shared environment; with the training framework installed, also its RLinf model.
+
+        ``check``/``view``/``record``/``smoke`` register here without RLinf. Training and
+        evaluation need it, and then the project's model and its adapter are registered too.
+        """
+        register_environment_factory(self.task_id, factory=self.make_environment)
         object_api = (self.scene_config.parent / 'task.py').is_file()
         if object_api:
             factories, terms, _ = project_registry(self.package, backend=None)
             refresh_observation_types(self.scene_config, self.package, factories=factories, terms=terms)
-        policy = import_module(self.package + ".policy")
-        from .layout import load_scene_config
-        settings = load_scene_config(self.scene_config)
-        layered = False
-        if 'control' in settings:
-            from .control import component_config, load_factory
-            control = component_config(settings['control'], self.package)
-            selected = control['components'][control['train']]
-            layered = control.get('layers') is True
-            if layered:
-                from .policy_runtime import build_layer
-                drives = control['train'] == control['driver']
-                def build_selected(config, torch_dtype):
-                    # Weights of the trained layer are a checkpoint of the whole adapter (below).
-                    trained = {**selected, 'parameters': {k: v for k, v in selected.get('parameters', {}).items() if k != 'weights'}}
-                    return build_layer(trained, actions=config.action_dim if drives else None,
-                                       model_config=config).to(dtype=torch_dtype)
-            else:
-                factory = load_factory(selected['model'])
-                def build_selected(config, torch_dtype):
-                    return factory(config=config, torch_dtype=torch_dtype, **selected.get('parameters', {}))
-            build = build_selected
-        else:
-            build = policy.build_model
+        try:
+            from rlinf.models import register_model
+            from shared.integrations.rlinf.isaac import register_isaac_assembly_env
+        except ModuleNotFoundError:
+            return  # the training framework is an optional group (see docs/PACKAGING_PLAN.md)
+        build = self.model_builder()
         if object_api:
+            selected, layered = self.trained_component()
             project_build = build
             def build_object(config, torch_dtype):
                 from shared.integrations.rlinf.object_policy import ObjectPolicy

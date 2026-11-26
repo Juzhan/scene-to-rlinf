@@ -87,3 +87,5 @@ def test_evaluation_requires_snapshot_only_when_native_step_reset_rows():
         evaluation_step_state(live, torch.tensor([True, False]), {
             "autoreset": True, "terminal_state": {"root_pos_w": torch.ones(1, 3)},
         })
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

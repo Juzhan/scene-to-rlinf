@@ -46,3 +46,7 @@ def test_explicit_camera_options_are_kept(tmp_path):
     explicit = {"resolution": (640, 480), "eye": (1., 2., 3.)}
     assert complete_viewer(explicit, description) == explicit
     assert complete_viewer({"resolution": (640, 480)}, description)["follow"] == "robot"
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

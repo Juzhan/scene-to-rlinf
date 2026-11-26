@@ -8,7 +8,7 @@ ground truth the policy does not see. ``reset(env_ids)`` clears the per-environm
 import torch
 from .observation import SceneInfo, TaskResult
 from shared.assembly.abstract import quaternion_multiply
-from shared.policy_math import inverse_rotate
+from shared.policy import inverse_rotate
 
 FEET = ('FL_foot', 'FR_foot', 'RL_foot', 'RR_foot')  # also the order of feet_contact bodies
 # Piper base frame -> desired tcp: approach axis (gripper z) forward, gripper x down; the reference's

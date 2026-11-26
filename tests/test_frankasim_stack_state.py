@@ -216,3 +216,5 @@ class StackStateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

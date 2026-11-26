@@ -34,3 +34,5 @@ def test_board_serves_runs_and_stops(tmp_path):
     finally:
         stop_board(process, cfg)
     assert process.returncode is not None
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

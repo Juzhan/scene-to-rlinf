@@ -1,8 +1,9 @@
 """Procedural terrain tiles as ordinary static assets usable by every backend.
 
-A tile is generated once by an Isaac Lab sub-terrain generator (variant names and
-parameters as in shared/backends/isaac/assets.py TERRAIN_VARIANTS), then written as a
-USD and an MJCF whose collision geometry matches, plus ASSET.json. Scenes use it like any
+A tile is generated once by an Isaac Lab 3 sub-terrain generator (variant names and
+parameters as in shared/backends/isaaclab3/assets.py TERRAIN_VARIANTS; the generators are
+plain Python, so no simulator or Kit application starts), then written as a USD and an
+MJCF whose collision geometry matches, plus ASSET.json. Scenes use it like any
 other prop (`usd_object` pointing at the USD); the tile is centred on the entity origin.
 
     run.py asset terrain stairs assets/terrains/stairs --size 8 --difficulty 0.6 \\
@@ -222,20 +223,21 @@ def build(meshes, origin, size, output, name, generator):
 
 
 def generate(variant, output, *, name=None, size=8.0, difficulty=0.5, seed=0, parameters=None):
-    """Generate a tile with Isaac Lab (in the Isaac interpreter) and write it with build().
+    """Generate a tile with Isaac Lab 3's generators and write it with build().
 
     Without `parameters` the variant's PRESETS entry is used."""
     parameters = PRESETS.get(variant, {}) if parameters is None else parameters
-    python = os.environ.get('ISAAC_PYTHON', str(ROOT / '.venv/bin/python'))
+    from shared.assembly.runtimes import declared_python
+    python = str(declared_python('isaaclab3', ROOT))  # RLINF_PYTHON, then .venv-il3
     with tempfile.TemporaryDirectory() as scratch:
         dump = Path(scratch) / 'tile.npz'
-        subprocess.run([python, '-m', 'shared.backends.isaac.terrain', variant, str(dump), str(size),
+        subprocess.run([python, '-m', 'shared.backends.isaaclab3.terrain', variant, str(dump), str(size),
                         str(difficulty), str(seed), json.dumps(parameters)],
-                       check=True, cwd=ROOT, env={
-                           **os.environ, 'OMNI_KIT_ACCEPT_EULA': 'YES',
+                       cwd=ROOT, env={
+                           **os.environ,
                            'PYTHONPATH': os.pathsep.join(filter(None, (str(ROOT), os.environ.get('PYTHONPATH'))))})
         if not dump.exists():
-            raise RuntimeError(f"Isaac generated no tile for '{variant}' (see the error printed above)")
+            raise RuntimeError(f"The Isaac Lab 3 generator produced no tile for '{variant}' (see the error above)")
         with np.load(dump) as tile:
             count = len([key for key in tile.files if key.startswith('vertices')])
             meshes = [(tile[f'vertices{index}'], tile[f'faces{index}']) for index in range(count)]

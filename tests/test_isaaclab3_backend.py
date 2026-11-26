@@ -12,7 +12,7 @@ SCENE = ROOT / 'projects/dual_backend_scene/scene.yaml'
 
 
 def test_shared_layout_without_sdk_imports():
-    reports = [prepare(SCENE, backend)[3] for backend in ('isaac', 'isaaclab3')]
+    reports = [prepare(SCENE, backend)[3] for backend in ('isaaclab3', 'mjlab')]
     assert reports[0]['entities'] == reports[1]['entities']
     subprocess.run([sys.executable, '-c',
         "from shared.assembly.backend_scene import prepare; import sys; "
@@ -107,6 +107,32 @@ def test_height_scanner_targets_the_global_world_only(tmp_path):
             validate(world, settings)
 
 
+def test_an_unreadable_usd_names_the_entity_and_file(tmp_path):
+    """A missing or empty asset must not surface later as a mount body that the USD does not have."""
+    import yaml
+    from shared.backends.isaaclab3.scene import asset_bodies
+    settings = yaml.safe_load(SCENE.read_text())
+    robot = next(entity for entity in settings['entities'] if entity['name'] == 'robot')
+    robot.update(factory='usd_object', initial_state=None,
+                 parameters={'usd_path': 'projects/dual_backend_scene/assets/missing.usd'})
+    robot.pop('initial_state')
+    settings['entities'].append({'name': 'contacts', 'kind': 'sensor', 'factory': 'contact_sensor',
+                                 'parameters': {'force_threshold': 1.},
+                                 'mount': {'entity': 'world/robot', 'body': 'base'}})
+    path = tmp_path / 'scene.yaml'
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    with pytest.raises(ValueError) as missing:
+        asset_bodies(prepare(path, 'isaaclab3')[1])('world/robot')
+    assert 'world/robot' in str(missing.value) and 'missing.usd' in str(missing.value)
+
+    empty = tmp_path / 'empty.usda'
+    empty.write_text('#usda 1.0\n')  # a valid layer with no default prim
+    robot['parameters']['usd_path'] = str(empty)
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    with pytest.raises(ValueError, match='no default prim'):
+        asset_bodies(prepare(path, 'isaaclab3')[1])('world/robot')
+
+
 def test_only_a_camera_may_stand_fixed_in_the_world(tmp_path):
     import yaml
     settings = yaml.safe_load(SCENE.read_text())
@@ -143,9 +169,9 @@ def test_connections_join_per_environment_entities(tmp_path):
 def test_camera_shares_the_portable_signature_without_sdk():
     from inspect import signature
     from shared.assembly.assets import check_parameters
-    from shared.backends.isaac import assets as isaac
     from shared.backends.isaaclab3 import assets
-    assert signature(assets.camera) == signature(isaac.camera) and 'camera' in assets.SENSORS
+    from shared.backends.mjlab import assets as mjlab
+    assert signature(assets.camera) == signature(mjlab.camera) and 'camera' in assets.SENSORS
     with pytest.raises(ValueError, match='data_types'):
         check_parameters(assets.camera, {'data_types': ['thermal']})
 
@@ -168,3 +194,5 @@ def test_xform_colliders_move_onto_their_geometry():
     assert not collisions.IsInstanceable() and not holder.HasAPI(UsdPhysics.CollisionAPI)
     assert mesh.HasAPI(UsdPhysics.CollisionAPI)
     assert UsdPhysics.MeshCollisionAPI(mesh).GetApproximationAttr().Get() == 'convexHull'
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

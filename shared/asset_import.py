@@ -277,7 +277,8 @@ def expand_xacro(path, root, target, arguments=''):
     for manifest in root.rglob('package.xml'):
         with contextlib.suppress(ElementTree.ParseError):
             packages.setdefault(ElementTree.parse(manifest).findtext('name'), manifest.parent)
-    python = os.environ.get('ISAAC_PYTHON', str(ROOT / '.venv/bin/python'))
+    from shared.assembly.runtimes import declared_python
+    python = str(declared_python('isaac', ROOT))  # RLINF_PYTHON, then .venv (Isaac Sim)
     with tempfile.TemporaryDirectory(prefix='xacro_') as scratch:
         scratch = Path(scratch)
         located = {name: scratch / folder.relative_to(root) for name, folder in packages.items()}

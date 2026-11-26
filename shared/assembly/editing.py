@@ -314,7 +314,7 @@ class SceneDocument:
 
     def _removal_filter(self, removed):
         """Entity keys and abstract names in ``removed``, and whether an observation term reads one."""
-        from shared.backends.isaac.entity_observations import parse_signal
+        from .entity_information import parse_signal
         keys = {path.split('/', 1)[1].replace('/', '__') for path in removed}
         abstract = {self.entities[path]['name'] for path in removed
                     if path in self.entities and self.entities[path].get('kind') == 'abstract'}
@@ -683,7 +683,7 @@ class SceneDocument:
                 component['history'] = {k: v for k, v in component['history'].items() if k in terms}
                 if not component['history']:
                     component.pop('history')
-            from shared.backends.isaac.entity_observations import signal_profile
+            from .entity_information import signal_profile
             if any(signal_profile(term).startswith('camera__') for term in terms):
                 self.data.setdefault('application', {})['enable_cameras'] = True
             return
@@ -693,7 +693,7 @@ class SceneDocument:
         if not isinstance(terms, list) or not terms or len(set(terms)) != len(terms):
             raise ValueError("Choose a nonempty ordered list of unique observation terms")
         observations = self.data.setdefault("observations", {})
-        from shared.backends.isaac.entity_observations import signal_profile
+        from .entity_information import signal_profile
         if (self.path.parent / 'task.py').is_file():
             observations[profile] = list(terms)
             if any(signal_profile(name).startswith('camera__') for name in terms):
@@ -1087,7 +1087,7 @@ def apply_edits(path, payload):
     document.snapshot()
     from .catalog import _project_package
     from .project import project_registry, _check_factory
-    from shared.backends.isaac.task_config import validate_task_settings
+    from .native_terms import validate_task_settings
     from .visuals import geometry_backend
     factories, terms, tasks = project_registry(_project_package(document.path.parent),
                                                backend=geometry_backend(document.path))

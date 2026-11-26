@@ -197,3 +197,5 @@ def test_jointed_assets_are_shown_as_modelled_up_to_a_ceiling():
     huge = [{'faces': np.zeros((900_000, 3), int)}, {'faces': np.zeros((300_000, 3), int)}]
     targets = part_targets({'parts': huge, 'joints': [{'name': 'j'}]})
     assert TRIANGLE_BUDGET * 4 < sum(targets) <= ARTICULATED_TRIANGLES and targets[0] == 3 * targets[1]
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

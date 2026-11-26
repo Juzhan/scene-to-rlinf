@@ -146,3 +146,5 @@ def test_changed_robot_assets_invalidate_measured_joint_metadata(tmp_path, refer
     assert load_interface(scene) == report
     asset.write_text("joint_order = right,left\n")
     assert load_interface(scene) is None
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

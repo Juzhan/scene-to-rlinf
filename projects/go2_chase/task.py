@@ -12,7 +12,7 @@ import math
 import torch
 from torch import Tensor
 from .observation import SceneInfo, TaskResult
-from shared.policy_math import inverse_rotate, yaw
+from shared.policy import inverse_rotate, yaw
 
 ARENA_RADIUS = 4.0        # m; the terrain block is 8 m wide
 TAG_RADIUS = .2           # horizontal head-to-ball distance that counts as a tag (m), as in the reference

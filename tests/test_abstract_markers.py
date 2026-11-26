@@ -1,4 +1,4 @@
-"""Abstract-entity markers: one shared shape/size spec, drawn by Isaac and mjlab previews alike."""
+"""Abstract-entity markers: one shared shape/size spec, drawn by Isaac Lab 3 and mjlab previews alike."""
 import math
 from types import SimpleNamespace
 
@@ -7,7 +7,7 @@ import pytest
 
 from shared.assembly import abstract
 from shared.assembly.abstract import ARROW_LENGTH, EDGE_WIDTH, POINT_RADIUS, marker_edges
-from shared.backends.isaac import abstract_terms as isaac_terms
+from shared.backends.isaaclab3 import abstract_terms as isaac_terms
 from shared.backends.mjlab import abstract_terms as mjlab_terms
 
 
@@ -44,14 +44,13 @@ def test_isaac_markers_exist_only_with_a_viewer(monkeypatch):
                      {"name": "goal", "kind": "abstract", "shape": "point",
                       "reset": {"region": "world/area", "interval": 4}},
                      visualization={"abstract": ["area", "goal"]})
-    output = {"commands": SimpleNamespace()}
-    isaac_terms.attach_abstract(output, settings, visualize=False)
+    commands = {}
+    isaac_terms.attach_abstract(commands, settings, visualize=False)
     # A randomized entity keeps its term for its readings; nothing is drawn.
-    assert {name: term.debug_vis for name, term in vars(output["commands"]).items()} == {
-        "assembly_abstract_goal": False}
-    output = {"commands": SimpleNamespace()}
-    isaac_terms.attach_abstract(output, settings, visualize=True)
-    assert {name: term.debug_vis for name, term in vars(output["commands"]).items()} == {
+    assert {name: term.debug_vis for name, term in commands.items()} == {"assembly_abstract_goal": False}
+    commands = {}
+    isaac_terms.attach_abstract(commands, settings, visualize=True)
+    assert {name: term.debug_vis for name, term in commands.items()} == {
         "assembly_abstract_area": True, "assembly_abstract_goal": True}
 
 
@@ -175,3 +174,5 @@ def test_mujoco_arrow_matches_a_cylinder_of_the_marker_length():
     shaft, shaft_row = extent((red > 60) & (red > 2 * green) & (red > 2 * blue))
     assert arrow_row != shaft_row
     assert abs(arrow - shaft) <= 0.03 * shaft, (arrow, shaft)
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

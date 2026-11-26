@@ -13,8 +13,7 @@ constants, the same on the real robot.
 """
 import torch
 from torch import nn
-from shared.policy import flat, mlp
-from shared.policy_math import inverse_rotate, relative_goal, yaw
+from shared.policy import flat, inverse_rotate, mlp, relative_goal, yaw
 from .observation import Action, ExecutorObs, PlannerObs, Targets
 
 # Go2 standing pose (rad), in joint_position order: hips FL FR RL RR, thighs, calves.

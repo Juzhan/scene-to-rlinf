@@ -24,3 +24,7 @@ def test_environment_returns_native_observation_without_computing_history_again(
     for observations in (reset, stepped):
         torch.testing.assert_close(observations["states"], torch.tensor([[1., 2., 3.]]))
     native.observation_manager.compute.assert_not_called()
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

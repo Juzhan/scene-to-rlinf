@@ -25,8 +25,8 @@ SOURCES = (
     "projects/franka_lift/train.yaml",
     "projects/franka_lift/ablation.yaml",
     "shared/isaac_state.py",
-    "tools/lift_ablation.py",
-    "tools/rsl_reference.py",
+    "experiments/lift_ablation.py",
+    "experiments/rsl_reference.py",
     "third_party/RLinf/rlinf/algorithms/utils.py",
     "third_party/RLinf/rlinf/algorithms/losses.py",
     "third_party/RLinf/rlinf/algorithms/advantages.py",
@@ -44,7 +44,7 @@ SOURCES = (
     "projects/my_robot/dino.yaml",
     "projects/my_robot/course.yaml",
     "projects/my_robot/dino_policy.py",
-    "tools/stack_evaluation.py",
+    "experiments/stack_evaluation.py",
 )
 
 
@@ -442,9 +442,9 @@ def execute(output, resume_checkpoint=None, plan_file="plan.json"):
             reports = []
             for seed in plan["evaluation_seeds"]:
                 destination = output / f"eval_{name}_seed{seed}.json"
-                base_command = ([sys.executable, "-m", "tools.stack_evaluation", "--num-envs", "1",
+                base_command = ([sys.executable, "-m", "experiments.stack_evaluation", "--num-envs", "1",
                                  "--config", condition.get("recipe", "adaptive")]
-                                if stack else [sys.executable, "-m", "tools.rsl_reference", "evaluate",
+                                if stack else [sys.executable, "-m", "experiments.rsl_reference", "evaluate",
                                                "--trainer", "rlinf", "--headless", "--num_envs", "32"])
                 if "stage" in condition:
                     base_command.extend(["--stage", condition["stage"]])
@@ -472,9 +472,9 @@ def execute(output, resume_checkpoint=None, plan_file="plan.json"):
             if plan.get("suite") in ("builtin_transfer", "stack_reward", "stack_precision", "stack_dino", "visual_course"):
                 status.update(phase="replay")
                 write_json(output / "status.json", status)
-                replay_base = ([sys.executable, "-m", "tools.stack_evaluation", "--num-envs", "1",
+                replay_base = ([sys.executable, "-m", "experiments.stack_evaluation", "--num-envs", "1",
                                 "--config", condition.get("recipe", "adaptive")]
-                               if stack else [sys.executable, "-m", "tools.rsl_reference", "evaluate",
+                               if stack else [sys.executable, "-m", "experiments.rsl_reference", "evaluate",
                                               "--trainer", "rlinf", "--headless", "--num_envs", "1"])
                 if "stage" in condition:
                     replay_base.extend(["--stage", condition["stage"]])

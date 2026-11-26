@@ -43,7 +43,7 @@ def test_target_must_belong_to_scene_entity(tmp_path):
     path = tmp_path / 'scene.yaml'
     path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValueError, match='unknown scene entity'):
-        prepare_scene({}, scene_config=path)
+        prepare_scene({'backend': 'isaac'}, scene_config=path)
 
 
 def test_nested_property_and_target_are_distinct():
@@ -188,3 +188,5 @@ def navigation_primitives(n):
             'robot.joint_position': torch.zeros(n,12), 'robot.joint_velocity': torch.zeros(n,12),
             'robot.default_joint_position': torch.zeros(n,12), 'robot.default_joint_velocity': torch.zeros(n,12),
             'height_scanner.position': torch.zeros(n,3), 'height_scanner.ray_hit_positions': torch.zeros(n,187,3)}
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

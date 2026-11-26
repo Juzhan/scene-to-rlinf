@@ -6,8 +6,42 @@ build-backend = "setuptools.build_meta"
 name = "rlinf-project-workspace"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["hydra-core>=1.3", "omegaconf>=2.3", "ruamel.yaml>=0.18,<0.19"]
+# [core]: what `new`, `catalog`, the scene editor's static half and `check` read the scene with.
+dependencies = ["hydra-core>=1.3", "omegaconf>=2.3", "ruamel.yaml>=0.18,<0.19", "numpy>=1.24"]
+
+[project.optional-dependencies]
+# Web editor (`run.py edit`); its websockets pin conflicts with Isaac Sim, so it often lives in its own env.
+editor = ["viser==1.1.1", "trimesh>=4", "pillow>=10"]
+# Asset import: USD through usd-exchange (it provides pxr), meshes and MJCF through MuJoCo, a URDF to USD
+# without Kit through urdf-usd-converter (which requires usd-exchange, so usd-core cannot be installed here);
+# ROS xacro for .xacro sources.
+import = ["usd-exchange>=3.0.1", "urdf-usd-converter>=0.4", "trimesh>=4", "pillow>=10", "mujoco>=3.2",
+          "xacro>=2.0"]
+# Kit-free MJCF -> USD. It needs mujoco-core 4.x, whose ``mujoco`` module cannot share an environment with the
+# import group's mujoco 3.12 (Newton pins ~=3.12.0 in the simulator group), so it gets its own environment.
+usd = ["mujoco-usd-converter>=0.10"]
+# Simulator group: the SDK itself is a source install (tools/setup_env.py --with isaaclab3).
+isaaclab3 = ["torch>=2.7"]
+# Training group: RLinf and the PPO stack are source installs (tools/setup_env.py --with train).
+train = ["torch>=2.7", "ray[default]>=2.40", "tensorboard>=2.16", "imageio>=2.34", "imageio-ffmpeg>=0.5"]
+# Real-robot inference: policy.py, weights, observation types and decode_action.
+deploy = ["torch>=2.7"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["projects*", "shared*", "tools*"]
+include = ["projects*", "shared*", "tools*", "experiments*"]
+
+[tool.pytest.ini_options]
+# Group markers: a test module's marker names the smallest environment that can run it
+# (docs/PACKAGING_PLAN.md). Select one group with `pytest -m group_core`.
+markers = [
+    "group_core: runs without torch, a simulator SDK or the training framework",
+    "group_editor: needs the editor group (viser), no simulator",
+    "group_import: needs the import group (usd-core, mujoco, trimesh)",
+    "group_usd: needs the usd group (mujoco-usd-converter, its own mujoco-core)",
+    "group_deploy: needs torch only",
+    "group_isaaclab3: needs the Isaac Lab 3 source install (torch, isaaclab, newton)",
+    "group_train: needs the training group (RLinf, ray)",
+    "group_mjlab: needs the frozen mjlab environment",
+    "group_isaac: needs the Isaac Sim environment",
+]

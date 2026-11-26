@@ -25,3 +25,5 @@ importlib.import_module(allowed+'.observation')
 '''
     result=subprocess.run([sys.executable,'-c',script,project],cwd=Path(__file__).resolve().parents[1],capture_output=True,text=True)
     assert result.returncode==0,result.stdout+result.stderr
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

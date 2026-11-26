@@ -11,7 +11,7 @@ SCENE = ROOT / 'projects/dual_backend_scene/scene.yaml'
 
 
 def test_shared_layout_and_lazy_imports():
-    reports = [prepare(SCENE, backend)[3] for backend in ('isaac', 'mjlab')]
+    reports = [prepare(SCENE, backend)[3] for backend in ('isaaclab3', 'mjlab')]
     assert reports[0]['entities'] == reports[1]['entities']
     assert len(reports[0]['entities']) == 5
     assert not reports[1]['rlinf_training_connected']
@@ -119,3 +119,5 @@ def test_mjlab_depth_follows_isaac_clipping():
     assert plane[0, 0, 0, 0] == pytest.approx(2 * float(cosine[0, 0, 0]))
     assert depth(ray, SimpleNamespace(**{**vars(cfg), 'depth_clipping': 'zero'}), 'distance_to_camera')[0, 0, 1, 0] == 0
     assert math.isinf(depth(ray, SimpleNamespace(**{**vars(cfg), 'depth_clipping': 'none'}), 'distance_to_camera')[0, 0, 2, 0])
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

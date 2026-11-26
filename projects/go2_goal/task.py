@@ -13,7 +13,7 @@ The example rewards approaching ``destination`` and fails on body contact; repla
 """
 import torch
 from .observation import SceneInfo, TaskResult
-from shared.policy_math import relative_goal, yaw
+from shared.policy import relative_goal, yaw
 
 
 def evaluate(obs: SceneInfo) -> TaskResult:

@@ -82,7 +82,7 @@ def _config_type():
 
 def chain_config(control, dt, settings, signal_factories=None):
     from isaaclab.envs import mdp
-    from shared.backends.isaac.task_config import _ACTION_CLASSES
+    from shared.assembly.native_terms import ACTION_CLASSES as _ACTION_CLASSES
     endpoints = {}
     for name, binding in control['output'].items():
         parameters = dict(binding)

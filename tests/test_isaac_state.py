@@ -73,7 +73,7 @@ class StateContractTests(unittest.TestCase):
             cfg = OmegaConf.create({"env": {"train": {"env_type": "isaaclab", "seed": 42,
                 "max_episode_steps": 8, "init_params": {"id": "test", "env_cfg": "test:Config",
                 "obs_dim": 4, "action_dim": 1}}}, "runner": {"logger": {"log_path": directory}}})
-            with patch("tools.preview.make_simulation", return_value=(environment, owner)) as factory, \
+            with patch("shared.backends.isaac.legacy.state.make_simulation", return_value=(environment, owner)) as factory, \
                  patch("rlinf.models.get_model") as model, patch("imageio.v2.get_writer") as writer, \
                  patch("imageio.v2.imwrite"), patch("builtins.print"):
                 report = preview(cfg, options, recording=True)
@@ -126,7 +126,7 @@ class StateContractTests(unittest.TestCase):
             cfg.runner.logger.log_path = directory
             constructor = Mock(return_value=(environment, owner))
             with patch.dict(_ENVIRONMENT_FACTORIES, {cfg.env.train.init_params.id: constructor}), \
-                 patch("tools.preview.make_simulation") as fallback, \
+                 patch("shared.backends.isaac.legacy.state.make_simulation") as fallback, \
                  patch.dict("os.environ", {"DISPLAY": ":test"}), \
                  patch.dict("sys.modules", {"omni.appwindow": window_module}), patch("builtins.print"):
                 report = preview(cfg, options, recording=False)
@@ -173,7 +173,7 @@ class StateContractTests(unittest.TestCase):
             cfg.runner.logger.log_path = directory
             constructor = Mock(return_value=(environment, owner))
             with patch.dict(_ENVIRONMENT_FACTORIES, {cfg.env.train.init_params.id: constructor}), \
-                 patch("tools.preview.make_simulation") as fallback, \
+                 patch("shared.backends.isaac.legacy.state.make_simulation") as fallback, \
                  patch.dict("os.environ", {"DISPLAY": ":test"}), \
                  patch.dict("sys.modules", {"omni.appwindow": window_module}), patch("builtins.print"):
                 report = preview(cfg, options, recording=False)
@@ -210,7 +210,7 @@ class StateContractTests(unittest.TestCase):
                 cfg = OmegaConf.create({"env": {"train": {"env_type": "isaaclab", "seed": 42,
                     "max_episode_steps": 8, "init_params": {"id": "test", "env_cfg": "test:Config",
                     "obs_dim": 4, "action_dim": 1}}}, "runner": {"logger": {"log_path": directory}}})
-                with patch("tools.preview.make_simulation", return_value=(environment, SimpleNamespace(application=application))), \
+                with patch("shared.backends.isaac.legacy.state.make_simulation", return_value=(environment, SimpleNamespace(application=application))), \
                      patch.dict("os.environ", {"DISPLAY": ":test"}), \
                      patch.dict("sys.modules", {"omni.appwindow": window_module}), patch("builtins.print"):
                     if closing:
@@ -221,3 +221,7 @@ class StateContractTests(unittest.TestCase):
                         with self.assertRaisesRegex(ReferenceError, "physics object"):
                             preview(cfg, options, recording=False)
                 environment.close.assert_called_once()
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

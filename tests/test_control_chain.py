@@ -232,3 +232,5 @@ def test_without_control_output_every_robot_is_driven_by_name():
     result, _ = compile_control(scene_settings, {}, project_package='projects.go2_piper_wholebody',
                                 backend='isaaclab3', world=world)
     assert result['control']['output'] == outputs and 'modes' not in result['control']
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

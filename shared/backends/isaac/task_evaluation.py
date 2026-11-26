@@ -1,50 +1,10 @@
 """Bridge task expressions to native Lab terms, using the scene signal catalog."""
-from shared.assembly.signals import Signal, Signals
-from shared.assembly.legacy.task import TaskEvaluator, validate_evaluation, reward_entries
-from .entity_observations import build_signal, parse_signal, signal_information, command_information
 from shared.assembly.information import Information
-from shared.assembly.legacy.task_types import infer_evaluation
-from .targets import target_catalog, read_target
-
-
-ACTION_SIGNALS = {"policy.action": "action", "policy.previous_action": "prev_action"}
-
-
-def validate_sources(config, signal_factories=None, settings=None):
-    report = validate_evaluation(config)
-    sources = {}
-    settings = settings or {}
-    targets = target_catalog(settings)
-    task = settings.get("task", {})
-    native_defaults = {
-        "lift": {"object_pose": {"type": "UniformPoseCommandCfg", "asset_name": "robot"}},
-        "velocity": {"base_velocity": {"type": "UniformVelocityCommandCfg", "asset_name": "robot"}},
-    }
-    for path in report["signals"]:
-        if path in (signal_factories or {}):
-            sources[path] = getattr(signal_factories[path], "information", Information())
-            continue
-        if path in targets:
-            sources[path] = targets[path][1]
-        elif path.split('.')[0] in settings.get('control', {}).get('components', {}) and path.split('.')[-1] in ('input', 'output', 'previous_output'):
-            sources[path] = Information('number', (None,), 'float', axes=('component',))
-        elif path in ACTION_SIGNALS:
-            sources[path] = Information("number", (None,), "float", axes=("action",))
-        elif path == "simulation.gravity" or parse_signal(path):
-            sources[path] = signal_information(path)
-        elif path.startswith("command__") and len(path) > 9:
-            name = path[9:]
-            default = native_defaults.get(task.get("preset"), {}).get(name, {})
-            changes = (task.get("commands") or {}).get(name, {}) or {}
-            sources[path] = command_information({**default, **changes})
-        else:
-            raise ValueError(f"Unknown task signal {path!r}: select a scene property or abstract entity field")
-    types = infer_evaluation(config, sources)
-    report["information"] = {name: info.describe() for name, info in types["nodes"].items()}
-    report["sources"] = {name: info.describe() for name, info in sources.items()}
-    report["untyped_signals"] = types["untyped_signals"]
-    report["untyped_variables"] = types["untyped_variables"]
-    return report
+from shared.assembly.legacy.sources import ACTION_SIGNALS, validate_sources  # noqa: F401 - re-exported
+from shared.assembly.legacy.task import TaskEvaluator, validate_evaluation, reward_entries
+from shared.assembly.signals import Signal, Signals
+from .entity_observations import build_signal, command_information, parse_signal, signal_information
+from .targets import read_target, target_catalog
 
 
 def _runtime(env, config, signal_factories, targets=None):

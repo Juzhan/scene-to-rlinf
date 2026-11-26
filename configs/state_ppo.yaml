@@ -69,7 +69,7 @@ env:
     video_cfg:
       save_video: false
     init_params:
-      backend: isaac
+      backend: isaaclab3
       obs_dim: ${actor.model.obs_dim}
       action_dim: ${actor.model.action_dim}
       # actor.model for policy layers built in the environment process (their `config` argument).

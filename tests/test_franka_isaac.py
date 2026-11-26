@@ -79,3 +79,7 @@ class IsaacVisualLiftTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

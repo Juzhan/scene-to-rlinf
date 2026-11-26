@@ -86,13 +86,9 @@ def exporter_available(backend):
 
 
 def exporter_python(backend):
-    """Interpreter for a backend's exporter: ``RLINF_EXPORT_PYTHON``, its declared environment, else ``.venv``."""
-    from importlib import import_module
-    override = os.environ.get('RLINF_EXPORT_PYTHON')
-    if override:
-        return Path(override)
-    package = import_module(f'shared.backends.{backend}')
-    return ROOT / (getattr(package, 'INTERPRETER', None) or '.venv/bin/python')
+    """Interpreter for a backend's exporter: ``RLINF_PYTHON``, its declared environment, else ``.venv``."""
+    from .runtimes import declared_python
+    return declared_python(backend, ROOT)
 
 
 def geometry_keys(scene, document=None, *, content=False):

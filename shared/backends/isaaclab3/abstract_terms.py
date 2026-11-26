@@ -1,12 +1,57 @@
 """Abstract entity poses in Isaac Lab 3's native CommandManager and EventManager.
 
-As in the ``isaac`` backend: every commanded or shown abstract entity is one command term holding a
-shared ``AbstractState`` (wxyz, environment-local); physical assets placed in an abstract
-rectangle/box use one native reset event. Only native poses are converted from/to xyzw here.
+Every commanded or shown abstract entity is one command term holding a shared ``AbstractState`` (wxyz,
+environment-local); physical assets placed in an abstract rectangle/box use one native reset event. Only
+native poses are converted from/to xyzw here.
 """
 from functools import lru_cache
-from shared.backends.isaac.abstract_terms import marker_config as isaac_marker_config, marker_parts, term_name
 from .frames import wxyz, xyzw
+
+
+def term_name(name):
+    return 'assembly_abstract_' + name
+
+
+def marker_parts(entity):
+    """Prototype instances of one marker: (centre offsets in the entity frame, prototype indices).
+
+    Shapes and sizes come from ``shared.assembly.abstract`` so every backend's preview draws the same.
+    """
+    from shared.assembly.abstract import ARROW_HEAD_LENGTH, ARROW_LENGTH, marker_edges
+    edges = marker_edges(entity)
+    if edges is not None:
+        return edges
+    if entity['shape'] == 'direction':
+        # Shaft, then head, along local +X.
+        shaft = (1 - ARROW_HEAD_LENGTH) * ARROW_LENGTH
+        return [[shaft / 2, 0., 0.], [shaft + ARROW_HEAD_LENGTH * ARROW_LENGTH / 2, 0., 0.]], [0, 1]
+    return [[0., 0., 0.]], [0]
+
+
+def _prototypes(entity, path):
+    """Sphere point, cylinder + cone arrow direction, cylinder edges of a rectangle/box (x, y, z prototypes)."""
+    import isaaclab.sim as sim_utils
+    from isaaclab.markers import VisualizationMarkersCfg
+    from shared.assembly.abstract import (ARROW_COLOR, ARROW_HEAD_LENGTH, ARROW_HEAD_RADIUS, ARROW_LENGTH,
+                                          ARROW_WIDTH, EDGE_WIDTH, MARKER_COLOR, POINT_RADIUS)
+    if entity['shape'] == 'direction':
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=ARROW_COLOR)
+        return VisualizationMarkersCfg(prim_path=path, markers={
+            'shaft': sim_utils.CylinderCfg(radius=ARROW_WIDTH, height=(1 - ARROW_HEAD_LENGTH) * ARROW_LENGTH,
+                                           axis='X', visual_material=material),
+            # A USD cone's apex is at +height/2 along its axis.
+            'head': sim_utils.ConeCfg(radius=ARROW_HEAD_RADIUS * ARROW_WIDTH, height=ARROW_HEAD_LENGTH * ARROW_LENGTH,
+                                      axis='X', visual_material=material)})
+    material = sim_utils.PreviewSurfaceCfg(diffuse_color=MARKER_COLOR)
+    if entity['shape'] == 'point':
+        return VisualizationMarkersCfg(prim_path=path, markers={
+            'abstract': sim_utils.SphereCfg(radius=POINT_RADIUS, visual_material=material)})
+    size = list(entity['size']) + [0.] * (3 - len(entity['size']))
+    # Prototype order is the marker index: x, y, z edges.
+    return VisualizationMarkersCfg(prim_path=path, markers={
+        'edge_' + name: sim_utils.CylinderCfg(radius=EDGE_WIDTH / 2, height=size[axis] + EDGE_WIDTH,
+                                              axis=name.upper(), visual_material=material)
+        for axis, name in enumerate('xyz')})
 
 
 # xyzw rotations taking a prototype's local Z onto its configured axis.
@@ -14,11 +59,11 @@ _AXIS_ROTATIONS = {'X': (0., .5 ** .5, 0., .5 ** .5), 'Y': (-.5 ** .5, 0., 0., .
 
 
 def marker_config(entity, path):
-    """The isaac backend's marker prototypes along Z, plus each one's xyzw rotation onto its axis.
+    """The marker prototypes (_prototypes) along Z, plus each one's xyzw rotation onto its axis.
 
     Lab 3's Newton marker renderer builds cylinders and cones along Z and ignores ``axis``,
     so the axis is applied as a per-instance rotation instead, which every renderer draws alike."""
-    config = isaac_marker_config(entity, path)
+    config = _prototypes(entity, path)
     rotations = []
     for prototype in config.markers.values():
         rotations.append(_AXIS_ROTATIONS[getattr(prototype, 'axis', 'Z')])

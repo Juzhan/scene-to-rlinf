@@ -297,7 +297,7 @@ def execute(output):
         reports = []
         for seed in (43, 44):
             destination = output / f"evaluation_seed{seed}.json"
-            command = [sys.executable, "-m", "tools.frankasim_reference", "evaluate",
+            command = [sys.executable, "-m", "experiments.frankasim_reference", "evaluate",
                        "--output", str(destination), "--checkpoint", str(checkpoint),
                        "--seed", str(seed), "--episodes", "32"]
             if workspace:

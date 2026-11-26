@@ -3,8 +3,8 @@
 from pathlib import Path
 from typing import Literal
 
-from shared.assembly.assets import (CameraData, Go2Actuators, ball_parameters, box_parameters, camera_parameters,
-                                   checked, checked_gains, go2_parameters, workspace_file)
+from shared.assembly.assets import (FACTORY_SCOPES, CameraData, Go2Actuators, ball_parameters, box_parameters,
+                                   camera_parameters, checked, checked_gains, go2_parameters, workspace_file)
 from shared.asset_formats import nucleus_copy
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
@@ -375,7 +375,6 @@ FACTORIES = {factory.__name__: factory for factory in
               franka_panda, ground_plane, dome_light, seattle_table, dex_cube, camera, frame_transformer,
               piper, piper_x, m20, box, ball, urdf_robot, usd_robot, usd_object)}
 
-# Native manager-scene defaults belong to named presets, not inferred SDK types.
-# Explicit scene scope overrides these defaults; unlisted factories are per-env.
-FACTORY_SCOPES = {name: "global" for name in
-                  ("terrain", "ground_plane", "dome_light", "clear_sky")}
+# Native manager-scene defaults come from shared.assembly.assets.FACTORY_SCOPES: they belong
+# to named presets, not inferred SDK types. Explicit scene scope overrides them; unlisted
+# factories are per-env.

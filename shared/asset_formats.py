@@ -739,30 +739,139 @@ def mjcf_standalone_inertia(source, target):
 KIT_EXIT_GRACE = 30.0  # s the Isaac importer may take to close Kit after writing its result
 
 
-def to_usd(source, directory, name, fix_base):
-    """Run the Isaac Lab importer in the Isaac interpreter (it starts a headless Kit app). An MJCF whose geoms
-    take attributes from default classes is imported from a copy with them written out (mjcf_geom_defaults)."""
-    python = os.environ.get('ISAAC_PYTHON', str(ROOT / '.venv/bin/python'))
-    # Same file name (the importer names the root prim after it) in a scratch folder
-    scratch = Path(tempfile.mkdtemp(prefix='mjcf_'))
-    if source_format(source) == 'mjcf' and mjcf_geom_defaults(source, scratch / Path(source).name):
-        source = scratch / Path(source).name
-    command = [python, '-m', 'shared.asset_formats', '_isaac_import', str(source), str(directory), name]
+URDF_USD_CONVERTER = 'urdf_usd_converter'
+MJCF_USD_CONVERTER = 'mujoco_usd_converter'
+_converter_interpreters = {}
+
+
+def converter_python(module, root=ROOT):
+    """Interpreter that has the standalone converter ``module``: ``RLINF_PYTHON``, then the workspace environments.
+
+    Returned so the conversion runs in a process that has the package even when the caller does not
+    (``asset convert`` may run in an Isaac Sim environment); ``None`` keeps the Isaac importer path. The two
+    converters need different ``mujoco`` builds, so they are looked up separately."""
+    from shared.assembly.runtimes import OVERRIDE, workspace_interpreters
+    override = os.environ.get(OVERRIDE)
+    candidates = [Path(override)] if override else []
+    candidates += list(workspace_interpreters(root))
+    probe = f'import importlib.util as util, sys; sys.exit(0 if util.find_spec({module!r}) else 1)'
+    for python in candidates:
+        key = (str(python), module)
+        if key not in _converter_interpreters:
+            try:
+                found = subprocess.run([str(python), '-c', probe], capture_output=True, timeout=120).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                found = False
+            _converter_interpreters[key] = found
+        if _converter_interpreters[key]:
+            return str(python)
+    return None
+
+
+def urdf_converter_python(root=ROOT):
+    """Interpreter for URDF -> USD without Kit (see ``converter_python``)."""
+    return converter_python(URDF_USD_CONVERTER, root)
+
+
+def mjcf_converter_python(root=ROOT):
+    """Interpreter for MJCF -> USD without Kit (see ``converter_python``)."""
+    return converter_python(MJCF_USD_CONVERTER, root)
+
+
+def convert_urdf(source, directory, name, fix_base):
+    """URDF -> USD with the standalone converter: no Kit application and no Isaac Sim.
+
+    The converter is Newton's own (`urdf-usd-converter`): bodies keep its nested link hierarchy
+    (``Geometry/<link>/<child>``), which the isaaclab3 backend resolves through ``usd_body_paths``,
+    and a massless link on fixed joints stays a plain transform (``urdf_frames`` records it as a frame)."""
+    from urdf_usd_converter import Converter
+    return _standalone(Converter, 'urdf-usd-converter', source, directory, name, fix_base)
+
+
+def _standalone(converter, package, source, directory, name, fix_base):
+    """Run a standalone converter. It welds the root body to the world; ``fix_base=False`` deactivates that
+    weld so the entity's own anchor decides, as with the Isaac importer. The file is renamed to ``<name>.usd``,
+    the name the rest of the pipeline records (the content format is unchanged)."""
+    from importlib.metadata import version
+    target = Path(directory) / (name + '.usd')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='usd_convert_') as scratch:
+        produced = Path(str(converter(layer_structure=False, scene=False).convert(str(source), scratch).path))
+        if not produced.is_absolute():  # the converter reports it relative to the output directory
+            produced = Path(scratch) / produced
+        if not fix_base:
+            _free_root(produced)
+        shutil.move(str(produced), str(target))
+    record = {'tool': package, 'version': version(package), 'fix_base': fix_base, 'link_hierarchy': 'nested'}
+    (Path(directory) / '.import.json').write_text(json.dumps(record))
+    return target, record
+
+
+def _free_root(usd):
+    """Deactivate the converter's weld of the root link to the world: the entity's ``fix_root_link`` decides."""
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(str(usd))
+    world = str(stage.GetDefaultPrim().GetPath())
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.FixedJoint):
+            continue
+        body0 = UsdPhysics.Joint(prim).GetBody0Rel().GetTargets()
+        if [str(path) for path in body0] == [world]:
+            prim.SetActive(False)  # an inactive prim is not parsed, and this pxr has no prim removal
+    stage.GetRootLayer().Save()
+
+
+def convert_mjcf(source, directory, name, fix_base):
+    """MJCF -> USD with the standalone converter (`mujoco-usd-converter`): no Kit application and no Isaac Sim.
+    Bodies keep its nested hierarchy (``Geometry/<body>/<child>``), as with the URDF converter."""
+    from mujoco_usd_converter import Converter
+    return _standalone(Converter, 'mujoco-usd-converter', source, directory, name, fix_base)
+
+
+def _converted(convert, source, directory, name, fix_base):
+    """A converter error is written to .import.json, the record to_usd reads."""
+    import traceback
+    try:
+        convert(source, directory, name, fix_base)
+    except Exception:
+        (Path(directory) / '.import.json').write_text(json.dumps({'error': traceback.format_exc()}))
+        return 1
+    return 0
+
+
+def _urdf_convert(source, directory, name, fix_base):
+    return _converted(convert_urdf, source, directory, name, fix_base)
+
+
+def _mjcf_convert(source, directory, name, fix_base):
+    return _converted(convert_mjcf, source, directory, name, fix_base)
+
+
+# The Kit-free conversion of each source format: the worker module, the name to report, its interpreter lookup.
+CONVERTERS = {'urdf': ('_urdf_convert', 'URDF converter', urdf_converter_python),
+              'mjcf': ('_mjcf_convert', 'MJCF converter', mjcf_converter_python)}
+
+
+def _conversion(source, directory, name, fix_base, python, worker, tool, grace=None, env=None, quiet=False):
+    """Run one converter module in ``python``; it leaves ``.import.json`` behind (a record or an error).
+
+    ``quiet`` keeps a chatty converter's progress lines back and shows them only if the conversion fails."""
+    command = [python, '-m', 'shared.asset_formats', worker, str(source), str(directory), name]
     if fix_base:
         command.append('--fix-base')
     result = Path(directory) / '.import.json'
     result.unlink(missing_ok=True)
-    process = subprocess.Popen(command, cwd=ROOT, env={
-        **os.environ, 'OMNI_KIT_ACCEPT_EULA': 'YES',
-        'PYTHONPATH': os.pathsep.join(filter(None, (str(ROOT), os.environ.get('PYTHONPATH'))))})
+    log = tempfile.TemporaryFile('w+') if quiet else None
+    process = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT if quiet else None, env=env or {
+        **os.environ, 'PYTHONPATH': os.pathsep.join(filter(None, (str(ROOT), os.environ.get('PYTHONPATH'))))})
     try:
-        # The importer writes .import.json before closing Kit, whose shutdown can hang (seen after a URDF whose
+        # The Isaac importer writes .import.json before closing Kit, whose shutdown can hang (seen after a URDF whose
         # links have no geometry): once the result is there, the process gets a grace period, then it is ended.
         finished = None
         while process.poll() is None:
-            if finished is None and result.is_file():
+            if grace is not None and finished is None and result.is_file():
                 finished = time.time()
-            if finished is not None and time.time() - finished > KIT_EXIT_GRACE:
+            if finished is not None and time.time() - finished > grace:
                 process.terminate()
                 try:
                     process.wait(10)
@@ -773,13 +882,53 @@ def to_usd(source, directory, name, fix_base):
     finally:
         if process.poll() is None:
             process.kill()
-        shutil.rmtree(scratch, ignore_errors=True)
+    if log is not None:
+        log.seek(0)
+        output = log.read().strip()
+        log.close()
+    else:
+        output = ''
     if not result.is_file():
-        raise RuntimeError(f'Isaac importer exited ({process.returncode}) without a result for {source}')
+        raise RuntimeError(f'{tool} exited ({process.returncode}) without a result for {source}'
+                           + (f':\n{output}' if output else ''))
     record = json.loads(result.read_text())
     if 'error' in record:
-        raise RuntimeError(f'Isaac importer failed on {source}:\n{record["error"]}')
+        raise RuntimeError(f'{tool} failed on {source}:\n{record["error"]}')
     return Path(directory) / (name + '.usd'), record
+
+
+def to_usd(source, directory, name, fix_base):
+    """Write a USD for a URDF or MJCF source.
+
+    Each format uses its standalone converter when a workspace interpreter has it (the import group
+    installs the URDF one, the usd group the MJCF one; no Kit starts). Without that package the source
+    goes through the Isaac Lab importer in an interpreter that has one (it starts a headless Kit app).
+    An MJCF whose geoms take attributes from default classes is imported from a copy with them written
+    out (mjcf_geom_defaults)."""
+    kind = source_format(source)
+    worker, tool, find = CONVERTERS.get(kind, (None, None, None))
+    if worker is not None:
+        python = find()
+        if python is not None:
+            return _conversion(source, directory, name, fix_base, python, worker, tool, quiet=True)
+    from shared.assembly.runtimes import declared_python
+    python = str(declared_python('isaac', ROOT))  # RLINF_PYTHON, then .venv (Isaac Sim)
+    if not Path(python).is_file():
+        raise RuntimeError(
+            f'URDF/MJCF -> USD needs an Isaac Sim environment with the Isaac Lab importer, and {python} does not '
+            'exist: create .venv with Isaac Sim, or set RLINF_PYTHON to an interpreter that has it.')
+    # Same file name (the importer names the root prim after it) in a scratch folder
+    scratch = Path(tempfile.mkdtemp(prefix='mjcf_'))
+    if source_format(source) == 'mjcf' and mjcf_geom_defaults(source, scratch / Path(source).name):
+        source = scratch / Path(source).name
+    try:
+        return _conversion(source, directory, name, fix_base, python, '_isaac_import', 'Isaac importer',
+                           grace=KIT_EXIT_GRACE, env={
+                               **os.environ, 'OMNI_KIT_ACCEPT_EULA': 'YES',
+                               'PYTHONPATH': os.pathsep.join(filter(None, (str(ROOT),
+                                                                           os.environ.get('PYTHONPATH'))))})
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _isaac_import(source, directory, name, fix_base):
@@ -948,21 +1097,91 @@ def joint_order_problems(record):
     return problems
 
 
-def recorded_joint_order(path):
-    """Canonical joint order of the asset whose ASSET.json lists `path` as its source or a format;
-    None for files no ASSET.json lists. Backends present joint readings in this order."""
+def asset_record(path):
+    """(ASSET.json path, record) of the asset that lists `path` as its source or a format; None if none does."""
     path = Path(path).resolve()
     for record_path in (directory / 'ASSET.json' for directory in path.parents):
         if not record_path.is_file():
             continue
         record = json.loads(record_path.read_text())
-        if path not in {(ROOT / item).resolve() for item in (record['source'], *record['formats'].values())}:
-            continue
-        if 'joint_order' not in record:
-            raise ValueError(f'{workspace_path(record_path)} has no joint_order; rerun: '
-                             f'run.py asset convert {record["source"]} <asset directory>')
-        return tuple(record['joint_order'])
+        if path in {(ROOT / item).resolve() for item in (record['source'], *record['formats'].values())}:
+            return record_path, record
     return None
+
+
+def recorded_joint_order(path):
+    """Canonical joint order of the asset whose ASSET.json lists `path` as its source or a format;
+    None for files no ASSET.json lists. Backends present joint readings in this order."""
+    found = asset_record(path)
+    if found is None:
+        return None
+    record_path, record = found
+    if 'joint_order' not in record:
+        raise ValueError(f'{workspace_path(record_path)} has no joint_order; rerun: '
+                         f'run.py asset convert {record["source"]} <asset directory>')
+    return tuple(record['joint_order'])
+
+
+def recorded_frames(path):
+    """{frame: (body, (position, wxyz))} the asset's ASSET.json records for `path` (see urdf_frames); {} if none."""
+    found = asset_record(path)
+    frames = found[1].get('frames', {}) if found else {}
+    return {name: (body, (tuple(position), tuple(orientation)))
+            for name, (body, (position, orientation)) in frames.items()}
+
+
+def urdf_frames(urdf, bodies):
+    """URDF links that are not simulated bodies, as frames on the body they are fixed to.
+
+    The standalone converter keeps a link without mass that hangs on fixed joints (a TCP, a camera mount) as a
+    plain transform, so the articulation has no body of that name; recorded as a frame it stays addressable as
+    ``robot.frame_pose(<link>)`` and as an observation, like the frames of a built-in asset. Links behind a
+    movable joint are left out. Returns {link: [body, [position, wxyz]]} relative to ``body``'s origin."""
+    import numpy as np
+    root = ElementTree.parse(urdf).getroot()
+    parent_of = {}
+    for joint in root.findall('joint'):
+        origin = joint.find('origin')
+        xyz = [float(v) for v in (origin.get('xyz', '0 0 0') if origin is not None else '0 0 0').split()]
+        rpy = [float(v) for v in (origin.get('rpy', '0 0 0') if origin is not None else '0 0 0').split()]
+        parent_of[joint.find('child').get('link')] = (joint.find('parent').get('link'), joint.get('type'),
+                                                      np.array(_rotation(rpy)), np.array(xyz))
+    frames = {}
+    for link in (element.get('name') for element in root.findall('link')):
+        if link in bodies or link not in parent_of:
+            continue
+        rotation, position, current = np.eye(3), np.zeros(3), link
+        while current not in bodies and current in parent_of:
+            parent, kind, joint_rotation, joint_position = parent_of[current]
+            if kind != 'fixed':
+                break
+            rotation, position = joint_rotation @ rotation, joint_rotation @ position + joint_position
+            current = parent
+        if current in bodies:
+            frames[link] = [current, [[round(float(v), 9) for v in position], _quaternion(rotation)]]
+    return frames
+
+
+def _quaternion(matrix):
+    """wxyz of a rotation matrix."""
+    m = matrix
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0:
+        s = 2 * math.sqrt(trace + 1)
+        q = [s / 4, (m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s]
+    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = 2 * math.sqrt(1 + m[0][0] - m[1][1] - m[2][2])
+        q = [(m[2][1] - m[1][2]) / s, s / 4, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s]
+    elif m[1][1] > m[2][2]:
+        s = 2 * math.sqrt(1 + m[1][1] - m[0][0] - m[2][2])
+        q = [(m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s, s / 4, (m[1][2] + m[2][1]) / s]
+    else:
+        s = 2 * math.sqrt(1 + m[2][2] - m[0][0] - m[1][1])
+        q = [(m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, s / 4]
+    q = [float(v) for v in q]
+    if q[0] < 0:
+        q = [-v for v in q]
+    return [round(v, 9) for v in q]
 
 
 def compare(usd, mjcf):
@@ -1067,6 +1286,8 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
             path, step = to_usd(source, targets['usd'], name, fix_base)
             steps.append({'from': kind, 'to': 'usd', **step})
             formats['usd'] = workspace_path(path)
+    # Links the USD keeps as plain transforms (a TCP on fixed joints): frames on the body they hang on.
+    frames = urdf_frames(source, usd_bodies(ROOT / formats['usd'])[0]) if kind == 'urdf' and 'usd' in formats else {}
     record = {
         'source': workspace_path(original), 'source_format': kind, 'source_sha256': digest(original),
         **({'source_layers_sha256': usd_layers(source)} if kind == 'usd' else {}),
@@ -1076,6 +1297,7 @@ def convert(source, output, name=None, packages=None, root=None, fix_base=False,
                         else mjcf_joint_order(ROOT / formats['mjcf'])),
         'alignment': (alignment_of(ROOT / formats['usd'], ROOT / formats['mjcf'])
                       if {'usd', 'mjcf'} <= formats.keys() else None),
+        **({'frames': frames} if frames else {}),
         'sha256': {path.relative_to(output).as_posix(): digest(path)
                    for format_ in targets if format_ != kind
                    for path in sorted(targets[format_].rglob('*')) if path.is_file()},
@@ -1894,6 +2116,37 @@ def _usd_bounds(path, _mtime):
         return None
     unit = UsdGeom.GetStageMetersPerUnit(stage) or 1.
     return [float(v) * unit for v in box.GetMin()], [float(v) * unit for v in box.GetMax()]
+
+
+def usd_body_paths(path):
+    """{body name: prim path relative to the asset's default prim}.
+
+    An imported USD keeps its own link hierarchy (the standalone URDF converter nests a link under
+    its parent), while a scene addresses a body as <entity>/<body name>. Backends resolve the name
+    through this table instead of assuming a flat file."""
+    path = Path(path).resolve()
+    return _usd_body_paths(str(path), path.stat().st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=None)
+def _usd_body_paths(path, _mtime):
+    from pxr import Usd, UsdPhysics
+    stage = Usd.Stage.Open(path)
+    default = stage.GetDefaultPrim()
+    if not default:  # pxr hands out an invalid prim, not None: an empty or half-written file has no bodies
+        raise ValueError(f'{workspace_path(path)} has no default prim, so it has no bodies to address')
+    result, frames = {}, {}
+    for prim in Usd.PrimRange(default, Usd.TraverseInstanceProxies()):
+        relative = str(prim.GetPath().MakeRelativePath(default.GetPath()))
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            result.setdefault(prim.GetName(), relative)
+        elif prim.GetTypeName() == 'Xform' and prim.GetParent().HasAPI(UsdPhysics.RigidBodyAPI):
+            # A link joined by a fixed joint has no rigid body in the converter's output (it carries no mass
+            # of its own): keep it addressable so a mount on a tool or TCP frame still resolves.
+            frames.setdefault(prim.GetName(), relative)
+    for name, relative in frames.items():
+        result.setdefault(name, relative)
+    return result
 
 
 def usd_body_structure(path):
@@ -2967,6 +3220,12 @@ def main(argv=None):
     if argv[:1] == ['_isaac_import']:
         source, directory, name = argv[1:4]
         return _isaac_import(Path(source), Path(directory), name, '--fix-base' in argv)
+    if argv[:1] == ['_urdf_convert']:
+        source, directory, name = argv[1:4]
+        return _urdf_convert(Path(source), Path(directory), name, '--fix-base' in argv)
+    if argv[:1] == ['_mjcf_convert']:
+        source, directory, name = argv[1:4]
+        return _mjcf_convert(Path(source), Path(directory), name, '--fix-base' in argv)
     if importlib.util.find_spec('mujoco') is None:
         interpreter = ROOT / '.venv-mjlab/bin/python'
         if not interpreter.is_file():
@@ -3034,7 +3293,7 @@ def main(argv=None):
                                                  'or a USD file')
     verify.add_argument('mjcf', type=Path, nargs='?', help='MJCF file when the first argument is a USD file')
     tile = commands.add_parser('terrain', help='Generate a terrain tile as an ordinary USD + MJCF asset')
-    tile.add_argument('variant', help='Terrain variant name (shared/backends/isaac/assets.py TERRAIN_VARIANTS), '
+    tile.add_argument('variant', help='Terrain variant name (shared/backends/isaaclab3/assets.py TERRAIN_VARIANTS), '
                                       'or "all" for every preset into OUTPUT/<variant>')
     tile.add_argument('output', type=Path, help='Asset directory; writes usd/, mjcf/ and ASSET.json')
     tile.add_argument('--name', help='File name of the generated model (default: variant)')

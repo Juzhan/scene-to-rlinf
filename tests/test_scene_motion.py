@@ -190,3 +190,5 @@ def test_custom_motion_calls_the_project_function_with_the_scene(monkeypatch):
         bad.step(pose, .5, torch.ones(2, dtype=torch.bool))
     with pytest.raises(ValueError, match='module:attribute'):
         check('npc', {'type': 'custom', 'function': 'keep_away'})
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

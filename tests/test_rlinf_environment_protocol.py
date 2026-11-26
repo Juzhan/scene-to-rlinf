@@ -57,3 +57,5 @@ def test_registration_can_repeat_the_same_project_bound_method(monkeypatch):
     register_isaac_assembly_env(identifier, factory=project.make_environment)
     with pytest.raises(ValueError, match="already has"):
         register_isaac_assembly_env(identifier, factory=Project().make_environment)
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

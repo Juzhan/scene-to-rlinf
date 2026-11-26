@@ -1,5 +1,5 @@
 """Small common tensor boundary around a native vector environment."""
-from shared.integrations.rlinf.terminal import snapshot
+from shared.backends.terminal import snapshot
 
 
 class Environment:

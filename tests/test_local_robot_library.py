@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 from shared.assembly.catalog import describe_scene
-from shared.backends.isaac.assets import FACTORIES
+from shared.backends.isaaclab3.assets import FACTORIES
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -40,3 +40,7 @@ def test_new_robot_instances_get_independent_unselected_observations(tmp_path):
         assert entry['selected_in']==[]
         assert entry['source_groups']['default']['group']==f'world/{name}'
     assert all(name in FACTORIES for name in ('piper','piper_x','m20','go2','anymal_c'))
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

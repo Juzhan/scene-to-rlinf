@@ -336,3 +336,7 @@ assert not any(name.startswith('robot_platform') for name in sys.modules)
         with patch("importlib.util.find_spec", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "runtime is not ready"):
                 project.preflight(cfg)
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

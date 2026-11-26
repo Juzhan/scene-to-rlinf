@@ -29,3 +29,7 @@ def test_low_level_checkpoint_loads_into_our_frozen_network(tmp_path, monkeypatc
     sample = torch.randn(4, 235)
     torch.testing.assert_close(policy(sample), actor.eval()(sample), rtol=0, atol=0)
     assert all(not parameter.requires_grad for parameter in policy.parameters())
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

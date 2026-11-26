@@ -319,3 +319,5 @@ def test_changed_history_length_changes_the_interface_identifier(signature_proje
     OmegaConf.save(scene, root / 'scene.yaml')
     without = project_signature(cfg, module)['interface_sha256']
     assert len({before, longer, without}) == 3
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

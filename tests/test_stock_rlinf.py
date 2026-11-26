@@ -16,7 +16,7 @@ import rlinf.data.schema.embodied_types as transport
 assert Path(transport.__file__).is_relative_to(run.RLINF)
 assert run.RLINF.name == 'RLinf-upstream'
 import sys
-cfg, project = run.compose_project('assembly_lift')
+cfg, project = run.compose_project('assembly_lift', overrides=['env.train.init_params.backend=isaac', 'env.eval.init_params.backend=isaac'])  # an Isaac Lab 2 project
 project.check(cfg)
 assert 'shared.assembly.legacy.task' not in sys.modules
 from shared.integrations.rlinf.upstream import validate_runtime
@@ -98,3 +98,7 @@ print('stock transport, routing, deterministic evaluation and gradient update pa
     result = subprocess.run([sys.executable, '-c', code], cwd=ROOT, env=env,
                             capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

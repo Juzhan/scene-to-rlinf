@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from shared.integrations.rlinf.terminal import (
+from shared.backends.terminal import (
     TerminalObservationMixin,
     snapshot_terminal_observations,
     validate_terminal_observations,
@@ -283,3 +283,5 @@ def test_environment_wrapper_leaves_actions_rewards_and_resets_to_native_sdk(sdk
     torch.testing.assert_close(obs["policy"], torch.tensor([[-5., -5., -5.], [20., 30., 32.]]))
     env.close()
     native.close.assert_called_once()
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

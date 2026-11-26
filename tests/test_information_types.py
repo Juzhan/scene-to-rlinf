@@ -162,3 +162,5 @@ def test_generated_object_schema_includes_source_types():
         assert 'class SceneInfo(ObjectView):' in source
         assert 'joint_position: Tensor' in source
         assert 'position: Tensor' in source
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

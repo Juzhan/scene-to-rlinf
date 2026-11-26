@@ -180,11 +180,22 @@ def robot_interface(node):
         node.factory, factory_capabilities(node.factory), node.parameters)
 
 
+def _recorded_frames(node):
+    """Frames an imported asset's ASSET.json records (URDF links kept as transforms, such as a TCP)."""
+    path = (node.parameters or {}).get('usd_path')
+    if not isinstance(path, str) or not path:
+        return {}
+    from shared.asset_formats import recorded_frames
+    from .assets import workspace_file
+    return recorded_frames(workspace_file(path))
+
+
 def robot_frames(world):
     """Robot key -> {frame name: (body, (position, orientation))} of a composed scene, without a simulator.
 
     ``world`` is the scene description with assembly files expanded. Asset defaults come
-    first; ``frames`` on the robot entity add frames or replace a default of the same name.
+    first (frames an imported asset's ASSET.json records, then ASSET_FRAMES); ``frames`` on the
+    robot entity add frames or replace a default of the same name.
     """
     from .entity_information import SIGNALS
     index = world.index()
@@ -193,7 +204,7 @@ def robot_frames(world):
     for path, (node, _) in index.items():
         if not robot_interface(node):
             continue
-        frames = dict(ASSET_FRAMES.get(node.factory, {}))
+        frames = {**_recorded_frames(node), **ASSET_FRAMES.get(node.factory, {})}
         for frame in node.frames:
             frames[frame.name] = (frame.body, (tuple(frame.pose.position), tuple(frame.pose.orientation)))
         children = {child.name for child in node.children}

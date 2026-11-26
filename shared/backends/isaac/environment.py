@@ -2,7 +2,7 @@
 
 import math
 
-from shared.integrations.rlinf.terminal import snapshot
+from shared.backends.terminal import snapshot
 
 
 from shared.backends.environment import Environment
@@ -113,7 +113,7 @@ def make_environment(parameters, num_envs, seed, horizon, *, scene_config, proje
     native = None
     try:
         from isaaclab.envs import ManagerBasedRLEnv
-        from shared.integrations.rlinf.terminal import TerminalObservationMixin, validate_terminal_observations
+        from shared.backends.terminal import TerminalObservationMixin, validate_terminal_observations
 
         class NativeEnv(TerminalObservationMixin, ManagerBasedRLEnv):
             pass

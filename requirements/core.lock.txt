@@ -1,0 +1,11 @@
+# Exact package set of [core]; regenerate with tools/setup_env.py --lock.
+# Frozen from .venv-il3/bin/python, .venv/bin/python so every group built from these
+# files keeps one version of each shared package.
+antlr4-python3-runtime==4.9.3
+hydra-core==1.4.0.dev1
+numpy==2.5.1
+omegaconf==2.4.0
+packaging==26.0
+pyyaml==6.0.3
+ruamel-yaml==0.18.17
+ruamel-yaml-clib==0.2.15

@@ -54,7 +54,7 @@ def test_display_labels_do_not_break_entity_references(project):
 
 
 def test_unfinished_environment_can_be_authored_but_not_trained(tmp_path):
-    from shared.backends.isaac.task_config import validate_task_settings
+    from shared.assembly.native_terms import validate_task_settings
     path = tmp_path / 'scene.yaml'
     path.write_text('schema_version: 1\nname: world\nentities: []\n')
     result = apply_edits(path, {'revision': SceneDocument(path).revision,
@@ -670,3 +670,5 @@ def test_an_edited_parameter_is_replaced_whole_and_none_removes_it():
     entity = {'parameters': {'usd_path': 'x.usda', 'couplings': {'lid': {'leader': 'pedal'}, 'needle': {'leader': 'knob'}}}}
     _merge(entity, {'parameters': {'couplings': {'lid': {'leader': 'pedal', 'ratio': 2.0}}, 'usd_path': None}})
     assert entity['parameters'] == {'couplings': {'lid': {'leader': 'pedal', 'ratio': 2.0}}}
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

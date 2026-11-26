@@ -11,11 +11,11 @@ PACKAGE = 'projects.dual_backend_scene'
 
 def test_same_project_definition_and_model_for_both_backends():
     prepared = [prepare_scene({'backend': b}, scene_config=SCENE, project_package=PACKAGE)
-                for b in ('isaac', 'mjlab')]
+                for b in ('isaaclab3', 'mjlab')]
     for section in ('control', 'observations', 'actions'):
         assert prepared[0].settings[section] == prepared[1].settings[section]
     assert prepared[0].terms['object_api'] == prepared[1].terms['object_api']
-    assert prepared[0].backend == 'isaac' and prepared[1].backend == 'mjlab'
+    assert prepared[0].backend == 'isaaclab3' and prepared[1].backend == 'mjlab'
     require_online_backend({'backend': 'mjlab'})
     with pytest.raises(ValueError, match='Unknown'):
         require_online_backend({'backend': 'missing'})
@@ -140,7 +140,7 @@ def test_mjlab_backend_selects_its_own_interpreter(monkeypatch, tmp_path):
     import sys
     import shared.assembly.project as project
     import pytest
-    assert project.backend_interpreter('isaac') == sys.executable
+    assert project.backend_interpreter('isaaclab3') == sys.executable
     monkeypatch.setattr(project.util, 'find_spec', lambda name: None)
     monkeypatch.delenv('RLINF_PYTHON', raising=False)
     expected = project.Path(project.__file__).resolve().parents[2] / '.venv-mjlab/bin/python'
@@ -150,3 +150,5 @@ def test_mjlab_backend_selects_its_own_interpreter(monkeypatch, tmp_path):
     monkeypatch.setenv('RLINF_PYTHON', sys.executable)
     with pytest.raises(RuntimeError, match='no mjlab'):
         project.backend_interpreter('mjlab')
+
+pytestmark = pytest.mark.group_mjlab  # runs in the [mjlab] dependency group

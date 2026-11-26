@@ -352,7 +352,7 @@ def test_backend_is_recorded_not_part_of_policy_interface(project, tmp_path):
     assert after['backends'] == {'train': 'mjlab', 'eval': 'mjlab'}
     assert before['interface_sha256'] == after['interface_sha256']
     report = compare_project(snapshot, cfg, module)
-    assert report['backend_changed'] and report['backends']['checkpoint']['train'] == 'isaac'
+    assert report['backend_changed'] and report['backends']['checkpoint']['train'] == 'isaaclab3'
     replay, _ = load_snapshot(snapshot, ["env.train.init_params.backend=mjlab"], register=False)
     assert replay.env.eval.init_params.backend == 'mjlab'
 
@@ -465,3 +465,5 @@ def test_snapshots_with_byte_source_hashes_compare_from_their_frozen_copy(projec
     (root / "task.py").write_text("def evaluate(obs):\n    return {'reward': 2.0}\n")
     with pytest.raises(ValueError, match="task.py"):
         compare_project(snapshot, cfg, module)
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

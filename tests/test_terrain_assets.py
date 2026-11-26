@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -133,7 +134,25 @@ def test_mjlab_scene_uses_generated_tile_as_ordinary_static_object(tmp_path, mon
 
 
 def test_presets_cover_every_terrain_variant():
-    from shared.backends.isaac.assets import TERRAIN_VARIANTS
+    from shared.backends.isaaclab3.assets import TERRAIN_VARIANTS
     from shared.terrain_assets import LABELS, PRESETS
 
     assert set(PRESETS) == set(TERRAIN_VARIANTS) == set(LABELS)
+
+def test_generator_runs_in_the_isaaclab3_environment(tmp_path):
+    """The tile comes from Isaac Lab 3's own generators: no Kit application and no ``isaac`` backend."""
+    from shared.assembly.runtimes import declared_python
+    from shared.terrain_assets import generate
+
+    python = declared_python('isaaclab3')
+    if not Path(python).is_file():
+        pytest.skip(f"no Isaac Lab 3 environment at {python}")
+    record = generate('flat', tmp_path / 'flat', size=SIZE, difficulty=0.5, seed=0)
+    assert (tmp_path / 'flat' / 'usd' / 'flat.usda').is_file()
+    assert (tmp_path / 'flat' / 'mjcf' / 'flat.xml').is_file()
+    assert record['steps'][0]['generator']['variant'] == 'flat'
+    assert record['alignment']['aligned']
+    assert record['steps'][0]['max_height_difference'] < 1e-3
+
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

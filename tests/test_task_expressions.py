@@ -185,3 +185,5 @@ def test_domain_call_state_is_per_occurrence_and_resets_by_environment():
     result = engine.evaluate(dt=.1, step=2)
     assert not result.success.any()
     assert result.reward.tolist() == [3., 50.]
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

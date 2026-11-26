@@ -49,7 +49,7 @@ def main():
     )
     import torch
     from rlinf.models import get_model
-    from tools.lift_ablation import checksum
+    from experiments.lift_ablation import checksum
 
     model = get_model(config.actor.model).to(environment.device).eval()
     reference_encoder = None

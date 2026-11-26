@@ -45,3 +45,5 @@ finally:
     else:
         assert "Traceback (most recent call last)" in result.stderr
         assert "ValueError: factory validation failed" in result.stderr
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

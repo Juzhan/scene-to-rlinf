@@ -307,3 +307,5 @@ def test_assembly_override_replaces_reset_mode(tmp_path):
     cube = {"name": "cube", "assembly": "cube.yaml", "overrides": {".": {"reset": {"region": "world/area"}}}}
     body = world(area(), cube, tmp_path=tmp_path).index()["world/cube"][0]
     assert body.reset.region == "world/area" and not body.reset.pose_range
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

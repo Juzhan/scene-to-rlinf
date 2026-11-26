@@ -1,6 +1,6 @@
 import unittest
 
-from tools.frankasim_reference import accepted, make_config, stable_grasp
+from experiments.frankasim_reference import accepted, make_config, stable_grasp
 
 
 class FrankaSimReferenceTests(unittest.TestCase):
@@ -45,7 +45,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
         import sys
         import tempfile
         from unittest.mock import patch
-        from tools.frankasim_reference import ROOT, execute, prepare, write_json
+        from experiments.frankasim_reference import ROOT, execute, prepare, write_json
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "experiment"
@@ -64,7 +64,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
                     write_json(destination, {"seed": seed, "episodes": 32, "success_rate": 0.9,
                                              "held_0_5s_rate": 0.9, "frozen_encoder_verified": True})
 
-            with patch("tools.frankasim_reference.subprocess.run", side_effect=complete):
+            with patch("experiments.frankasim_reference.subprocess.run", side_effect=complete):
                 execute(output)
             self.assertEqual(commands[0][:4], [sys.executable, str(ROOT / "run.py"), "train", "frankasim"])
             self.assertEqual(len(commands), 3)
@@ -78,7 +78,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
         from pathlib import Path
         import tempfile
         from unittest.mock import patch
-        from tools.frankasim_reference import execute, prepare
+        from experiments.frankasim_reference import execute, prepare
 
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "global_step_1062"
@@ -96,7 +96,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
             self.assertEqual(plan["ablation"]["planned_transitions"], 3840000)
             self.assertEqual(len(plan["resume"]["checkpoint_sha256"]), 3)
             (checkpoint / "actor/dcp_checkpoint/__0_0.distcp").unlink()
-            with patch("tools.frankasim_reference.subprocess.run") as launch:
+            with patch("experiments.frankasim_reference.subprocess.run") as launch:
                 with self.assertRaises(FileNotFoundError):
                     execute(output)
                 launch.assert_not_called()
@@ -154,7 +154,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
         self.assertEqual(ppo.runner.max_epochs * ppo.env.train.max_steps_per_rollout_epoch, 271872)
 
     def test_ppo_promotion_requires_comparable_success_and_holding(self):
-        from tools.frankasim_reference import ablation_comparison
+        from experiments.frankasim_reference import ablation_comparison
 
         baseline = [{"seed": seed, "episodes": 32, "success_rate": success,
                      "held_0_5s_rate": holding, "frozen_encoder_verified": True}
@@ -187,3 +187,7 @@ class FrankaSimReferenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_deploy  # runs in the [deploy] dependency group

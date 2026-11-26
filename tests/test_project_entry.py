@@ -163,3 +163,5 @@ def test_generator_rejects_ambiguous_assembly_registration(tmp_path):
     )
     with pytest.raises(ValueError, match="explicit string"):
         _assembly_registration_names(tmp_path, "copy")
+
+pytestmark = pytest.mark.group_train  # runs in the [train] dependency group

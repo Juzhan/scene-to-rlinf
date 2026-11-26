@@ -125,7 +125,7 @@ def build_scene_config(description, settings, factories):
     import mujoco
     from mjlab.sensor import CameraSensorCfg, ContactMatch, ContactSensorCfg, ObjRef, RayCastSensorCfg, SensorCfg
     from mjlab.scene import SceneCfg
-    from shared.backends.isaac.initial_state import apply_initial_state  # SDK-free value checks
+    from shared.backends.isaaclab3.initial_state import apply_initial_state  # SDK-free value checks
     validate(description, settings)
     entities, sensors, keys = {}, {}, {}
     for path, (node, pose) in description.index().items():
@@ -291,7 +291,7 @@ def contact_friction(settings, keys):
     MuJoCo has one sliding coefficient and no combine mode: the higher-priority geom's friction
     wins, so the entity's geoms get the combined dynamic friction and priority over the ground.
     Static friction has no MuJoCo counterpart."""
-    from shared.backends.isaac.contact_materials import validate_materials  # SDK-free value checks
+    from shared.backends.isaaclab3.contact_materials import validate_materials  # SDK-free value checks
     values = settings.get('world', {}).get('contact_materials') or {}
     validate_materials(values, set(keys.values()))
     combine = COMBINE[settings.get('simulation', {}).get('physics_material', {}).get('friction_combine_mode', 'average')]

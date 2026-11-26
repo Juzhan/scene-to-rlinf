@@ -82,6 +82,11 @@ def test_newton_style_floor_tiles_the_square_and_sky_fades_down():
 def test_headless_editor_round_trip(tmp_path):
     project = tmp_path / 'lift'
     shutil.copytree(ROOT / 'projects/assembly_lift', project, ignore=shutil.ignore_patterns('.cache', '__pycache__'))
+    # An older project written for Isaac Lab 2 (urdf_robot, native presets): it must run on that backend.
+    recipe = project / 'train.yaml'
+    source = recipe.read_text()
+    if 'backend:' not in source:
+        recipe.write_text(source.replace('    init_params:\n', '    init_params:\n      backend: isaac\n', 1))
     scene = project / 'scene.yaml'
     script = f'''
 import sys
@@ -154,6 +159,25 @@ editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+def test_urdf_quick_import_names_the_conversion_on_backends_without_it(tmp_path):
+    """Only the isaac backend builds a scene from a URDF; isaaclab3/mjlab need the converted USD."""
+    from tools.web_editor import Editor
+
+    scene = tmp_path / 'scene.yaml'
+    scene.write_text('schema_version: 1\nname: world\nentities: []\n')
+    (tmp_path / 'train.yaml').write_text(
+        'defaults: [state_ppo, _self_]\nenv:\n  train:\n    init_params:\n      backend: isaaclab3\n')
+    editor = Editor(scene, port=0, native_preview=False)
+    try:
+        editor.import_path.value = 'projects/piper_phone_sim/assets/piper_x.urdf'
+        editor._import_asset()  # guarded: the page shows the reason instead of raising
+        assert editor.messages and editor.messages[-1]['error']
+        assert '不能直接用 URDF 生成实体' in editor.messages[-1]['text']
+        assert 'asset import' in editor.messages[-1]['text']
+    finally:
+        editor.server.stop()
 
 
 def test_thumbnail_sketch_of_exported_mesh(tmp_path):
@@ -796,3 +820,5 @@ editor.server.stop()
 '''
     result = subprocess.run([str(EDITOR_PYTHON), '-c', script], cwd=ROOT, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+pytestmark = pytest.mark.group_editor  # runs in the [editor] dependency group

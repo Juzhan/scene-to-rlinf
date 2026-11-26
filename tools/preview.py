@@ -14,9 +14,8 @@ import sys
 import time
 import traceback
 
-import torch
-
-from shared.isaac_state import make_simulation, resolve
+from shared.assembly.control import load_factory
+from shared.backends.observations import checked_observations
 
 
 def parse_options(arguments, operation):
@@ -57,9 +56,10 @@ def parse_options(arguments, operation):
 
 
 def checked_states(observations, count, dimension, adapter=None):
+    import torch  # imported here so --help and option parsing work without the simulator group
+
     if dimension is None:
-        from shared.integrations.rlinf.tensors import _wrap_observations
-        return _wrap_observations(observations, count)
+        return checked_observations(observations, count)
     packed = adapter(observations) if adapter is not None else observations if "states" in observations else None
     states = packed["states"] if packed is not None else observations["policy"]
     if isinstance(states, dict):
@@ -81,15 +81,18 @@ def update_environment_camera(native):
 
 
 def preview(cfg, options, *, recording):
-    from shared.integrations.rlinf.isaac import get_isaac_assembly_factory
+    import torch
+
+    from shared.assembly.project import environment_factory
 
     parameters = cfg.env.train.init_params
     factory = parameters.get("preview_factory")
-    constructor = resolve(factory) if factory else get_isaac_assembly_factory(parameters.id)
+    # The project registers its constructor without the training framework (shared.assembly.project).
+    constructor = load_factory(factory) if factory else environment_factory(parameters.id)
     # Registered assembly factories can keep their scene's camera setting in view mode.
     camera_override = None if constructor is not None and not factory and not recording else recording
     adapter_entry = parameters.get("observation_adapter")
-    adapter = resolve(adapter_entry) if adapter_entry else None
+    adapter = load_factory(adapter_entry) if adapter_entry else None
     if cfg.env.train.env_type != "isaaclab" or not (parameters.get("env_cfg") or constructor):
         raise ValueError("view/record require an Isaac task configuration or registered environment")
     if not recording and not os.environ.get("DISPLAY"):
@@ -121,7 +124,10 @@ def preview(cfg, options, *, recording):
             viewer["scene_cameras"] = True  # the scene's cameras render, whatever its enable_cameras says
         if options.camera_render:
             viewer["render"] = "camera"  # the backend draws the viewpoint through a camera (and errs if it cannot)
-        constructor = constructor or make_simulation
+        if constructor is None:
+            # A legacy task configured by a native env_cfg: Isaac Lab 2 through the RLinf subprocess.
+            from shared.backends.isaac.legacy.state import make_simulation
+            constructor = make_simulation
         environment, owner = constructor(
             parameters, options.num_envs, cfg.env.train.seed, cfg.env.train.max_episode_steps,
             headless=recording, enable_cameras=camera_override, viewer=viewer,
@@ -167,7 +173,11 @@ def preview(cfg, options, *, recording):
                       step_dt=native.step_dt, seed=cfg.env.train.seed)
         model = None
         if options.actions == "policy":
-            from rlinf.models import get_model
+            try:
+                from rlinf.models import get_model
+            except ModuleNotFoundError:
+                raise ValueError("Policy preview loads a training model: install the train group "
+                                 "(tools/setup_env.py --with train) or preview with --actions hold") from None
 
             torch.manual_seed(cfg.actor.seed)
             model = get_model(cfg.actor.model).to(environment.device).eval()

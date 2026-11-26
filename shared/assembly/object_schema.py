@@ -142,6 +142,12 @@ def generate(scene, *, catalog_directory=None, settings=None, factories=None, te
         windows[root] = history_lengths(settings).get(role, {})
     from .layout import world_spec_from_config
     from .robot import RobotView, robot_frames
+    if factories is None:  # the catalog's view: every installed backend's asset names, the project's own first
+        from .catalog import _project_package
+        from .project import project_registry
+        from .visuals import geometry_backend
+        factories = project_registry(_project_package(catalog_directory or scene.parent), backend=None,
+                                     prefer=geometry_backend(scene))[0]
     world = world_spec_from_config(settings, directory=catalog_directory or scene.parent, factories=factories)
     robots = robot_frames(world)
     methods = {name for name in vars(RobotView) if not name.startswith('_')}

@@ -323,3 +323,5 @@ def test_scene_edit_layer_moves_an_object_and_its_collider(tmp_path, monkeypatch
     assert np.allclose(np.asarray(lamp), np.asarray(collider))
     with pytest.raises(ValueError, match='moved.Meshes/chair'):
         formats.scene_edit_layer(source, moved={'Meshes/chair': {'position': [1, 2]}})
+
+pytestmark = pytest.mark.group_import  # runs in the [import] dependency group

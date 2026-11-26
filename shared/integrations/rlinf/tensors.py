@@ -52,16 +52,8 @@ def _validate_config(cfg, *, factory=None):
 
 
 def _wrap_observations(observations, num_envs):
-    if not isinstance(observations, dict) or not observations:
-        raise ValueError("Training requires a nonempty observation dictionary")
-    result = {}
-    for name, value in observations.items():
-        if not isinstance(value, torch.Tensor) or value.ndim < 1 or value.shape[0] != num_envs:
-            raise ValueError(f"Observation {name} must be a tensor with leading dimension num_envs")
-        if value.is_floating_point() and not torch.isfinite(value).all():
-            raise ValueError(f"Observation {name} must be finite")
-        result[name] = value.detach().clone()
-    return result
+    from shared.backends.observations import checked_observations
+    return checked_observations(observations, num_envs)
 
 
 def _prepare_actions(actions, expected, device):

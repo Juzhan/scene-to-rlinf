@@ -15,7 +15,7 @@ def _scene(path, data):
 
 
 def _config():
-    environment = SimpleNamespace(init_params={})
+    environment = SimpleNamespace(init_params={'backend': 'isaac'})  # these scenes use Isaac Lab 2 presets
     return SimpleNamespace(runner=SimpleNamespace(only_eval=False),
                            env=SimpleNamespace(train=environment, eval=environment))
 
@@ -99,3 +99,7 @@ def test_unified_inventory_preserves_scopes_mesh_and_mount_references(tmp_path):
     assert layout["world/scanner"]["mount"] == {"entity":"world/robot", "body":"base"}
     assert layout["world/scanner"]["meshes"] == ["world/terrain"]
     assert report["physical_connections"] == []
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

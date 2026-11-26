@@ -89,7 +89,8 @@ uv pip install --python .venv-il3/bin/python --no-deps \
 
 冻结列表本身不能由解析器重新求解（验证环境是增量安装的，numpy 2.5.1 与 cmeel-boost 的声明范围不符，实际运行正常），
 所以用 `--no-deps`。所有命令（含 `edit`）都由 `run.sh` 自动使用 `.venv-il3`，不需要激活环境；
-环境放在别处时用 `RLINF_PYTHON` 指定解释器。
+环境放在别处时用 `RLINF_PYTHON` 指定解释器。按用途装环境（只编辑场景、只导出网格、只推理）见 [README 的依赖组一节](../README.md#依赖组与按需安装)与 [PACKAGING_PLAN.md](PACKAGING_PLAN.md)：
+`python3 tools/setup_env.py --with core,editor --env .venv-editor` 这类命令会按组安装并沿用同一份锁文件。
 
 ### 验证安装
 
@@ -128,7 +129,7 @@ bash run.sh evaluate my_task env.eval.total_num_envs=16
   （写法见 `shared/assembly/randomization.py` 开头）；IL3（Newton/OvPhysX）与 mjlab 支持，Isaac Lab 2 后端会报错。
 - 多条件评估：train.yaml 顶层 `evaluation.conditions` 列出条件（替换随机化或改场景实体），
   `evaluate <项目> --conditions all` 每个条件单独评估并汇总成表和 `summary.json`（写法见 `tools/conditions.py`）。
-- 后端由项目 train.yaml 的 `env.train.init_params.backend` 决定；没写的旧项目（如 apple）沿用 `configs/state_ppo.yaml` 的 `isaac`（Isaac Lab 2），`check` 会打印 WARN。要在 IL3 上运行，先在其 train.yaml 写上 `backend: isaaclab3`。
+- 后端由项目 train.yaml 的 `env.train.init_params.backend` 决定；没写的项目用 `configs/state_ppo.yaml` 的默认 `isaaclab3`，`check` 会打印 WARN。Isaac Lab 2（`isaac`）不再维护，为它写的旧项目（如 apple）要继续在 IL2 上跑，须在 train.yaml 写明 `backend: isaac`。
 - 训练产物：`outputs/<项目>/runs/<时间>/`，含有效配置与项目源码快照；用
   `evaluate <项目> --snapshot <运行目录> runner.ckpt_path=<.../full_weights.pt>` 按当时的代码回放。
 - `check` 与编辑器保存时刷新 `observation.py`；改了实体或观察后先 `check`，再按新类型改 `policy.py` / `task.py`。

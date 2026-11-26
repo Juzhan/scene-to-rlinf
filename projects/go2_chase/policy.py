@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
-from shared.policy_math import inverse_rotate, yaw
+from shared.policy import inverse_rotate, yaw
 from .observation import Action, PolicyObs, Targets
 
 # The actor orders legs FL, FR, RL, RR with hip, thigh, calf per leg; the robot reports and takes joints

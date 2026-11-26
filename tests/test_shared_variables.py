@@ -111,3 +111,5 @@ def test_derived_fields_removed_from_backend_catalog():
     assert not {'relative_joint_position', 'relative_joint_velocity', 'body_linear_velocity',
                 'body_angular_velocity', 'gravity_direction', 'height', 'peak_contact_force', 'tracked_position'} & SIGNALS.keys()
     assert {'joint_position', 'default_joint_position', 'ray_hit_positions', 'contact_force_samples'} <= SIGNALS.keys()
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

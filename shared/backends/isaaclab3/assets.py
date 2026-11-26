@@ -5,19 +5,201 @@ PhysX-only property classes are left to the presets that already carry both vari
 """
 
 from functools import cache
+from pathlib import Path
 from typing import Literal
 
-from shared.assembly.assets import (GO2_SUPERMIMIC, CameraData, Go2Actuators, ball_parameters, box_parameters,
-                                   camera_parameters, checked, go2_parameters, workspace_file)
+from shared.assembly.assets import (FACTORY_SCOPES, GO2_SUPERMIMIC, CameraData, Go2Actuators,  # noqa: F401
+                                   ball_parameters, box_parameters, camera_parameters, checked, checked_gains,
+                                   go2_parameters, workspace_file)
 from shared.asset_formats import nucleus_copy
-# Scopes follow the isaac backend; its scene_metadata resolves native keys and prim paths for both.
-from shared.backends.isaac.assets import FACTORY_SCOPES  # noqa: F401
-# Isaac Lab 3 keeps these Isaac Lab 2 configurations through its deprecated PhysX-schema aliases;
-# none carries a quaternion, and their root poses are left to scene.py (xyzw). PhysX-only schema
-# fields (solver iterations, combine modes) apply on OvPhysX and are ignored by Newton, as in
-# Isaac Lab 3's own presets.
-from shared.backends.isaac.assets import (clear_sky, dex_cube, m20, piper, piper_x,
-                                          seattle_table, terrain, usd_robot)
+# The robots kept in this workspace (robots/) and the props below are written in Isaac Lab's
+# RigidBodyPropertiesCfg / ArticulationCfg form, which Isaac Lab 3 keeps through its PhysX-schema
+# aliases; none carries a quaternion, and their root poses are left to scene.py (xyzw). PhysX-only
+# fields (solver iterations, combine modes) apply on OvPhysX and are ignored by Newton, as in Isaac
+# Lab 3's own presets.
+
+def _local_robot(config, usd_path, fix_root_link):
+    config = config.copy()
+    if usd_path is not None:
+        config.spawn.usd_path = str(Path(usd_path).expanduser().resolve())
+    if not Path(config.spawn.usd_path).is_file():
+        raise FileNotFoundError(f"Robot USD asset is missing: {config.spawn.usd_path}")
+    config.spawn.articulation_props.fix_root_link = fix_root_link
+    return config
+
+
+def piper(usd_path=None, fix_root_link=True):
+    from .robots.piper import PIPER_CFG
+    return _local_robot(PIPER_CFG, usd_path, fix_root_link)
+
+
+def _override_gains(config, gains):
+    """gains maps exact joint names to [stiffness, damping], replacing the native values of those joints."""
+    import re
+
+    joints = list(config.init_state.joint_pos)
+    unknown = set(gains) - set(joints)
+    if unknown:
+        raise ValueError(f"gains: unknown joints {sorted(unknown)}; expected names among {joints}")
+    for actuator in config.actuators.values():
+        names = [joint for joint in joints if any(re.fullmatch(expr, joint) for expr in actuator.joint_names_expr)]
+        if set(names) & set(gains):
+            actuator.stiffness = {re.escape(joint): float(gains.get(joint, (actuator.stiffness,))[0]) for joint in names}
+            actuator.damping = {re.escape(joint): float(gains.get(joint, (0., actuator.damping))[1]) for joint in names}
+    return config
+
+
+@checked(lambda gains=None, **_: checked_gains(gains or {}))
+def piper_x(usd_path=None, fix_root_link=True, gains=None):
+    """gains: optional {joint: [stiffness, damping]} replacing PIPER_X_CFG's fixed-base arm gains."""
+    from .robots.piper_x import PIPER_X_CFG
+    config = _local_robot(PIPER_X_CFG, usd_path, fix_root_link)
+    return _override_gains(config, checked_gains(gains)) if gains else config
+
+
+def m20(usd_path=None, fix_root_link=False):
+    from .robots.m20 import DEEPROBOTICS_M20_CFG
+    return _local_robot(DEEPROBOTICS_M20_CFG, usd_path, fix_root_link)
+
+
+def franka_panda_usd():
+    return nucleus_copy("franka_panda", "Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd")
+
+
+def seattle_table():
+    """Vendored copy of the Isaac 5.1 SeattleLabTable USD (assets/seattle_table/source)."""
+    import isaaclab.sim as sim
+    from isaaclab.assets import AssetBaseCfg
+
+    usd = nucleus_copy("seattle_table", "Isaac/Props/Mounts/SeattleLabTable/table_instanceable.usd")
+    return AssetBaseCfg(prim_path="", spawn=sim.UsdFileCfg(usd_path=str(usd)))
+
+
+def dex_cube(scale=(0.8, 0.8, 0.8)):
+    import isaaclab.sim as sim
+    from isaaclab.assets import RigidObjectCfg
+
+    return RigidObjectCfg(prim_path="", spawn=sim.UsdFileCfg(
+        usd_path=str(dex_cube_usd()),
+        scale=tuple(scale),
+        rigid_props=sim.RigidBodyPropertiesCfg(
+            solver_position_iteration_count=16, solver_velocity_iteration_count=1,
+            max_angular_velocity=1000.0, max_linear_velocity=1000.0,
+            max_depenetration_velocity=5.0, disable_gravity=False,
+        ),
+    ))
+
+
+def dex_cube_usd():
+    return nucleus_copy("dex_cube", "Isaac/Props/Blocks/DexCube/dex_cube_instanceable.usd")
+
+
+def white_marble():
+    import isaaclab.sim as sim
+
+    return sim.MdlFileCfg(
+        mdl_path=str(nucleus_copy("white_marble", "Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/"
+                                                  "TilesMarbleSpiderWhiteBrickBondHoned.mdl")),
+        project_uvw=True, texture_scale=(0.25, 0.25),
+    )
+
+
+def clear_sky(intensity=750.0):
+    import isaaclab.sim as sim
+    from isaaclab.assets import AssetBaseCfg
+
+    return AssetBaseCfg(
+        prim_path="",
+        spawn=sim.DomeLightCfg(
+            intensity=intensity,
+            texture_file=str(nucleus_copy("clear_sky", "Isaac/Materials/Textures/Skies/PolyHaven/"
+                                                       "kloofendal_43d_clear_puresky_4k.hdr")),
+        ),
+    )
+
+
+MATERIALS = {"white_marble": white_marble}
+
+
+# Sub-terrain names used in scene.yaml -> Isaac Lab sub-terrain config classes.
+# Mesh terrains build exact geometry; height-field terrains (rough, slope, waves,
+# obstacles, stepping stones) are sampled on a grid and suit rough-ground training.
+TERRAIN_VARIANTS = {
+    "flat": "MeshPlaneTerrainCfg",
+    "stairs": "MeshPyramidStairsTerrainCfg",
+    "inverted_stairs": "MeshInvertedPyramidStairsTerrainCfg",
+    "random_grid": "MeshRandomGridTerrainCfg",
+    "rails": "MeshRailsTerrainCfg",
+    "pit": "MeshPitTerrainCfg",
+    "box": "MeshBoxTerrainCfg",
+    "gap": "MeshGapTerrainCfg",
+    "floating_ring": "MeshFloatingRingTerrainCfg",
+    "star": "MeshStarTerrainCfg",
+    "repeated_pyramids": "MeshRepeatedPyramidsTerrainCfg",
+    "repeated_boxes": "MeshRepeatedBoxesTerrainCfg",
+    "repeated_cylinders": "MeshRepeatedCylindersTerrainCfg",
+    "rough": "HfRandomUniformTerrainCfg",
+    "slope": "HfPyramidSlopedTerrainCfg",
+    "inverted_slope": "HfInvertedPyramidSlopedTerrainCfg",
+    "hf_stairs": "HfPyramidStairsTerrainCfg",
+    "hf_inverted_stairs": "HfInvertedPyramidStairsTerrainCfg",
+    "obstacles": "HfDiscreteObstaclesTerrainCfg",
+    "waves": "HfWaveTerrainCfg",
+    "stepping_stones": "HfSteppingStonesTerrainCfg",
+}
+
+
+def _as_tuples(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(_as_tuples(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _as_tuples(item) for key, item in value.items()}
+    return value
+
+
+def terrain_variant(factory, parameters):
+    if factory not in TERRAIN_VARIANTS:
+        raise ValueError(f"Unknown terrain variant '{factory}'. Available: {', '.join(TERRAIN_VARIANTS)}")
+    import isaaclab.terrains as terrains
+
+    config_class = getattr(terrains, TERRAIN_VARIANTS[factory])
+    values = _as_tuples(parameters)
+    for key in ("object_params_start", "object_params_end"):
+        if key in values:
+            values[key] = config_class.ObjectCfg(**values[key])
+    return config_class(**values)
+
+
+def terrain(terrain_generator, physics_material, material, **parameters):
+    import isaaclab.sim as sim
+    import isaaclab.terrains as terrains
+
+    generator = dict(terrain_generator)
+    generator["size"] = tuple(generator["size"])
+    generator["difficulty_range"] = tuple(generator["difficulty_range"])
+    generator["sub_terrains"] = {
+        name: terrain_variant(variant["factory"], variant.get("parameters", {}))
+        for name, variant in generator["sub_terrains"].items()
+    }
+    return terrains.TerrainImporterCfg(
+        prim_path="", **parameters,
+        terrain_generator=terrains.TerrainGeneratorCfg(**generator),
+        physics_material=sim.RigidBodyMaterialCfg(**physics_material),
+        visual_material=MATERIALS[material](),
+    )
+
+
+def usd_robot(usd_path, fix_root_link=True, stiffness=None, damping=None):
+    """Imported USD articulation; joint drives come from the USD unless gains are given."""
+    import isaaclab.sim as sim
+    from isaaclab.actuators import ImplicitActuatorCfg
+    from isaaclab.assets import ArticulationCfg
+
+    spawn = sim.UsdFileCfg(usd_path=str(workspace_file(usd_path)),
+                           articulation_props=sim.ArticulationRootPropertiesCfg(fix_root_link=fix_root_link))
+    return ArticulationCfg(prim_path="", spawn=spawn, init_state=ArticulationCfg.InitialStateCfg(),
+                           actuators={"joints": ImplicitActuatorCfg(joint_names_expr=[".*"],
+                                                                    stiffness=stiffness, damping=damping)})
 
 
 @checked(go2_parameters)
@@ -76,7 +258,6 @@ def franka_panda(fix_root_link=True, tracking: FrankaTracking = 'native'):
     measured joint positions then do not let the arm sag. Scene building keeps gravity off on Newton too
     (scene.compensate_gravity)."""
     from isaaclab_assets.robots.franka import FRANKA_PANDA_LEGACY_CFG, FRANKA_PANDA_LEGACY_HIGH_PD_CFG
-    from shared.backends.isaac.assets import franka_panda_usd
 
     franka_parameters(fix_root_link, tracking)
     config = (FRANKA_PANDA_LEGACY_HIGH_PD_CFG if tracking == 'stiff' else FRANKA_PANDA_LEGACY_CFG).copy()

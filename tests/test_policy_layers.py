@@ -252,3 +252,5 @@ def test_models_asking_for_config_get_the_recipe_model_section():
     built = FeedbackChain(control, .005, env, 3, {'_model_config': {'hidden_dims': [8, 4], 'own_setting': 1}},
                           input_factory=Input, model_factory={'Sized': Sized, 'decode': lambda a, o: a}.get)
     assert built.dimension == 3 and seen['hidden'] == [8, 4]
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

@@ -112,3 +112,5 @@ def test_isaaclab3_export_of_static_geometry_and_rigid_bodies(tmp_path, entity, 
     records = json.loads((tmp_path / '.cache/scene_visuals.json').read_text())['entities']
     name = entity.split(',')[0].split(': ')[1]
     assert (records[f'world/{name}'].get('initial_state') or {}).get('root_body') == body
+
+pytestmark = pytest.mark.group_core  # runs in the [core] dependency group

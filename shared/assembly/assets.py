@@ -1,12 +1,17 @@
 """Resolve logical asset names to backend implementations, without loading SDKs."""
-from importlib import import_module
+from importlib import import_module, util
 from inspect import signature
 from math import isfinite
 from pathlib import Path
 from typing import Literal, get_args
 
-BACKENDS = ('isaac', 'mjlab', 'isaaclab3')
-DEFAULT_BACKEND = 'isaac'
+# isaaclab3 is the maintained backend and the default; mjlab and isaac (Isaac Lab 2) are frozen, isaac is no
+# longer maintained and may be removed: views over every backend use installed_backends().
+BACKENDS = ('isaaclab3', 'mjlab', 'isaac')
+DEFAULT_BACKEND = 'isaaclab3'
+# Factories placed outside the per-environment namespace: shared terrain and lighting.
+FACTORY_SCOPES = {name: "global" for name in
+                  ("terrain", "ground_plane", "dome_light", "clear_sky")}
 
 
 def selected_backend(parameters):
@@ -26,8 +31,20 @@ def factories_for(backend=DEFAULT_BACKEND):
     return dict(backend_module(backend, 'assets').FACTORIES)
 
 
+def installed_backends():
+    """The backends whose package is present: a removed one (Isaac Lab 2) drops out of every view over them."""
+    present = []
+    for backend in BACKENDS:
+        try:
+            if util.find_spec(f'shared.backends.{backend}') is not None:
+                present.append(backend)
+        except ImportError:
+            pass
+    return tuple(present)
+
+
 def asset_backends(name):
-    return [backend for backend in BACKENDS if name in factories_for(backend)]
+    return [backend for backend in installed_backends() if name in factories_for(backend)]
 
 
 def workspace_file(path):

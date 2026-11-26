@@ -16,10 +16,11 @@ from pathlib import Path
 from types import UnionType
 from typing import Literal, Union, get_args, get_origin, get_type_hints
 
+from .assets import DEFAULT_BACKEND, asset_backends, image_outputs
 from .layout import load_scene_config, world_spec_from_config
-from .assets import asset_backends, image_outputs
-from shared.backends.isaac.scene import scene_metadata
-from shared.backends.isaac.task_config import _ACTION_CLASSES, _OBSERVATION_NAMES, _TASK_NAMES, _selection
+from .native_terms import (ACTION_CLASSES, PRESET_OBSERVATION_NAMES, PRESET_TASK_NAMES,
+                           implementation_names, selection as _selection)
+from .scene_metadata import scene_metadata
 
 
 _ASSETS = {
@@ -323,7 +324,7 @@ project registries and metadata are discovered for ordinary Python packages.
     by_key = {entity["native_key"]: entity for entity in entities}
     robots = [entity for entity in entities if "articulation" in entity["capabilities"] or entity["kind"] == "robot"]
     task, preset = settings.get("task", {}), settings.get("task", {}).get("preset")
-    command_names = set(_TASK_NAMES.get(preset, {}).get("commands", ()))
+    command_names = set(PRESET_TASK_NAMES.get(preset, {}).get("commands", ()))
     if task.get("commands", {}) is None:
         command_names.clear()
     else:
@@ -338,6 +339,8 @@ project registries and metadata are discovered for ordinary Python packages.
         return {"available": not missing, "availability": "missing_dependency" if missing else "candidate",
                 "missing": missing, "runtime_required": True}
 
+    # Native implementation paths belong to the backend; the catalog only describes terms.
+    native = implementation_names(prefer or DEFAULT_BACKEND)
     selected = {}
     for group, value in settings.get("observations", {}).items():
         names, _, _ = _selection(value, f"observations.{group}")
@@ -348,11 +351,9 @@ project registries and metadata are discovered for ordinary Python packages.
         for source in component.get('observations') or []:
             selected.setdefault(source, []).append(role)
     observations = []
-    for name in _OBSERVATION_NAMES.get(preset, ()):
+    for name in PRESET_OBSERVATION_NAMES.get(preset, ()):
         label, description, function, units, frame, requires, dimension = _OBSERVATIONS[name]
-        implementation = "isaaclab.envs.mdp." + function
-        if name == "object_position":
-            implementation = "isaaclab_tasks.manager_based.manipulation.lift.mdp." + function
+        implementation = native.observation(function)
         observations.append({"id": name, "label": label, "description": description, "implementation": implementation,
                              "units": units, "frame": frame, "dimension": dimension, "requires": requires,
                              "parameters": {"params": _parameter("原生项参数与实体绑定", "mapping"),
@@ -360,7 +361,7 @@ project registries and metadata are discovered for ordinary Python packages.
                                             "clip": _parameter("裁剪范围", "range")},
                              "selected_in": selected.get(name, []), **availability(requires)})
     actions = []
-    for name, class_name in _ACTION_CLASSES.items():
+    for name, class_name in ACTION_CLASSES.items():
         label, description = _ACTION_LABELS[name]
         parameters = {
             "asset_name": _parameter("机器人", "entity", required=True, choices=[e["native_key"] for e in robots]),
@@ -380,19 +381,15 @@ project registries and metadata are discovered for ordinary Python packages.
                 parameters["offset"] = _parameter("目标偏移", "number_or_mapping", default=0.)
         configured = [key for key, value in settings.get("actions", {}).items() if value.get("type") == name]
         actions.append({"id": name, "label": label, "description": description, "requires": ["articulation"],
-                        "implementation": "isaaclab.envs.mdp." + class_name, "parameters": parameters,
+                        "implementation": native.action(class_name), "parameters": parameters,
                         "available": bool(robots), "availability": "candidate" if robots else "missing_dependency",
                         "runtime_required": True, "configured": configured,
                         "targets": [{key: entity[key] for key in ("path", "native_key", "factory")} for entity in robots]})
     rewards = []
     updates = task.get("rewards", {})
-    for name in sorted(_TASK_NAMES.get(preset, {}).get("rewards", ())):
+    for name in sorted(PRESET_TASK_NAMES.get(preset, {}).get("rewards", ())):
         label, description, function, formula, requires = _REWARDS[name]
-        implementation = "isaaclab.envs.mdp." + function
-        if function.startswith("object_"):
-            implementation = "isaaclab_tasks.manager_based.manipulation.lift.mdp." + function
-        elif function == "feet_air_time":
-            implementation = "isaaclab_tasks.manager_based.locomotion.velocity.mdp." + function
+        implementation = native.reward(function)
         current = updates.get(name, {}) if updates is not None else None
         rewards.append({"id": name, "label": label, "description": description, "formula": formula,
                         "implementation": implementation, "requires": requires,
@@ -472,7 +469,7 @@ project registries and metadata are discovered for ordinary Python packages.
             if preset:
                 name = f'entity__{entity["native_key"]}__{signal}'
             observations.append({"id": name, "label": label, "description": label + "，来源：" + entity["path"],
-                                 "implementation": ("shared.backends.isaac.entity_observations.primitive" if signal in {"position", "default_joint_position", "default_joint_velocity", "ray_hit_positions", "frame_positions", "contact_force", "contact_force_samples"} else "isaaclab.envs.mdp." + function),
+                                 "implementation": native.signal(signal, function),
                                  "requires": [entity["native_key"]], "units": units, "dimension": dimension,
                                  "information": _image_size(signal_information(name), entity, assets).describe(),
                                  "profile": signal_profile(name),
@@ -527,7 +524,7 @@ project registries and metadata are discovered for ordinary Python packages.
     from .information import Information
     computed = {}
     if settings.get('variables'):
-        from shared.backends.isaac.derived import variable_information
+        from .legacy.derived import variable_information
         computed = {name: variable_information(settings, name, terms.get("signals")) for name in settings['variables']}
     from .control import declared_dimension
     control = settings.get('control') or {}

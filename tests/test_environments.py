@@ -187,3 +187,7 @@ def test_unreal_like_exports_get_expanded_instances_and_colliders(tmp_path):
     record = environment(tmp_path / 'town.usda', tmp_path / 'simplified', expand_instancers=True,
                          add_colliders=True, simplify_colliders=0.05, simplify_visuals=4)
     assert record['steps'][0]['simplified_colliders']['meshes'] == 3
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_import  # runs in the [import] dependency group

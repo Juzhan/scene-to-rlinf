@@ -5,6 +5,7 @@ own stepping and resets; this module only translates poses to its xyzw quaternio
 reset rules to its native events and index-based write APIs.
 """
 
+import re
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
@@ -12,7 +13,7 @@ from math import isfinite
 
 from shared.assembly.robot import robot_interface
 from shared.assembly.spec import Abstract, Mount, Pose, Sensor
-from shared.backends.isaac.scene import scene_metadata
+from shared.assembly.scene_metadata import scene_metadata
 from .frames import wxyz, xyzw
 
 SCENE_KEYS = {'schema_version', 'name', 'entities', 'connections', 'simulation', 'world', 'authoring',
@@ -45,7 +46,7 @@ def validate(description, settings):
     if world.keys() - {'env_spacing', 'contact_materials'}:
         raise NotImplementedError('isaaclab3 scene world supports only env_spacing and contact_materials')
     # Isaac Lab 3 keeps the native material startup event on Newton and OvPhysX.
-    from shared.backends.isaac.contact_materials import validate_materials
+    from .contact_materials import validate_materials
     validate_materials(world.get('contact_materials', {}), scene_metadata(description).keys.values())
     from .assets import FREE_SENSORS, RAY_SENSORS, SENSORS
     for path, (node, _) in description.index().items():
@@ -130,11 +131,12 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
     from isaaclab.assets import ArticulationCfg
     from isaaclab.scene import InteractiveSceneCfg
     from shared.asset_formats import recorded_joint_order
-    from shared.backends.isaac.initial_state import apply_initial_state
+    from .initial_state import apply_initial_state
     from .assets import FACTORIES
     from .spawners import NATIVE, SPAWN_FROM_USD
 
     metadata = scene_metadata(description)
+    bodies_of = asset_bodies(description)
     registry = {**FACTORIES, **(factories or {})}
     config = InteractiveSceneCfg(num_envs=num_envs, env_spacing=env_spacing)
     reserved = set(vars(config))
@@ -153,6 +155,11 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
         if not hasattr(native, 'prim_path'):
             raise TypeError(f'Entity {path}: factory must return a native Isaac Lab 3 asset config')
         native.prim_path = metadata.prim_paths[path]
+        if isinstance(node, Sensor) and node.mount:
+            mount = description.resolve_mount(path, node.mount)
+            if mount.body:
+                native.prim_path = (metadata.prim_paths[mount.entity] + '/'
+                                    + body_subpath(bodies_of(mount.entity), mount.body, f'Entity {path}: {mount.entity}'))
         if metadata.scopes[path] == 'global' and hasattr(native, 'collision_group'):
             # Shared physical assets collide with every environment's clones.
             native.collision_group = -1
@@ -179,7 +186,9 @@ def build_scene_config(description, *, num_envs=1, env_spacing=4.0, factories=No
             for frame in getattr(native, 'target_frames', ()):
                 if frame.prim_path.startswith('{SOURCE_ASSET}/'):
                     mount = description.resolve_mount(path, node.mount)
-                    frame.prim_path = frame.prim_path.replace('{SOURCE_ASSET}', metadata.prim_paths[mount.entity], 1)
+                    target = body_subpath(bodies_of(mount.entity), frame.prim_path.partition('/')[2],
+                                          f'Entity {path}: {mount.entity}')
+                    frame.prim_path = metadata.prim_paths[mount.entity] + '/' + target
             setattr(config, key, native)
             continue
         spawn = getattr(native, 'spawn', None)
@@ -410,9 +419,56 @@ def _relative(parent_pose, child_pose):
     return parent_pose.compose(inverse(child_pose))
 
 
-def _body_path(prim_paths, mount, namespace):
+def _body_path(prim_paths, mount, namespace, bodies):
     path = prim_paths[mount['entity']].replace('{ENV_REGEX_NS}', namespace)
-    return path + '/' + mount['body'] if mount['body'] else path
+    if not mount['body']:
+        return path
+    return path + '/' + body_subpath(bodies(mount['entity']), mount['body'], mount['entity'])
+
+
+def asset_bodies(description):
+    """entity path -> {body name: sub-path} of the imported USD it spawns, or None for a factory's own asset.
+
+    The standalone URDF/MJCF converters nest a link under its parent (``Geometry/<link>/<child>``), while
+    the scene names a body as ``<entity>/<body>``; read where each file keeps its bodies instead of
+    assuming the flat layout of the Isaac Sim importer. A file is read only when something mounts on it.
+    """
+    from functools import lru_cache
+    from shared.assembly.assets import workspace_file
+    from shared.asset_formats import usd_body_paths
+    index = description.index()
+
+    @lru_cache(maxsize=None)
+    def bodies(entity):
+        usd = (index[entity][0].parameters or {}).get('usd_path') if entity in index else None
+        if not isinstance(usd, str) or not usd:
+            return None
+        try:
+            return usd_body_paths(workspace_file(usd))
+        except (OSError, ValueError, RuntimeError) as error:  # pxr reports layer problems as RuntimeError
+            raise ValueError(f'{entity}: cannot read the bodies of {usd}: {error}') from error
+    return bodies
+
+
+def body_subpath(bodies, body, owner):
+    """Sub-path of ``body`` (a name, or a pattern such as ``.*_foot``) under the entity's prim.
+
+    Isaac Lab matches a pattern against the children of one prim, so it stays a pattern under the parent
+    the bodies it matches share (the entity prim in a flat file, ``Geometry`` in a converted one)."""
+    if bodies is None:  # a factory's own asset: its bodies are the entity's children
+        return body
+    if body in bodies:
+        return bodies[body]
+    if re.escape(body) != body:
+        parents = {bodies[name].rpartition('/')[0] for name in bodies if re.fullmatch(body, name)}
+        if len(parents) == 1:
+            parent = parents.pop()
+            return f'{parent}/{body}' if parent else body
+        if parents:
+            raise ValueError(f'{owner}: {body!r} matches bodies under different parents in the USD '
+                             f'({sorted(parents)}); mount on each body by name')
+    raise ValueError(f'{owner} has no body {body!r}'
+                     + (f'; bodies: {sorted(bodies)}' if bodies else ' (its USD has no rigid bodies)'))
 
 
 @contextmanager
@@ -436,9 +492,10 @@ def newton_connections(description, physics, dt):
     from newton import JointType
     from newton.solvers import SolverMuJoCo
     prim_paths = scene_metadata(description).prim_paths
-    welds = [(joint.name, joint.parent and _body_path(prim_paths, asdict(joint.parent), ''),
-              _body_path(prim_paths, asdict(joint.child), ''), _relative(joint.parent_pose, joint.child_pose))
-             for joint in joints]
+    bodies = asset_bodies(description)
+    path_of = lambda mount: _body_path(prim_paths, asdict(mount), '', bodies)
+    welds = [(joint.name, joint.parent and path_of(joint.parent), path_of(joint.child),
+              _relative(joint.parent_pose, joint.child_pose)) for joint in joints]
 
     def tail(worlds, current):
         # Replication appended this world's elements last.
@@ -545,7 +602,7 @@ def physx_connections(env, description):
 
     def first_reset(*args, **kwargs):
         del sim.reset
-        _author_physx_connections(env, joints, metadata.prim_paths)
+        _author_physx_connections(env, joints, metadata.prim_paths, asset_bodies(description))
         return reset(*args, **kwargs)
 
     sim.reset = first_reset
@@ -555,7 +612,7 @@ def physx_connections(env, description):
         vars(sim).pop('reset', None)
 
 
-def _author_physx_connections(env, joints, prim_paths):
+def _author_physx_connections(env, joints, prim_paths, bodies):
     from isaaclab_ov.physics import OvPhysxManager
     from pxr import Gf, UsdGeom, UsdPhysics
 
@@ -563,7 +620,7 @@ def _author_physx_connections(env, joints, prim_paths):
     source = f'{env.scene.env_ns}/env_0'
     for joint in joints:
         for mount in filter(None, (joint['parent'], joint['child'])):
-            prim = stage.GetPrimAtPath(_body_path(prim_paths, mount, source))
+            prim = stage.GetPrimAtPath(_body_path(prim_paths, mount, source, bodies))
             if not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
                 raise ValueError(f"Connection {joint['name']}: endpoint must be a rigid body: {prim.GetPath()}")
     whole = _whole_environment_clone(env, joints)
@@ -579,13 +636,13 @@ def _author_physx_connections(env, joints, prim_paths):
         UsdGeom.Scope.Define(stage, namespace + '/Connections')
         for joint in joints:
             _float_articulation(stage, prim_paths[joint['child']['entity']].replace('{ENV_REGEX_NS}', namespace),
-                                _body_path(prim_paths, joint['child'], namespace))
+                                _body_path(prim_paths, joint['child'], namespace, bodies))
             native = UsdPhysics.FixedJoint.Define(stage, f"{namespace}/Connections/{joint['name']}")
-            native.CreateBody1Rel().SetTargets([_body_path(prim_paths, joint['child'], namespace)])
+            native.CreateBody1Rel().SetTargets([_body_path(prim_paths, joint['child'], namespace, bodies)])
             parent_pose, child_pose = joint['parent_pose'], joint['child_pose']
             position = parent_pose['position']
             if joint['parent']:
-                native.CreateBody0Rel().SetTargets([_body_path(prim_paths, joint['parent'], namespace)])
+                native.CreateBody0Rel().SetTargets([_body_path(prim_paths, joint['parent'], namespace, bodies)])
             else:
                 position = [a + b for a, b in zip(position, origins[index])]
             native.CreateLocalPos0Attr().Set(Gf.Vec3f(*position))

@@ -234,3 +234,5 @@ def test_coverage_union_does_not_count_repeated_cells_and_resets_per_env():
     engine.reset([1])
     result = engine.evaluate(dt=.1, step=2)
     assert result.metrics["coverage"].value.tolist() == [.5, .5]
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group

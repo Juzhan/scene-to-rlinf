@@ -49,3 +49,7 @@ def test_static_pose_reads_env0_view_for_every_environment():
     torch.testing.assert_close(local[:,:3],torch.tensor([[1.,2.,.1]]*3))
     shared=IsaacAssemblyWorld._static_pose(world,View('/World/floor',[1.,2.,.1]))
     torch.testing.assert_close(shared[:,:3],torch.tensor([1.,2.,.1])-origins)
+
+import pytest  # noqa: E402 - collection marker
+
+pytestmark = pytest.mark.group_isaaclab3  # runs in the [isaaclab3] dependency group
